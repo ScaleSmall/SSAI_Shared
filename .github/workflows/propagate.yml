@@ -1,0 +1,25 @@
+name: Propagate to consumer apps
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  trigger-rebuilds:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger SSAI_Connect rebuild
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.SCALESMALL_PAT }}
+          repository: ScaleSmall/SSAI_Connect
+          event-type: shared-updated
+          client-payload: '{"ref": "${{ github.sha }}"}'
+
+      - name: Trigger SSAI_Dashboard rebuild
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.SCALESMALL_PAT }}
+          repository: ScaleSmall/SSAI_Dashboard
+          event-type: shared-updated
+          client-payload: '{"ref": "${{ github.sha }}"}'
