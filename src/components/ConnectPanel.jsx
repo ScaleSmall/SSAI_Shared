@@ -2,18 +2,23 @@ import React, { useState } from 'react';
 import { useConnect } from '../hooks/useConnect.js';
 import { PLATFORM_META, CONNECTOR_ICONS } from '../config.js';
 import PlatformIcon from './PlatformIcon.jsx';
+import EmailIdentity from './EmailIdentity.jsx';
+import DataSourcePanel from './DataSourcePanel.jsx';
 
 /**
- * Full Connect panel — connectors above platforms.
+ * Full Connect panel — connectors, platforms, and service-gated sections.
  * Drop this into any ScaleSmall app.
  *
  * @param {string} clientId - n8n_client_id
  * @param {string} supabaseUrl - Base Supabase URL
  * @param {string} businessName - Display name for the business
+ * @param {string[]} [services] - Enabled service slugs (e.g., ['repeat_referral','jobs_to_socials'])
+ * @param {function} [getToken] - Returns current session access_token (needed for R&R sections)
  * @param {string} [className] - Optional wrapper class
  */
-export default function ConnectPanel({ clientId, supabaseUrl, businessName, className }) {
+export default function ConnectPanel({ clientId, supabaseUrl, businessName, services, getToken, className }) {
   const { sortedPlatforms, connectors, counts, error, loading, refresh, connectorStatusUrl } = useConnect(clientId, supabaseUrl);
+  const hasRR = services && (services.includes('repeat_referral') || services.includes('customer_intelligence'));
 
   if (!clientId) return (
     <div className={`sc-panel ${className || ''}`}>
@@ -51,6 +56,13 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, clas
             <PlatformRow key={p.platform} p={p} clientId={clientId} supabaseUrl={supabaseUrl} i={i} />
           ))}
         </div>
+
+        {/* R&R Service sections — only visible if repeat_referral or customer_intelligence is enabled */}
+        {hasRR && getToken && <>
+          <div className="sc-rr-divider" />
+          <EmailIdentity supabaseUrl={supabaseUrl} getToken={getToken} />
+          <DataSourcePanel supabaseUrl={supabaseUrl} getToken={getToken} />
+        </>}
       </>}
     </div>
   );
