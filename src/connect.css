@@ -264,3 +264,10 @@
 .sc-ei-provider-steps code { background: rgba(59,130,246,0.15); padding: 2px 6px; border-radius: 4px; font-size: 11px; color: #60a5fa; font-family: monospace; }
 .sc-ei-help-link { display: inline-block; font-size: 12px; color: #60a5fa; text-decoration: none; padding: 6px 0; transition: color 0.15s; }
 .sc-ei-help-link:hover { color: #93bbfd; text-decoration: underline; }
+
+/* ===== DNS Copy buttons ===== */
+.sc-dns-copy { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; margin-left: 4px; background: rgba(59,130,246,0.12); border: 1px solid rgba(59,130,246,0.25); border-radius: 4px; color: #60a5fa; cursor: pointer; font-size: 11px; transition: all 0.15s; vertical-align: middle; padding: 0; line-height: 1; }
+.sc-dns-copy:hover { background: rgba(59,130,246,0.25); color: #93bbfd; }
+.sc-dns-copy-all { width: 70px; text-align: right; }
+.sc-dns-copy-row { font-size: 10px; padding: 3px 8px; border-radius: 4px; border: 1px solid rgba(148,163,184,0.2); background: rgba(30,41,59,0.4); color: #94a3b8; cursor: pointer; white-space: nowrap; transition: all 0.15s; }
+.sc-dns-copy-row:hover { border-color: rgba(96,165,250,0.4); color: #e2e8f0; }
