@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import ServiceIcon from './ServiceIcon.jsx';
 
 /**
  * Data source connection panel for R&R customer data imports.
@@ -117,7 +118,7 @@ export default function DataSourcePanel({ supabaseUrl, getToken }) {
           {connected.map(s => (
             <div key={s.source_type} className="sc-row sc-row-connected">
               <div className="sc-row-main">
-                <div className="sc-icon sc-icon-connector">{s.icon || '🔌'}</div>
+                <div className="sc-icon sc-icon-connector"><ServiceIcon type={s.source_type} /></div>
                 <div className="sc-info">
                   <div className="sc-name">{s.display_name}</div>
                   <div className="sc-note">
@@ -143,7 +144,7 @@ export default function DataSourcePanel({ supabaseUrl, getToken }) {
           {available.map(s => (
             <div key={s.source_type} className="sc-row">
               <div className="sc-row-main">
-                <div className="sc-icon sc-icon-connector">{s.icon || '🔌'}</div>
+                <div className="sc-icon sc-icon-connector"><ServiceIcon type={s.source_type} /></div>
                 <div className="sc-info">
                   <div className="sc-name">{s.display_name}</div>
                   <div className="sc-note">{s.description}</div>

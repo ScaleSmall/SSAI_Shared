@@ -60,7 +60,7 @@
   flex-shrink: 0; font-weight: 700; font-size: 16px;
 }
 
-.sc-icon-connector { background: #1e2d4a; font-size: 20px; }
+.sc-icon-connector { background: transparent; font-size: 20px; }
 
 /* Info */
 .sc-info { flex: 1; min-width: 0; }
