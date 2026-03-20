@@ -4,6 +4,7 @@
 export { default as ConnectPanel, PlatformRow, ConnectorRow } from './components/ConnectPanel.jsx';
 export { default as PlatformIcon } from './components/PlatformIcon.jsx';
 export { default as ConnectorIcon } from './components/ConnectorIcon.jsx';
+export { default as ServiceIcon } from './components/ServiceIcon.jsx';
 export { default as Toast } from './components/Toast.jsx';
 export { default as EmailIdentity } from './components/EmailIdentity.jsx';
 export { default as DataSourcePanel } from './components/DataSourcePanel.jsx';
