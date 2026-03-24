@@ -18,7 +18,7 @@ import DataSourcePanel from './DataSourcePanel.jsx';
  * @param {string} [className] - Optional wrapper class
  */
 export default function ConnectPanel({ clientId, supabaseUrl, businessName, services, getToken, className }) {
-  const { sortedPlatforms, connectors, counts, error, loading, refresh, connectorStatusUrl } = useConnect(clientId, supabaseUrl);
+  const { sortedPlatforms, connectors, counts, error, loading, refresh, disconnectPlatform, connectorStatusUrl } = useConnect(clientId, supabaseUrl);
   const hasRR = services && (services.includes('repeat_referral') || services.includes('customer_intelligence'));
 
   if (!clientId) return (
@@ -54,7 +54,7 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
         <div className="sc-section-label" style={{ marginTop: connectors?.length > 0 ? 24 : 0 }}>Platforms</div>
         <div className="sc-list">
           {sortedPlatforms.map((p, i) => (
-            <PlatformRow key={p.platform} p={p} clientId={clientId} supabaseUrl={supabaseUrl} i={i} />
+            <PlatformRow key={p.platform} p={p} clientId={clientId} supabaseUrl={supabaseUrl} i={i} onDisconnect={disconnectPlatform} onRefresh={refresh} />
           ))}
         </div>
 
@@ -70,9 +70,11 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
 }
 
 // ===== Platform Row =====
-function PlatformRow({ p, clientId, supabaseUrl, i }) {
+function PlatformRow({ p, clientId, supabaseUrl, i, onDisconnect, onRefresh }) {
   const [showEmbed, setShowEmbed] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
+  const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   const meta = PLATFORM_META[p.platform];
   if (!meta) return null;
 
@@ -81,10 +83,28 @@ function PlatformRow({ p, clientId, supabaseUrl, i }) {
   const isWebsite = p.platform === 'website';
   const details = p.details || {};
 
+  const handleDisconnect = async () => {
+    setDisconnecting(true);
+    try {
+      await onDisconnect(p.platform);
+      setConfirmDisconnect(false);
+    } catch (e) { /* error handled in hook */ }
+    finally { setDisconnecting(false); }
+  };
+
   let statusBadge, action;
   if (p.connected && !p.is_expired) {
     statusBadge = <span className="sc-badge sc-badge-green">Connected</span>;
-    action = isWebsite ? <button className="sc-btn sc-btn-ghost" onClick={() => setShowEmbed(!showEmbed)}>{showEmbed ? 'Hide code' : 'Embed code'}</button> : null;
+    if (isWebsite) {
+      action = <button className="sc-btn sc-btn-ghost" onClick={() => setShowEmbed(!showEmbed)}>{showEmbed ? 'Hide code' : 'Embed code'}</button>;
+    } else if (!meta.noOAuth) {
+      action = confirmDisconnect
+        ? <span className="sc-confirm-row">
+            <button className="sc-btn sc-btn-danger" onClick={handleDisconnect} disabled={disconnecting}>{disconnecting ? 'Disconnecting...' : 'Confirm'}</button>
+            <button className="sc-btn sc-btn-ghost" onClick={() => setConfirmDisconnect(false)}>Cancel</button>
+          </span>
+        : <button className="sc-btn sc-btn-ghost sc-btn-disconnect" onClick={() => setConfirmDisconnect(true)}>Disconnect</button>;
+    }
   } else if (p.is_expired) {
     statusBadge = <span className="sc-badge sc-badge-amber">Expired</span>;
     action = !meta.noOAuth && <a href={connectUrl} className="sc-btn sc-btn-warn">Reconnect</a>;

@@ -81,10 +81,29 @@ export function useConnect(clientId, supabaseUrl) {
       });
   }, [platforms]);
 
+  const disconnectPlatform = useCallback(async (platform) => {
+    if (!clientId) return;
+    try {
+      const res = await fetch(oauthStatusUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ client_id: clientId, action: 'disconnect_platform', platform }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+      await fetchPlatforms();
+      return data;
+    } catch (err) {
+      setError(`Failed to disconnect ${platform}: ${err.message}`);
+      throw err;
+    }
+  }, [clientId, oauthStatusUrl, fetchPlatforms]);
+
   return {
     platforms, connectors, sortedPlatforms, counts,
     error, loading: !platforms,
     refresh, fetchPlatforms, fetchConnectors,
+    disconnectPlatform,
     connectorStatusUrl,
   };
 }
