@@ -75,6 +75,8 @@ function PlatformRow({ p, clientId, supabaseUrl, i, onDisconnect, onRefresh }) {
   const [copied, setCopied] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
   const [confirmDisconnect, setConfirmDisconnect] = useState(false);
+  const [showOrgPicker, setShowOrgPicker] = useState(false);
+  const [selectingOrg, setSelectingOrg] = useState(false);
   const meta = PLATFORM_META[p.platform];
   if (!meta) return null;
 
@@ -82,6 +84,24 @@ function PlatformRow({ p, clientId, supabaseUrl, i, onDisconnect, onRefresh }) {
   const connectUrl = p.connect_url ? p.connect_url + '&redirect_after=' + redirectUrl : '#';
   const isWebsite = p.platform === 'website';
   const details = p.details || {};
+  const isLinkedInNeedsOrg = p.platform === 'linkedin' && details.needs_org_selection;
+  const liAvailableOrgs = details.available_orgs || [];
+
+  const handleSelectOrg = async (org) => {
+    setSelectingOrg(true);
+    try {
+      const res = await fetch(`${supabaseUrl}/functions/v1/linkedin-select-org`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ client_id: clientId, org_urn: org.urn, org_id: org.id, org_name: org.name }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) throw new Error(data.error || 'Failed');
+      setShowOrgPicker(false);
+      if (onRefresh) onRefresh();
+    } catch (e) { console.error('Org select failed:', e); }
+    finally { setSelectingOrg(false); }
+  };
 
   const handleDisconnect = async () => {
     setDisconnecting(true);
@@ -110,6 +130,11 @@ function PlatformRow({ p, clientId, supabaseUrl, i, onDisconnect, onRefresh }) {
     action = !meta.noOAuth && <a href={connectUrl} className="sc-btn sc-btn-warn">Reconnect</a>;
   } else if (!p.enabled) {
     statusBadge = <span className="sc-badge sc-badge-off">Disabled</span>;
+  } else if (isLinkedInNeedsOrg) {
+    statusBadge = <span className="sc-badge sc-badge-amber">Select Page</span>;
+    action = <button className="sc-btn sc-btn-primary" onClick={() => setShowOrgPicker(!showOrgPicker)}>
+      {showOrgPicker ? 'Cancel' : 'Choose Page'}
+    </button>;
   } else {
     statusBadge = <span className="sc-badge sc-badge-red">Not connected</span>;
     if (isWebsite) action = <button className="sc-btn sc-btn-primary" onClick={() => setShowEmbed(!showEmbed)}>Get embed code</button>;
@@ -130,8 +155,10 @@ function PlatformRow({ p, clientId, supabaseUrl, i, onDisconnect, onRefresh }) {
           <div className="sc-name">{meta.name}</div>
           <div className="sc-note">
             {p.connected && !p.is_expired
-              ? (Object.entries(details).filter(([, v]) => v).map(([k, v]) => `${k}: ${v}`).join(' · ') || 'Connected')
-              : meta.note}
+              ? (p.platform === 'linkedin' && details.org_urn
+                ? `Page: ${(liAvailableOrgs.find(o => o.urn === details.org_urn) || {}).name || details.page_id || 'Connected'}`
+                : (Object.entries(details).filter(([k, v]) => v && typeof v !== 'object').map(([k, v]) => `${k}: ${v}`).join(' · ') || 'Connected'))
+              : isLinkedInNeedsOrg ? 'Authorized — select a LinkedIn page to post to' : meta.note}
           </div>
         </div>
         <div className="sc-actions">{statusBadge}{action}</div>
@@ -143,6 +170,25 @@ function PlatformRow({ p, clientId, supabaseUrl, i, onDisconnect, onRefresh }) {
             <code className="sc-embed-code">{embedCode}</code>
             <button className="sc-btn sc-btn-ghost" onClick={handleCopy}>{copied ? '✓ Copied' : 'Copy'}</button>
           </div>
+        </div>
+      )}
+      {isLinkedInNeedsOrg && showOrgPicker && (
+        <div className="sc-embed">
+          <p className="sc-embed-label">Which LinkedIn page should we post to?</p>
+          <div className="sc-org-list">
+            {liAvailableOrgs.map((org) => (
+              <button
+                key={org.urn}
+                className="sc-org-btn"
+                onClick={() => handleSelectOrg(org)}
+                disabled={selectingOrg}
+              >
+                <span className="sc-org-name">{org.name}</span>
+                <span className="sc-org-id">ID: {org.id}</span>
+              </button>
+            ))}
+          </div>
+          {selectingOrg && <p className="sc-note" style={{marginTop:8}}>Saving...</p>}
         </div>
       )}
     </div>

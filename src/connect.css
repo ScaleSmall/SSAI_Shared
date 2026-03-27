@@ -276,3 +276,16 @@
 .sc-btn-disconnect { color: #94a3b8; border-color: transparent; }
 .sc-btn-disconnect:hover { color: #ef4444; border-color: #ef4444; }
 .sc-confirm-row { display: flex; gap: 6px; align-items: center; }
+
+/* LinkedIn org picker */
+.sc-org-list { display: flex; flex-direction: column; gap: 6px; }
+.sc-org-btn {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 14px; border-radius: 8px;
+  background: rgba(30, 41, 59, 0.6); border: 1px solid rgba(51, 65, 85, 0.4);
+  color: #e2e8f0; cursor: pointer; transition: all 0.15s; text-align: left;
+}
+.sc-org-btn:hover { border-color: #3b82f6; background: rgba(59, 130, 246, 0.1); }
+.sc-org-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.sc-org-name { font-weight: 500; font-size: 14px; }
+.sc-org-id { font-size: 11px; color: #64748b; }
