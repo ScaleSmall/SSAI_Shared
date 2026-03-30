@@ -27,9 +27,17 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
       {error && <div className="sc-error">{error}</div>}
 
       {loading ? <div className="sc-loading"><div className="sc-spinner" />Loading…</div> : <>
+        {/* Social Platforms */}
+        <div className="sc-section-label">Social Platforms</div>
+        <div className="sc-list">
+          {sortedPlatforms.map((p, i) => (
+            <PlatformRow key={p.platform} p={p} clientId={clientId} supabaseUrl={supabaseUrl} i={i} onDisconnect={disconnectPlatform} onRefresh={refresh} />
+          ))}
+        </div>
+
         {/* Photo Feed Sources */}
         {connectors && connectors.length > 0 && <>
-          <div className="sc-section-label">Photo Feed Sources</div>
+          <div className="sc-section-label" style={{ marginTop: 24 }}>Photo Feed Sources</div>
           <p className="sc-subtitle">Connect the app where your team stores job site photos so we can automatically import them.</p>
           <div className="sc-list">
             {connectors.map(c => (
@@ -37,14 +45,6 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
             ))}
           </div>
         </>}
-
-        {/* Social Platforms */}
-        <div className="sc-section-label" style={{ marginTop: connectors?.length > 0 ? 24 : 0 }}>Social Platforms</div>
-        <div className="sc-list">
-          {sortedPlatforms.map((p, i) => (
-            <PlatformRow key={p.platform} p={p} clientId={clientId} supabaseUrl={supabaseUrl} i={i} onDisconnect={disconnectPlatform} onRefresh={refresh} />
-          ))}
-        </div>
 
         {/* R&R Service sections */}
         {hasRR && getToken && <>
