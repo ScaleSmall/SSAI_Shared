@@ -84,11 +84,7 @@ export default function DataSourcePanel({ supabaseUrl, getToken }) {
   return (
     <div className="sc-ds-section">
       <div className="sc-section-label">Customer Data Sources</div>
-      <p className="sc-subtitle">
-        Connect your CRM, invoicing, or field service tools to import customer history.
-        Better data means smarter timing for your outreach.
-        <span className="sc-optional-badge">Optional</span>
-      </p>
+      <p className="sc-subtitle">Connect the tools you already use to run your business — your CRM, invoicing app, or field service software. Connect as many or as few as you use. <strong>If you only use one, that's perfect.</strong> <span className="sc-optional-badge">Optional</span></p>
       <p className="sc-note" style={{ marginBottom: 16, fontSize: 12, lineHeight: 1.5 }}>
         Your customer data is used exclusively to power your outreach system.
         We never sell, share, or use individual customer information for any other purpose.
