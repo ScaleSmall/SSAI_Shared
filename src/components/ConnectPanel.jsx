@@ -29,6 +29,7 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
       {loading ? <div className="sc-loading"><div className="sc-spinner" />Loading…</div> : <>
         {/* Social Platforms */}
         <div className="sc-section-label">Social Platforms</div>
+        <p className="sc-subtitle">Connect the socials you actually use — skip the ones you don't. Most clients connect 2–4. <strong>No need to connect them all.</strong></p>
         <div className="sc-list">
           {sortedPlatforms.map((p, i) => (
             <PlatformRow key={p.platform} p={p} clientId={clientId} supabaseUrl={supabaseUrl} i={i} onDisconnect={disconnectPlatform} onRefresh={refresh} />
@@ -38,7 +39,7 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
         {/* Photo Feed Sources */}
         {connectors && connectors.length > 0 && <>
           <div className="sc-section-label" style={{ marginTop: 24 }}>Photo Feed Sources</div>
-          <p className="sc-subtitle">Connect the app where your team stores job site photos so we can automatically import them.</p>
+          <p className="sc-subtitle">Connect where your team takes job photos. Most clients use 1, maybe 2. <strong>If you use CompanyCam, that's all you need.</strong></p>
           <div className="sc-list">
             {connectors.map(c => (
               <ConnectorRow key={c.connector_type} c={c} clientId={clientId} endpoint={connectorStatusUrl} onRefresh={refresh} />
