@@ -1,6 +1,4 @@
 // Single source of truth for platform and connector metadata.
-// Both SSAI_Connect and SSAI_Dashboard import from here.
-
 export const PLATFORM_ORDER = [
   'facebook', 'instagram', 'x', 'youtube', 'linkedin', 'gbp', 'tiktok', 'website',
 ];
@@ -18,17 +16,26 @@ export const PLATFORM_META = {
 };
 
 export const CONNECTOR_ICONS = {
-  companycam: '📸',
-  google_drive: '📁',
-  dropbox: '💧',
-  jobber: '🔧',
+  companycam:    '📸',
   manual_upload: '⬆️',
+  google_drive:  '📁',
+  dropbox:       '💧',
+  onedrive:      '☁️',
+  box:           '📦',
+  jobber:        '🔧',
+  jobnimbus:     '🏚️',
+  workiz:        '⚡',
+  housecall_pro: '🏠',
+  servicetitan:  '🔩',
+  procore:       '🏗️',
+  acculynx:      '🏘️',
+  buildertrend:  '🏗️',
+  houzz_pro:     '🪴',
 };
 
-// Build API URLs from a supabase base URL
 export function buildConnectUrls(supabaseUrl) {
   return {
-    oauthStatusUrl: `${supabaseUrl}/functions/v1/oauth-status`,
-    connectorStatusUrl: `${supabaseUrl}/functions/v1/connect-connector`,
+    oauthStatusUrl:    `${supabaseUrl}/functions/v1/oauth-status`,
+    connectorStatusUrl:`${supabaseUrl}/functions/v1/connect-connector`,
   };
 }
