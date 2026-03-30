@@ -29,7 +29,7 @@
   letter-spacing: 1.2px; color: #64748b; margin-bottom: 10px;
 }
 
-.sc-subtitle { font-size: 14px; color: #94a3b8; margin-bottom: 14px; line-height: 1.5; }
+.sc-subtitle { font-size: 14px; color: var(--green, #22c55e); margin-bottom: 14px; line-height: 1.5; }
 
 /* List */
 .sc-list { display: flex; flex-direction: column; gap: 6px; }
