@@ -289,3 +289,18 @@
 .sc-org-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .sc-org-name { font-weight: 500; font-size: 14px; }
 .sc-org-id { font-size: 11px; color: #64748b; }
+
+/* Coming Soon badge */
+.sc-badge-coming-soon {
+  background: rgba(120,120,140,0.12);
+  color: #888;
+  border: 1px solid rgba(120,120,140,0.2);
+}
+
+/* Coming Soon row — slightly muted */
+.sc-row-coming-soon {
+  opacity: 0.7;
+}
+.sc-row-coming-soon .sc-name {
+  color: var(--sc-text-sub, #9ca3af);
+}
