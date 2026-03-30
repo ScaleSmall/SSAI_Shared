@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useConnect } from '../hooks/useConnect.js';
-import { PLATFORM_META, CONNECTOR_ICONS } from '../config.js';
+import { PLATFORM_META } from '../config.js';
 import PlatformIcon from './PlatformIcon.jsx';
 import ConnectorIcon from './ConnectorIcon.jsx';
 import EmailIdentity from './EmailIdentity.jsx';
@@ -175,7 +175,6 @@ function ConnectorRow({ c, clientId, endpoint, onRefresh }) {
   const [token, setToken] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const icon = CONNECTOR_ICONS[c.connector_type] || '🔌';
   const isConnected = c.status === 'connected';
   const isComingSoon = c.availability_status === 'coming_soon' || c.status === 'coming_soon';
 
@@ -183,7 +182,7 @@ function ConnectorRow({ c, clientId, endpoint, onRefresh }) {
     return (
       <div className="sc-row sc-row-coming-soon">
         <div className="sc-row-main">
-          <div className="sc-icon sc-icon-connector">{icon}</div>
+          <div className="sc-icon sc-icon-connector"><ConnectorIcon type={c.connector_type} /></div>
           <div className="sc-info">
             <div className="sc-name">{c.display_name}</div>
             <div className="sc-note">{c.description}</div>
@@ -225,7 +224,7 @@ function ConnectorRow({ c, clientId, endpoint, onRefresh }) {
   return (
     <div className={`sc-row ${isConnected ? 'sc-row-connected' : ''}`}>
       <div className="sc-row-main">
-        <div className="sc-icon sc-icon-connector">{icon}</div>
+        <div className="sc-icon sc-icon-connector"><ConnectorIcon type={c.connector_type} /></div>
         <div className="sc-info">
           <div className="sc-name">{c.display_name}</div>
           <div className="sc-note">{c.description}</div>
