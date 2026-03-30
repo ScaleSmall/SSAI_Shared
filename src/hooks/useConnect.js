@@ -1,14 +1,6 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { PLATFORM_ORDER, PLATFORM_META, buildConnectUrls } from '../config.js';
 
-/**
- * Hook that manages Connect state — platforms, connectors, counts.
- * Both SSAI_Connect and SSAI_Dashboard use this same hook.
- *
- * @param {string} clientId - The n8n_client_id
- * @param {string} supabaseUrl - Base Supabase URL (for building function URLs)
- * @returns {object} Connect state and actions
- */
 export function useConnect(clientId, supabaseUrl) {
   const [platforms, setPlatforms] = useState(null);
   const [connectors, setConnectors] = useState(null);
@@ -37,7 +29,8 @@ export function useConnect(clientId, supabaseUrl) {
       const res = await fetch(`${connectorStatusUrl}?client_id=${clientId}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      setConnectors(data.my_connectors || []);
+      // Use all_connectors (includes coming_soon); fall back to my_connectors for older API
+      setConnectors(data.all_connectors || data.my_connectors || []);
     } catch (err) {
       console.error('Failed to load connectors:', err);
       setConnectors([]);
@@ -54,7 +47,6 @@ export function useConnect(clientId, supabaseUrl) {
     fetchConnectors();
   }, [fetchPlatforms, fetchConnectors]);
 
-  // Counts
   const counts = useMemo(() => {
     if (!platforms) return { connected: 0, expired: 0, needsSetup: 0, disabled: 0 };
     let connected = 0, expired = 0, needsSetup = 0, disabled = 0;
@@ -69,7 +61,6 @@ export function useConnect(clientId, supabaseUrl) {
     return { connected, expired, needsSetup, disabled };
   }, [platforms]);
 
-  // Sorted platforms (needs-setup first, then expired, then connected, then disabled)
   const sortedPlatforms = useMemo(() => {
     if (!platforms) return [];
     return PLATFORM_ORDER
