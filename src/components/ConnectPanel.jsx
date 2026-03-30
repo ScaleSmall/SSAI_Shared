@@ -6,17 +6,6 @@ import ConnectorIcon from './ConnectorIcon.jsx';
 import EmailIdentity from './EmailIdentity.jsx';
 import DataSourcePanel from './DataSourcePanel.jsx';
 
-/**
- * Full Connect panel — connectors, platforms, and service-gated sections.
- * Drop this into any ScaleSmall app.
- *
- * @param {string} clientId - n8n_client_id
- * @param {string} supabaseUrl - Base Supabase URL
- * @param {string} businessName - Display name for the business
- * @param {string[]} [services] - Enabled service slugs (e.g., ['repeat_referral','jobs_to_socials'])
- * @param {function} [getToken] - Returns current session access_token (needed for R&R sections)
- * @param {string} [className] - Optional wrapper class
- */
 export default function ConnectPanel({ clientId, supabaseUrl, businessName, services, getToken, className }) {
   const { sortedPlatforms, connectors, counts, error, loading, refresh, disconnectPlatform, connectorStatusUrl } = useConnect(clientId, supabaseUrl);
   const hasRR = services && (services.includes('repeat_referral') || services.includes('customer_intelligence'));
@@ -29,7 +18,6 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
 
   return (
     <div className={`sc-panel ${className || ''}`}>
-      {/* Status bar */}
       <div className="sc-status-bar">
         <div className="sc-stat"><span className="sc-dot sc-dot-green" />{counts.connected} connected</div>
         {counts.expired > 0 && <div className="sc-stat"><span className="sc-dot sc-dot-amber" />{counts.expired} expired</div>}
@@ -39,10 +27,10 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
       {error && <div className="sc-error">{error}</div>}
 
       {loading ? <div className="sc-loading"><div className="sc-spinner" />Loading…</div> : <>
-        {/* Connectors first */}
-        {connectors?.length > 0 && <>
-          <div className="sc-section-label">Connectors</div>
-          <p className="sc-subtitle">Connect your photo source so we can automatically import job site photos.</p>
+        {/* Photo Feed Sources */}
+        {connectors && connectors.length > 0 && <>
+          <div className="sc-section-label">Photo Feed Sources</div>
+          <p className="sc-subtitle">Connect the app where your team stores job site photos so we can automatically import them.</p>
           <div className="sc-list">
             {connectors.map(c => (
               <ConnectorRow key={c.connector_type} c={c} clientId={clientId} endpoint={connectorStatusUrl} onRefresh={refresh} />
@@ -50,15 +38,15 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
           </div>
         </>}
 
-        {/* Platforms */}
-        <div className="sc-section-label" style={{ marginTop: connectors?.length > 0 ? 24 : 0 }}>Platforms</div>
+        {/* Social Platforms */}
+        <div className="sc-section-label" style={{ marginTop: connectors?.length > 0 ? 24 : 0 }}>Social Platforms</div>
         <div className="sc-list">
           {sortedPlatforms.map((p, i) => (
             <PlatformRow key={p.platform} p={p} clientId={clientId} supabaseUrl={supabaseUrl} i={i} onDisconnect={disconnectPlatform} onRefresh={refresh} />
           ))}
         </div>
 
-        {/* R&R Service sections — only visible if repeat_referral or customer_intelligence is enabled */}
+        {/* R&R Service sections */}
         {hasRR && getToken && <>
           <div className="sc-rr-divider" />
           <EmailIdentity supabaseUrl={supabaseUrl} getToken={getToken} />
@@ -69,7 +57,6 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
   );
 }
 
-// ===== Platform Row =====
 function PlatformRow({ p, clientId, supabaseUrl, i, onDisconnect, onRefresh }) {
   const [showEmbed, setShowEmbed] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -91,8 +78,7 @@ function PlatformRow({ p, clientId, supabaseUrl, i, onDisconnect, onRefresh }) {
     setSelectingOrg(true);
     try {
       const res = await fetch(`${supabaseUrl}/functions/v1/linkedin-select-org`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ client_id: clientId, org_urn: org.urn, org_id: org.id, org_name: org.name }),
       });
       const data = await res.json();
@@ -105,10 +91,8 @@ function PlatformRow({ p, clientId, supabaseUrl, i, onDisconnect, onRefresh }) {
 
   const handleDisconnect = async () => {
     setDisconnecting(true);
-    try {
-      await onDisconnect(p.platform);
-      setConfirmDisconnect(false);
-    } catch (e) { /* error handled in hook */ }
+    try { await onDisconnect(p.platform); setConfirmDisconnect(false); }
+    catch (e) { /* handled in hook */ }
     finally { setDisconnecting(false); }
   };
 
@@ -132,9 +116,7 @@ function PlatformRow({ p, clientId, supabaseUrl, i, onDisconnect, onRefresh }) {
     statusBadge = <span className="sc-badge sc-badge-off">Disabled</span>;
   } else if (isLinkedInNeedsOrg) {
     statusBadge = <span className="sc-badge sc-badge-amber">Select Page</span>;
-    action = <button className="sc-btn sc-btn-primary" onClick={() => setShowOrgPicker(!showOrgPicker)}>
-      {showOrgPicker ? 'Cancel' : 'Choose Page'}
-    </button>;
+    action = <button className="sc-btn sc-btn-primary" onClick={() => setShowOrgPicker(!showOrgPicker)}>{showOrgPicker ? 'Cancel' : 'Choose Page'}</button>;
   } else {
     statusBadge = <span className="sc-badge sc-badge-red">Not connected</span>;
     if (isWebsite) action = <button className="sc-btn sc-btn-primary" onClick={() => setShowEmbed(!showEmbed)}>Get embed code</button>;
@@ -148,16 +130,14 @@ function PlatformRow({ p, clientId, supabaseUrl, i, onDisconnect, onRefresh }) {
   return (
     <div className="sc-row" style={{ animationDelay: `${i * 0.03}s` }}>
       <div className="sc-row-main">
-        <div className="sc-icon" style={{ background: meta.color, color: '#fff' }}>
-          <PlatformIcon platform={p.platform} />
-        </div>
+        <div className="sc-icon" style={{ background: meta.color, color: '#fff' }}><PlatformIcon platform={p.platform} /></div>
         <div className="sc-info">
           <div className="sc-name">{meta.name}</div>
           <div className="sc-note">
             {p.connected && !p.is_expired
               ? (p.platform === 'linkedin' && details.org_urn
-                ? `Page: ${(liAvailableOrgs.find(o => o.urn === details.org_urn) || {}).name || details.page_id || 'Connected'}`
-                : (Object.entries(details).filter(([k, v]) => v && typeof v !== 'object').map(([k, v]) => `${k}: ${v}`).join(' · ') || 'Connected'))
+                  ? `Page: ${(liAvailableOrgs.find(o => o.urn === details.org_urn) || {}).name || details.page_id || 'Connected'}`
+                  : (Object.entries(details).filter(([k, v]) => v && typeof v !== 'object').map(([k, v]) => `${k}: ${v}`).join(' · ') || 'Connected'))
               : isLinkedInNeedsOrg ? 'Authorized — select a LinkedIn page to post to' : meta.note}
           </div>
         </div>
@@ -177,12 +157,7 @@ function PlatformRow({ p, clientId, supabaseUrl, i, onDisconnect, onRefresh }) {
           <p className="sc-embed-label">Which LinkedIn page should we post to?</p>
           <div className="sc-org-list">
             {liAvailableOrgs.map((org) => (
-              <button
-                key={org.urn}
-                className="sc-org-btn"
-                onClick={() => handleSelectOrg(org)}
-                disabled={selectingOrg}
-              >
+              <button key={org.urn} className="sc-org-btn" onClick={() => handleSelectOrg(org)} disabled={selectingOrg}>
                 <span className="sc-org-name">{org.name}</span>
                 <span className="sc-org-id">ID: {org.id}</span>
               </button>
@@ -195,13 +170,30 @@ function PlatformRow({ p, clientId, supabaseUrl, i, onDisconnect, onRefresh }) {
   );
 }
 
-// ===== Connector Row =====
 function ConnectorRow({ c, clientId, endpoint, onRefresh }) {
   const [token, setToken] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const icon = CONNECTOR_ICONS[c.connector_type] || '🔌';
   const isConnected = c.status === 'connected';
+  const isComingSoon = c.availability_status === 'coming_soon' || c.status === 'coming_soon';
+
+  if (isComingSoon) {
+    return (
+      <div className="sc-row sc-row-coming-soon">
+        <div className="sc-row-main">
+          <div className="sc-icon sc-icon-connector">{icon}</div>
+          <div className="sc-info">
+            <div className="sc-name">{c.display_name}</div>
+            <div className="sc-note">{c.description}</div>
+          </div>
+          <div className="sc-actions">
+            <span className="sc-badge sc-badge-coming-soon">Coming Soon</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const handleConnect = async () => {
     setLoading(true); setError(null);
@@ -232,7 +224,7 @@ function ConnectorRow({ c, clientId, endpoint, onRefresh }) {
   return (
     <div className={`sc-row ${isConnected ? 'sc-row-connected' : ''}`}>
       <div className="sc-row-main">
-        <div className="sc-icon sc-icon-connector"><ConnectorIcon type={c.connector_type} /></div>
+        <div className="sc-icon sc-icon-connector">{icon}</div>
         <div className="sc-info">
           <div className="sc-name">{c.display_name}</div>
           <div className="sc-note">{c.description}</div>
