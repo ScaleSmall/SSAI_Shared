@@ -304,3 +304,20 @@
 .sc-row-coming-soon .sc-name {
   color: var(--sc-text-sub, #9ca3af);
 }
+/* LinkedIn org button states */
+.sc-org-btn-current { opacity: 0.5; cursor: not-allowed; border-color: rgba(34,197,94,0.3); background: rgba(34,197,94,0.05); }
+.sc-org-btn-mismatch { border-color: rgba(251,191,36,0.3); }
+.sc-org-btn-mismatch:hover { border-color: #f59e0b; background: rgba(251,191,36,0.08); }
+.sc-org-btn .sc-org-name { font-weight: 500; font-size: 14px; }
+
+/* Org mismatch warning block */
+.sc-org-mismatch {
+  padding: 12px 14px; border-radius: 8px; margin-bottom: 12px;
+  background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.3);
+  color: #fbbf24; font-size: 13px;
+}
+.sc-org-mismatch p { margin: 0; }
+
+/* xs ghost button for "Change page" inline with Disconnect */
+.sc-btn-xs { padding: 4px 10px; font-size: 12px; }
+
