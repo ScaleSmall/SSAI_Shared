@@ -29,7 +29,7 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
       {loading ? <div className="sc-loading"><div className="sc-spinner" />Loading…</div> : <>
         {/* Social Platforms */}
         <div className="sc-section-label">Social Platforms</div>
-        <p className="sc-subtitle">Connect the socials you actually use — skip the ones you do not use. Most clients connect 2–4. <strong>Connect where your customers actually follow local businesses.</strong></p>
+        <p className="sc-subtitle">Connect the socials you actually use — skip the ones you do not use. You can add more later.</p>
         <div className="sc-list">
           {sortedPlatforms.map((p, i) => (
             <PlatformRow key={p.platform} p={p} clientId={clientId} supabaseUrl={supabaseUrl} businessName={businessName} i={i} onDisconnect={disconnectPlatform} onRefresh={refresh} />
@@ -39,7 +39,7 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
         {/* Photo Feed Sources */}
         {connectors && connectors.length > 0 && <>
           <div className="sc-section-label" style={{ marginTop: 24 }}>Photo Feed Sources</div>
-          <p className="sc-subtitle">Connect where your team takes job photos. Most clients use 1, maybe 2. <strong>One well-connected source keeps content flowing automatically.</strong></p>
+          <p className="sc-subtitle">Connect where your team takes job photos. Connect as many as you use.</p>
           <div className="sc-list">
             {connectors.map(c => (
               <ConnectorRow key={c.connector_type} c={c} clientId={clientId} endpoint={connectorStatusUrl} onRefresh={refresh} />
