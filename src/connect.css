@@ -222,6 +222,8 @@
 /* ===== Email Identity Explainer ===== */
 .sc-ei-explainer-card { background: rgba(15,23,42,0.6); border: 1px solid rgba(148,163,184,0.15); border-radius: 12px; padding: 24px; margin: 12px 0; }
 .sc-ei-h3 { font-size: 16px; font-weight: 600; color: #f1f5f9; margin: 0 0 10px; }
+/* Green intro text for Email Identity explainer header + first sentence */
+.sc-ei-intro-text { color: #22c55e !important; }
 .sc-ei-h4 { font-size: 14px; font-weight: 600; color: #f1f5f9; margin: 0 0 10px; }
 .sc-ei-h5 { font-size: 13px; font-weight: 600; color: #e2e8f0; margin: 0 0 8px; }
 .sc-ei-text { font-size: 13px; color: #cbd5e1; line-height: 1.6; margin: 0 0 8px; }
