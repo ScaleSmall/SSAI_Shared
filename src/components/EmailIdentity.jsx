@@ -196,8 +196,9 @@ export default function EmailIdentity({ supabaseUrl, getToken, stripePublishable
       {showExplainer && !acknowledged && status === 'not_started' && (
         <div className="sc-ei-explainer">
           <div className="sc-ei-explainer-card">
-            <h3 className="sc-ei-h3">How your outreach emails work</h3>
-            <p className="sc-ei-text">When we send automated follow-ups, review requests, and referral asks to your customers, the emails need a sender identity. You have two options:</p>
+            <h3 className="sc-ei-h3 sc-ei-intro-text">How your outreach emails work</h3>
+            <p className="sc-ei-text sc-ei-intro-text">When we send automated follow-ups, review requests, and referral asks to your customers, the emails need a sender identity.</p>
+            <p className="sc-ei-text">You have two options:</p>
             <div className="sc-ei-options">
               <div className="sc-ei-option">
                 <div className="sc-ei-option-icon">✉️</div>
