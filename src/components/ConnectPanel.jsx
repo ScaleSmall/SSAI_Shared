@@ -260,6 +260,7 @@ function ConnectorRow({ c, clientId, endpoint, onRefresh }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const isConnected = c.status === 'connected';
+  const needsDesignator = c.status === 'needs_designator';
   const isComingSoon = c.availability_status === 'coming_soon' || c.status === 'coming_soon';
 
   if (isComingSoon) {
@@ -317,11 +318,29 @@ function ConnectorRow({ c, clientId, endpoint, onRefresh }) {
           )}
         </div>
         <div className="sc-actions">
-          <span className={`sc-badge ${isConnected ? 'sc-badge-green' : 'sc-badge-amber'}`}>{isConnected ? 'Connected' : 'Setup Required'}</span>
+          <span className={`sc-badge ${isConnected ? 'sc-badge-green' : needsDesignator ? 'sc-badge-red' : 'sc-badge-amber'}`}>{isConnected ? 'Connected' : needsDesignator ? 'Action Required' : 'Setup Required'}</span>
           {isConnected && <button className="sc-btn sc-btn-danger" onClick={handleDisconnect} disabled={loading}>Disconnect</button>}
         </div>
       </div>
-      {!isConnected && c.auth_type === 'api_key' && (
+      {needsDesignator && (
+        <div className="sc-setup sc-setup-warning">
+          <div style={{fontWeight:600,color:'var(--red)',marginBottom:8}}>⚠ Before &amp; After tags not found</div>
+          <p style={{fontSize:13,color:'var(--slate-300)',marginBottom:12,lineHeight:1.5}}>
+            Your CompanyCam account is connected, but no Before &amp; After tags were found. 
+            Only photos tagged with <strong>Before</strong> or <strong>After</strong> are imported — this is required and cannot be changed.
+          </p>
+          <p style={{fontSize:13,color:'var(--slate-400)',marginBottom:12}}>
+            Go to <strong>CompanyCam → Settings → Tags</strong> and create tags named <em>Before</em> and <em>After</em>. 
+            Then reconnect below to activate photo ingestion.
+          </p>
+          <div className="sc-token-row">
+            <input type="password" placeholder="Re-enter your API token to activate" value={token} onChange={e => setToken(e.target.value)} className="sc-input" />
+            <button className="sc-btn sc-btn-primary" onClick={handleConnect} disabled={loading}>{loading ? 'Checking...' : 'Activate'}</button>
+          </div>
+          {error && <div className="sc-row-error">{error}</div>}
+        </div>
+      )}
+      {!isConnected && !needsDesignator && c.auth_type === 'api_key' && (
         <div className="sc-setup">
           {c.setup_instructions?.steps && <ol className="sc-steps">{c.setup_instructions.steps.map((s, i) => <li key={i}>{s}</li>)}</ol>}
           <div className="sc-token-row">
