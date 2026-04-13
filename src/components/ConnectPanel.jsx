@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useConnect } from '../hooks/useConnect.js';
 import { PLATFORM_META } from '../config.js';
 import PlatformIcon from './PlatformIcon.jsx';
@@ -59,6 +59,21 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
 }
 
 function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, onRefresh }) {
+  // Listen for OAuth success postMessage from popup window
+  useEffect(() => {
+    function handleOAuthMessage(event) {
+      // Only accept messages from allowed origins
+      const allowedOrigins = ['https://oyyfpkpzalhxztpcdjgq.supabase.co', 'http://localhost:54321'];
+      if (!allowedOrigins.some(o => event.origin.startsWith(o) || event.origin === window.location.origin)) return;
+      if (event.data?.type === 'oauth-success' && event.data?.platform === p.platform) {
+        console.log(`[ConnectPanel] OAuth success for ${p.platform} — refreshing statuses`);
+        if (onRefresh) onRefresh();
+      }
+    }
+    window.addEventListener('message', handleOAuthMessage);
+    return () => window.removeEventListener('message', handleOAuthMessage);
+  }, [p.platform, onRefresh]);
+
   const [showEmbed, setShowEmbed] = useState(false);
   const [copied, setCopied] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
@@ -70,8 +85,8 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
   const meta = PLATFORM_META[p.platform];
   if (!meta) return null;
 
-  const redirectUrl = encodeURIComponent(window.location.origin + window.location.pathname);
-  const connectUrl = p.connect_url ? p.connect_url + '&redirect_after=' + redirectUrl : '#';
+  // Popup flow: don't send redirect_after — oauth-callback shows success page with postMessage
+  const connectUrl = p.connect_url || '#';
   const isWebsite = p.platform === 'website';
   const details = p.details || {};
 
@@ -145,7 +160,7 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
     }
   } else if (p.is_expired) {
     statusBadge = <span className="sc-badge sc-badge-amber">Expired</span>;
-    action = !meta.noOAuth && <a href={connectUrl} className="sc-btn sc-btn-warn">Reconnect</a>;
+    action = !meta.noOAuth && <button className="sc-btn sc-btn-warn" onClick={() => window.open(connectUrl, '_blank', 'popup,width=600,height=700')}>Reconnect</button>;
   } else if (!p.enabled) {
     statusBadge = <span className="sc-badge sc-badge-off">Disabled</span>;
   } else if (isLinkedIn && liNeedsOrgSelection) {
@@ -155,7 +170,7 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
     statusBadge = <span className="sc-badge sc-badge-red">Not connected</span>;
     if (isWebsite) action = <button className="sc-btn sc-btn-primary" onClick={() => setShowEmbed(!showEmbed)}>Get embed code</button>;
     else if (meta.noOAuth) action = meta.derived ? <span className="sc-badge sc-badge-off">Connect Facebook first</span> : null;
-    else action = <a href={connectUrl} className="sc-btn sc-btn-primary">Connect</a>;
+    else action = <button className="sc-btn sc-btn-primary" onClick={() => window.open(connectUrl, '_blank', 'popup,width=600,height=700')}>Connect</button>;
   }
 
   // LinkedIn detail note
