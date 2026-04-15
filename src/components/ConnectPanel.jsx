@@ -82,12 +82,22 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
   const [selectingOrg, setSelectingOrg] = useState(false);
   const [orgMismatchWarning, setOrgMismatchWarning] = useState(null);
   const [pendingOrg, setPendingOrg] = useState(null);
+  const [showGoogleWarning, setShowGoogleWarning] = useState(false);
   const meta = PLATFORM_META[p.platform];
   if (!meta) return null;
 
   // Popup flow: don't send redirect_after — oauth-callback shows success page with postMessage
   const connectUrl = p.connect_url || '#';
   const isWebsite = p.platform === 'website';
+  const isGoogleOAuth = ['youtube', 'gbp', 'google'].includes(p.platform);
+
+  const openOAuthPopup = () => {
+    const w = window.open(connectUrl, '_blank', 'popup,width=600,height=700');
+    if (w) { const t = setInterval(() => { if (w.closed) { clearInterval(t); if (onRefresh) onRefresh(); } }, 1000); setTimeout(() => clearInterval(t), 300000); }
+  };
+  const handleConnectClick = () => {
+    if (isGoogleOAuth) { setShowGoogleWarning(true); } else { openOAuthPopup(); }
+  };
   const details = p.details || {};
 
   // LinkedIn-specific state
@@ -160,7 +170,7 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
     }
   } else if (p.is_expired) {
     statusBadge = <span className="sc-badge sc-badge-amber">Expired</span>;
-    action = !meta.noOAuth && <button className="sc-btn sc-btn-warn" onClick={() => { const w = window.open(connectUrl, '_blank', 'popup,width=600,height=700'); if (w) { const t = setInterval(() => { if (w.closed) { clearInterval(t); if (onRefresh) onRefresh(); } }, 1000); setTimeout(() => clearInterval(t), 300000); } }}>Reconnect</button>;
+    action = !meta.noOAuth && <button className="sc-btn sc-btn-warn" onClick={handleConnectClick}>Reconnect</button>;
   } else if (!p.enabled) {
     statusBadge = <span className="sc-badge sc-badge-off">Disabled</span>;
   } else if (isLinkedIn && liNeedsOrgSelection) {
@@ -170,7 +180,7 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
     statusBadge = <span className="sc-badge sc-badge-red">Not connected</span>;
     if (isWebsite) action = <button className="sc-btn sc-btn-primary" onClick={() => setShowEmbed(!showEmbed)}>Get embed code</button>;
     else if (meta.noOAuth) action = meta.derived ? <span className="sc-badge sc-badge-off">Connect Facebook first</span> : null;
-    else action = <button className="sc-btn sc-btn-primary" onClick={() => { const w = window.open(connectUrl, '_blank', 'popup,width=600,height=700'); if (w) { const t = setInterval(() => { if (w.closed) { clearInterval(t); if (onRefresh) onRefresh(); } }, 1000); setTimeout(() => clearInterval(t), 300000); } }}>Connect</button>;
+    else action = <button className="sc-btn sc-btn-primary" onClick={handleConnectClick}>Connect</button>;
   }
 
   // LinkedIn detail note
@@ -264,6 +274,39 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
             })}
           </div>
           {selectingOrg && <p className="sc-note" style={{ marginTop: 8 }}>Saving...</p>}
+        </div>
+      )}
+
+      {/* Google OAuth unverified app warning */}
+      {showGoogleWarning && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999, backdropFilter: 'blur(4px)' }} onClick={() => setShowGoogleWarning(false)}>
+          <div style={{ background: 'var(--bg-card, #1a1a2e)', border: '1px solid var(--border, #333)', borderRadius: 16, padding: '32px 28px', maxWidth: 480, width: '90%', textAlign: 'center', boxShadow: '0 16px 48px rgba(0,0,0,0.5)' }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 28, marginBottom: 12 }}>⚠️</div>
+            <h3 style={{ margin: '0 0 12px', fontSize: 16, color: 'var(--slate-100, #f1f5f9)' }}>
+              Google Verification Pending
+            </h3>
+            <p style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--slate-300, #cbd5e1)', margin: '0 0 12px' }}>
+              Our Google OAuth app verification is currently pending with Google. When
+              you connect, Google will show a warning that says <strong style={{ color: 'var(--slate-100, #f1f5f9)' }}>"Google hasn't verified this app"</strong>.
+            </p>
+            <p style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--slate-300, #cbd5e1)', margin: '0 0 12px' }}>
+              This is expected and safe. To proceed:
+            </p>
+            <ol style={{ fontSize: 13, lineHeight: 1.8, color: 'var(--slate-200, #e2e8f0)', margin: '0 0 16px', paddingLeft: 20, textAlign: 'left' }}>
+              <li>Click <strong>"Advanced"</strong> (bottom-left of the warning)</li>
+              <li>Click <strong>"Go to Scale Small AI (unsafe)"</strong></li>
+              <li>Review and grant the requested permissions</li>
+            </ol>
+            <p style={{ fontSize: 12, color: 'var(--slate-400, #94a3b8)', margin: '0 0 20px' }}>
+              This warning will be removed once Google completes their verification review.
+            </p>
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'center' }}>
+              <button className="sc-btn sc-btn-primary" onClick={() => { setShowGoogleWarning(false); openOAuthPopup(); }}>
+                I Understand — Continue
+              </button>
+              <button className="sc-btn sc-btn-ghost" onClick={() => setShowGoogleWarning(false)}>Cancel</button>
+            </div>
+          </div>
         </div>
       )}
     </div>
