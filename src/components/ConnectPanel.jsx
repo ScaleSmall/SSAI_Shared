@@ -160,7 +160,7 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
     }
   } else if (p.is_expired) {
     statusBadge = <span className="sc-badge sc-badge-amber">Expired</span>;
-    action = !meta.noOAuth && <button className="sc-btn sc-btn-warn" onClick={() => window.open(connectUrl, '_blank', 'popup,width=600,height=700')}>Reconnect</button>;
+    action = !meta.noOAuth && <button className="sc-btn sc-btn-warn" onClick={() => { const w = window.open(connectUrl, '_blank', 'popup,width=600,height=700'); if (w) { const t = setInterval(() => { if (w.closed) { clearInterval(t); if (onRefresh) onRefresh(); } }, 1000); setTimeout(() => clearInterval(t), 300000); } }}>Reconnect</button>;
   } else if (!p.enabled) {
     statusBadge = <span className="sc-badge sc-badge-off">Disabled</span>;
   } else if (isLinkedIn && liNeedsOrgSelection) {
@@ -170,7 +170,7 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
     statusBadge = <span className="sc-badge sc-badge-red">Not connected</span>;
     if (isWebsite) action = <button className="sc-btn sc-btn-primary" onClick={() => setShowEmbed(!showEmbed)}>Get embed code</button>;
     else if (meta.noOAuth) action = meta.derived ? <span className="sc-badge sc-badge-off">Connect Facebook first</span> : null;
-    else action = <button className="sc-btn sc-btn-primary" onClick={() => window.open(connectUrl, '_blank', 'popup,width=600,height=700')}>Connect</button>;
+    else action = <button className="sc-btn sc-btn-primary" onClick={() => { const w = window.open(connectUrl, '_blank', 'popup,width=600,height=700'); if (w) { const t = setInterval(() => { if (w.closed) { clearInterval(t); if (onRefresh) onRefresh(); } }, 1000); setTimeout(() => clearInterval(t), 300000); } }}>Connect</button>;
   }
 
   // LinkedIn detail note
