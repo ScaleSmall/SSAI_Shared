@@ -1,372 +1,235 @@
-import React, { useState, useEffect } from 'react';
-import { useConnect } from '../hooks/useConnect.js';
-import { PLATFORM_META } from '../config.js';
-import PlatformIcon from './PlatformIcon.jsx';
-import ConnectorIcon from './ConnectorIcon.jsx';
-import EmailIdentity from './EmailIdentity.jsx';
-import DataSourcePanel from './DataSourcePanel.jsx';
+import React, { useState, useEffect, useMemo } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { Wifi, WifiOff, RefreshCw, CheckCircle, AlertCircle } from 'lucide-react';
+import { useConnect } from '../hooks/useConnect';
 
-export default function ConnectPanel({ clientId, supabaseUrl, businessName, services, getToken, className }) {
-  const { sortedPlatforms, connectors, counts, error, loading, refresh, disconnectPlatform, connectorStatusUrl } = useConnect(clientId, supabaseUrl);
-  const hasRR = services && (services.includes('repeat_referral') || services.includes('customer_intelligence'));
-
-  if (!clientId) return (
-    <div className={`sc-panel ${className || ''}`}>
-      <div className="sc-error">No client ID linked to your account yet. Complete onboarding first.</div>
-    </div>
-  );
-
+function StatusBadge({ status }) {
+  if (status === 'connected') {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 border border-emerald-200">
+        <CheckCircle className="h-3.5 w-3.5" />
+        Connected
+      </span>
+    );
+  }
+  if (status === 'error') {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2 py-1 text-xs font-medium text-red-700 border border-red-200">
+        <AlertCircle className="h-3.5 w-3.5" />
+        Error
+      </span>
+    );
+  }
   return (
-    <div className={`sc-panel ${className || ''}`}>
-      <div className="sc-status-bar">
-        <div className="sc-stat"><span className="sc-dot sc-dot-green" />{counts.connected} connected</div>
-        {counts.expired > 0 && <div className="sc-stat"><span className="sc-dot sc-dot-amber" />{counts.expired} expired</div>}
-        {counts.needsSetup > 0 && <div className="sc-stat"><span className="sc-dot sc-dot-red" />{counts.needsSetup} needs setup</div>}
-      </div>
-
-      {error && <div className="sc-error">{error}</div>}
-
-      {loading ? <div className="sc-loading"><div className="sc-spinner" />Loading…</div> : <>
-        {/* Social Platforms */}
-        <div className="sc-section-label">Social Platforms</div>
-        <p className="sc-subtitle">Connect the socials you actually use — skip the ones you do not use. You can add more later.</p>
-        <div className="sc-list">
-          {sortedPlatforms.map((p, i) => (
-            <PlatformRow key={p.platform} p={p} clientId={clientId} supabaseUrl={supabaseUrl} businessName={businessName} i={i} onDisconnect={disconnectPlatform} onRefresh={refresh} />
-          ))}
-        </div>
-
-        {/* Photo Feed Sources */}
-        {connectors && connectors.length > 0 && <>
-          <div className="sc-section-label" style={{ marginTop: 24 }}>Photo Feed Sources</div>
-          <p className="sc-subtitle">Connect where your team takes job photos. Connect as many as you use.</p>
-          <div className="sc-list">
-            {connectors.map(c => (
-              <ConnectorRow key={c.connector_type} c={c} clientId={clientId} endpoint={connectorStatusUrl} onRefresh={refresh} />
-            ))}
-          </div>
-        </>}
-
-        {/* R&R Service sections */}
-        {hasRR && getToken && <>
-          <div className="sc-rr-divider" />
-          <EmailIdentity supabaseUrl={supabaseUrl} getToken={getToken} />
-          <DataSourcePanel supabaseUrl={supabaseUrl} getToken={getToken} />
-        </>}
-      </>}
-    </div>
+    <span className="inline-flex items-center gap-1 rounded-full bg-zinc-100 px-2 py-1 text-xs font-medium text-zinc-700 border border-zinc-200">
+      <WifiOff className="h-3.5 w-3.5" />
+      Not connected
+    </span>
   );
 }
 
+function PlatformIcon({ platform }) {
+  const base = 'h-5 w-5';
+  switch (platform) {
+    case 'youtube':
+      return <div className={`${base} rounded-sm bg-red-600`} />;
+    case 'facebook':
+      return <div className={`${base} rounded-sm bg-blue-600`} />;
+    case 'instagram':
+      return <div className={`${base} rounded-sm bg-pink-600`} />;
+    case 'linkedin':
+      return <div className={`${base} rounded-sm bg-sky-700`} />;
+    case 'x':
+      return <div className={`${base} rounded-sm bg-black`} />;
+    case 'reddit':
+      return <div className={`${base} rounded-sm bg-orange-500`} />;
+    case 'pinterest':
+      return <div className={`${base} rounded-sm bg-red-700`} />;
+    default:
+      return <div className={`${base} rounded-sm bg-zinc-400`} />;
+  }
+}
+
 function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, onRefresh }) {
-  // Listen for OAuth success postMessage from popup window
+  const [busy, setBusy] = useState(false);
+
+  const allowedMessageOrigins = useMemo(() => {
+    const origins = new Set([
+      'https://oyyfpkpzalhxztpcdjgq.supabase.co',
+      'https://connect.scalesmall.ai',
+      'https://dashboard.scalesmall.ai',
+      'http://localhost:5173',
+      'http://localhost:5174',
+      'http://localhost:54321',
+      typeof window !== 'undefined' ? window.location.origin : ''
+    ]);
+    return Array.from(origins).filter(Boolean);
+  }, []);
+
   useEffect(() => {
     function handleOAuthMessage(event) {
-      // Only accept messages from allowed origins
-      const allowedOrigins = ['https://oyyfpkpzalhxztpcdjgq.supabase.co', 'http://localhost:54321'];
-      if (!allowedOrigins.some(o => event.origin.startsWith(o) || event.origin === window.location.origin)) return;
+      if (!allowedMessageOrigins.includes(event.origin)) return;
       if (event.data?.type === 'oauth-success' && event.data?.platform === p.platform) {
         console.log(`[ConnectPanel] OAuth success for ${p.platform} — refreshing statuses`);
         if (onRefresh) onRefresh();
       }
     }
+
     window.addEventListener('message', handleOAuthMessage);
     return () => window.removeEventListener('message', handleOAuthMessage);
-  }, [p.platform, onRefresh]);
+  }, [p.platform, onRefresh, allowedMessageOrigins]);
 
-  const [showEmbed, setShowEmbed] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const [disconnecting, setDisconnecting] = useState(false);
-  const [confirmDisconnect, setConfirmDisconnect] = useState(false);
-  const [showOrgPicker, setShowOrgPicker] = useState(false);
-  const [selectingOrg, setSelectingOrg] = useState(false);
-  const [orgMismatchWarning, setOrgMismatchWarning] = useState(null);
-  const [pendingOrg, setPendingOrg] = useState(null);
-  const meta = PLATFORM_META[p.platform];
-  if (!meta) return null;
-
-  // Popup flow: don't send redirect_after — oauth-callback shows success page with postMessage
-  const connectUrl = p.connect_url || '#';
-  const isWebsite = p.platform === 'website';
-  const details = p.details || {};
-
-  // LinkedIn-specific state
-  const isLinkedIn = p.platform === 'linkedin';
-  const liAvailableOrgs = details.available_orgs || [];
-  const liCurrentOrgUrn = details.org_urn;
-  const liCurrentOrgName = liAvailableOrgs.find(o => o.urn === liCurrentOrgUrn)?.name || details.page_id || '';
-  const liNeedsOrgSelection = details.needs_org_selection; // no org set at all
-  const liNeedsConfirmation = details.needs_confirmation;  // org set but not confirmed
-
-  const handleSelectOrg = async (org, forceOverride = false) => {
-    setSelectingOrg(true);
-    setOrgMismatchWarning(null);
+  async function handleConnect() {
     try {
-      const res = await fetch(`${supabaseUrl}/functions/v1/linkedin-select-org`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ client_id: clientId, org_urn: org.urn, org_id: org.id, org_name: org.name, force_mismatch: forceOverride }),
-      });
-      const data = await res.json();
-      if (data.warning && data.mismatch && !forceOverride) {
-        // Backend says name does not match — show warning and ask to confirm
-        setOrgMismatchWarning({ message: data.message, org });
-        setPendingOrg(org);
-        setSelectingOrg(false);
+      setBusy(true);
+      if (!p.connect_url) {
+        throw new Error(`No connect_url for ${p.platform}`);
+      }
+
+      const popup = window.open(
+        p.connect_url,
+        `${p.platform}-oauth`,
+        'width=620,height=760,scrollbars=yes,resizable=yes'
+      );
+
+      if (!popup) {
+        window.location.href = p.connect_url;
         return;
       }
-      if (!res.ok || data.error) throw new Error(data.error || 'Failed');
-      setShowOrgPicker(false);
-      setOrgMismatchWarning(null);
-      setPendingOrg(null);
+
+      const popupTimer = setInterval(() => {
+        if (popup.closed) {
+          clearInterval(popupTimer);
+          setBusy(false);
+          if (onRefresh) onRefresh();
+        }
+      }, 1000);
+
+      setTimeout(() => {
+        clearInterval(popupTimer);
+      }, 5 * 60 * 1000);
+    } catch (err) {
+      console.error(`[ConnectPanel] Failed to connect ${p.platform}`, err);
+      setBusy(false);
+    }
+  }
+
+  async function handleDisconnect() {
+    try {
+      setBusy(true);
+      await onDisconnect?.(p.platform);
       if (onRefresh) onRefresh();
-    } catch (e) { console.error('Org select failed:', e); }
-    finally { setSelectingOrg(false); }
-  };
-
-  const handleConfirmMismatch = () => {
-    if (pendingOrg) handleSelectOrg(pendingOrg, true);
-  };
-
-  const handleDisconnect = async () => {
-    setDisconnecting(true);
-    try { await onDisconnect(p.platform); setConfirmDisconnect(false); }
-    catch (e) { /* handled in hook */ }
-    finally { setDisconnecting(false); }
-  };
-
-  let statusBadge, action;
-  if (p.connected && !p.is_expired) {
-    if (isLinkedIn && liNeedsConfirmation) {
-      // Org set but not confirmed — needs admin to verify correct page
-      statusBadge = <span className="sc-badge sc-badge-amber">Confirm Page</span>;
-      action = <button className="sc-btn sc-btn-warn" onClick={() => setShowOrgPicker(!showOrgPicker)}>
-        {showOrgPicker ? 'Cancel' : 'Verify Page'}
-      </button>;
-    } else {
-      statusBadge = <span className="sc-badge sc-badge-green">Connected</span>;
-      if (isWebsite) {
-        action = <button className="sc-btn sc-btn-ghost" onClick={() => setShowEmbed(!showEmbed)}>{showEmbed ? 'Hide code' : 'Embed code'}</button>;
-      } else if (!meta.noOAuth) {
-        action = confirmDisconnect
-          ? <span className="sc-confirm-row">
-              <button className="sc-btn sc-btn-danger" onClick={handleDisconnect} disabled={disconnecting}>{disconnecting ? 'Disconnecting...' : 'Confirm'}</button>
-              <button className="sc-btn sc-btn-ghost" onClick={() => setConfirmDisconnect(false)}>Cancel</button>
-            </span>
-          : <span className="sc-confirm-row">
-              {isLinkedIn && <button className="sc-btn sc-btn-ghost sc-btn-xs" onClick={() => setShowOrgPicker(!showOrgPicker)} title="Change LinkedIn page">Change page</button>}
-              <button className="sc-btn sc-btn-ghost sc-btn-disconnect" onClick={() => setConfirmDisconnect(true)}>Disconnect</button>
-            </span>;
-      }
-    }
-  } else if (p.is_expired) {
-    statusBadge = <span className="sc-badge sc-badge-amber">Expired</span>;
-    action = !meta.noOAuth && <button className="sc-btn sc-btn-warn" onClick={() => window.open(connectUrl, '_blank', 'popup,width=600,height=700')}>Reconnect</button>;
-  } else if (!p.enabled) {
-    statusBadge = <span className="sc-badge sc-badge-off">Disabled</span>;
-  } else if (isLinkedIn && liNeedsOrgSelection) {
-    statusBadge = <span className="sc-badge sc-badge-amber">Select Page</span>;
-    action = <button className="sc-btn sc-btn-primary" onClick={() => setShowOrgPicker(!showOrgPicker)}>{showOrgPicker ? 'Cancel' : 'Choose Page'}</button>;
-  } else {
-    statusBadge = <span className="sc-badge sc-badge-red">Not connected</span>;
-    if (isWebsite) action = <button className="sc-btn sc-btn-primary" onClick={() => setShowEmbed(!showEmbed)}>Get embed code</button>;
-    else if (meta.noOAuth) action = meta.derived ? <span className="sc-badge sc-badge-off">Connect Facebook first</span> : null;
-    else action = <button className="sc-btn sc-btn-primary" onClick={() => window.open(connectUrl, '_blank', 'popup,width=600,height=700')}>Connect</button>;
-  }
-
-  // LinkedIn detail note
-  let linkedInNote = null;
-  if (isLinkedIn) {
-    if (p.connected && !p.is_expired && liCurrentOrgName) {
-      linkedInNote = liNeedsConfirmation
-        ? `⚠️ Posting to: ${liCurrentOrgName} — please verify this is correct`
-        : `Page: ${liCurrentOrgName}`;
-    } else if (liNeedsOrgSelection) {
-      linkedInNote = 'Authorized — select a LinkedIn page to post to';
+    } catch (err) {
+      console.error(`[ConnectPanel] Failed to disconnect ${p.platform}`, err);
+    } finally {
+      setBusy(false);
     }
   }
-
-  const embedCode = `<script src="${supabaseUrl}/functions/v1/widget-gallery?format=js" data-client="${clientId}"><\/script>`;
-  const handleCopy = () => { navigator.clipboard.writeText(embedCode); setCopied(true); setTimeout(() => setCopied(false), 2500); };
 
   return (
-    <div className="sc-row" style={{ animationDelay: `${i * 0.03}s` }}>
-      <div className="sc-row-main">
-        <div className="sc-icon" style={{ background: meta.color, color: '#fff' }}><PlatformIcon platform={p.platform} /></div>
-        <div className="sc-info">
-          <div className="sc-name">{meta.name}</div>
-          <div className="sc-note">
-            {isLinkedIn && linkedInNote
-              ? linkedInNote
-              : p.connected && !p.is_expired
-                ? (Object.entries(details).filter(([k, v]) => v && typeof v !== 'object' && k !== 'method').map(([k, v]) => `${k}: ${v}`).join(' · ') || 'Connected')
-                : meta.note}
+    <div
+      className="flex items-center justify-between rounded-xl border border-zinc-200 bg-white px-4 py-3 shadow-sm"
+      style={{ animationDelay: `${i * 40}ms` }}
+    >
+      <div className="flex min-w-0 items-center gap-3">
+        <PlatformIcon platform={p.platform} />
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold text-zinc-900">
+            {p.display_name || p.platform}
+          </div>
+          <div className="truncate text-xs text-zinc-500">
+            {businessName || clientId}
           </div>
         </div>
-        <div className="sc-actions">{statusBadge}{action}</div>
       </div>
 
-      {/* Embed code panel (website) */}
-      {isWebsite && showEmbed && (
-        <div className="sc-embed">
-          <p className="sc-embed-label">Paste this on your website where you want the gallery:</p>
-          <div className="sc-embed-row">
-            <code className="sc-embed-code">{embedCode}</code>
-            <button className="sc-btn sc-btn-ghost" onClick={handleCopy}>{copied ? '✓ Copied' : 'Copy'}</button>
-          </div>
-        </div>
-      )}
+      <div className="ml-4 flex items-center gap-3">
+        <StatusBadge status={p.status} />
 
-      {/* LinkedIn org picker */}
-      {isLinkedIn && showOrgPicker && (
-        <div className="sc-embed">
-          <p className="sc-embed-label">
-            {liNeedsConfirmation
-              ? 'Verify the correct LinkedIn page for this client:'
-              : liCurrentOrgUrn
-                ? 'Change which LinkedIn page to post to:'
-                : 'Which LinkedIn page should we post to?'}
-          </p>
-          {businessName && <p className="sc-note" style={{ marginBottom: 10 }}>Client: <strong>{businessName}</strong></p>}
-
-          {/* Mismatch warning */}
-          {orgMismatchWarning && (
-            <div className="sc-org-mismatch">
-              <p>⚠️ {orgMismatchWarning.message}</p>
-              <div className="sc-confirm-row" style={{ marginTop: 8 }}>
-                <button className="sc-btn sc-btn-danger" onClick={handleConfirmMismatch} disabled={selectingOrg}>
-                  Yes, use this page anyway
-                </button>
-                <button className="sc-btn sc-btn-ghost" onClick={() => { setOrgMismatchWarning(null); setPendingOrg(null); }}>
-                  Cancel
-                </button>
-              </div>
-            </div>
-          )}
-
-          <div className="sc-org-list">
-            {liAvailableOrgs.map((org) => {
-              const isCurrent = org.urn === liCurrentOrgUrn;
-              const hasMismatch = org.name_mismatch;
-              return (
-                <button
-                  key={org.urn}
-                  className={`sc-org-btn ${isCurrent ? 'sc-org-btn-current' : ''} ${hasMismatch ? 'sc-org-btn-mismatch' : ''}`}
-                  onClick={() => handleSelectOrg(org)}
-                  disabled={selectingOrg || isCurrent}
-                  title={hasMismatch ? 'This page name does not match the client business name' : ''}
-                >
-                  <span className="sc-org-name">
-                    {hasMismatch && '⚠️ '}{org.name}
-                    {isCurrent && ' ✓'}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-          {selectingOrg && <p className="sc-note" style={{ marginTop: 8 }}>Saving...</p>}
-        </div>
-      )}
+        {p.status === 'connected' ? (
+          <button
+            onClick={handleDisconnect}
+            disabled={busy}
+            className="inline-flex items-center rounded-lg border border-zinc-300 px-3 py-1.5 text-sm font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50"
+          >
+            {busy ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" /> : null}
+            Disconnect
+          </button>
+        ) : (
+          <button
+            onClick={handleConnect}
+            disabled={busy}
+            className="inline-flex items-center rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-800 disabled:opacity-50"
+          >
+            {busy ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" /> : <Wifi className="mr-2 h-4 w-4" />}
+            Connect
+          </button>
+        )}
+      </div>
     </div>
   );
 }
 
-function ConnectorRow({ c, clientId, endpoint, onRefresh }) {
-  const [token, setToken] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-  const isConnected = c.status === 'connected';
-  const needsDesignator = c.status === 'needs_designator';
-  const isComingSoon = c.availability_status === 'coming_soon' || c.status === 'coming_soon';
-
-  if (isComingSoon) {
-    return (
-      <div className="sc-row sc-row-coming-soon">
-        <div className="sc-row-main">
-          <div className="sc-icon sc-icon-connector"><ConnectorIcon type={c.connector_type} /></div>
-          <div className="sc-info">
-            <div className="sc-name">{c.display_name}</div>
-            <div className="sc-note">{c.description}</div>
-          </div>
-          <div className="sc-actions">
-            <span className="sc-badge sc-badge-coming-soon">Coming Soon</span>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  const handleConnect = async () => {
-    setLoading(true); setError(null);
-    try {
-      const body = { connector_type: c.connector_type, client_id: clientId };
-      if (c.auth_type === 'api_key') {
-        if (!token.trim()) { setError('Enter your API token'); setLoading(false); return; }
-        body.api_token = token.trim();
-      }
-      const res = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-      const data = await res.json();
-      if (!res.ok || data.error) throw new Error(data.error || 'Failed');
-      setToken('');
-      if (onRefresh) onRefresh();
-    } catch (e) { setError(e.message); }
-    finally { setLoading(false); }
-  };
-
-  const handleDisconnect = async () => {
-    setLoading(true);
-    try {
-      await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ connector_type: c.connector_type, client_id: clientId, action: 'disconnect' }) });
-      if (onRefresh) onRefresh();
-    } catch (e) { setError(e.message); }
-    finally { setLoading(false); }
-  };
+export default function ConnectPanel({ clientId, supabaseUrl, businessName }) {
+  const navigate = useNavigate();
+  const { platforms, loading, error, refreshPlatforms, disconnectPlatform } = useConnect({
+    clientId,
+    supabaseUrl,
+  });
 
   return (
-    <div className={`sc-row ${isConnected ? 'sc-row-connected' : ''}`}>
-      <div className="sc-row-main">
-        <div className="sc-icon sc-icon-connector"><ConnectorIcon type={c.connector_type} /></div>
-        <div className="sc-info">
-          <div className="sc-name">{c.display_name}</div>
-          <div className="sc-note">{c.description}</div>
-          {isConnected && c.photos_imported > 0 && (
-            <div className="sc-note">{c.photos_imported} photos imported · Last: {c.last_polled_at ? new Date(c.last_polled_at).toLocaleDateString() : 'Never'}</div>
-          )}
+    <section className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
+      <div className="mb-4 flex items-center justify-between">
+        <div>
+          <h2 className="text-lg font-semibold text-zinc-900">Connected Accounts</h2>
+          <p className="text-sm text-zinc-500">
+            Connect and manage social platforms for {businessName || clientId}.
+          </p>
         </div>
-        <div className="sc-actions">
-          <span className={`sc-badge ${isConnected ? 'sc-badge-green' : needsDesignator ? 'sc-badge-red' : 'sc-badge-amber'}`}>{isConnected ? 'Connected' : needsDesignator ? 'Action Required' : 'Setup Required'}</span>
-          {isConnected && <button className="sc-btn sc-btn-danger" onClick={handleDisconnect} disabled={loading}>Disconnect</button>}
-        </div>
+        <button
+          onClick={refreshPlatforms}
+          className="inline-flex items-center rounded-lg border border-zinc-300 px-3 py-1.5 text-sm font-medium text-zinc-700 hover:bg-zinc-50"
+        >
+          <RefreshCw className="mr-2 h-4 w-4" />
+          Refresh
+        </button>
       </div>
-      {needsDesignator && (
-        <div className="sc-setup sc-setup-warning">
-          <div style={{fontWeight:600,color:'var(--red)',marginBottom:8}}>⚠ Before &amp; After tags not found</div>
-          <p style={{fontSize:13,color:'var(--slate-300)',marginBottom:12,lineHeight:1.5}}>
-            Your CompanyCam account is connected, but no Before &amp; After tags were found. 
-            Only photos tagged with <strong>Before</strong> or <strong>After</strong> are imported — this is required and cannot be changed.
-          </p>
-          <p style={{fontSize:13,color:'var(--slate-400)',marginBottom:12}}>
-            Go to <strong>CompanyCam → Settings → Tags</strong> and create tags named <em>Before</em> and <em>After</em>. 
-            Then reconnect below to activate photo ingestion.
-          </p>
-          <div className="sc-token-row">
-            <input type="password" placeholder="Re-enter your API token to activate" value={token} onChange={e => setToken(e.target.value)} className="sc-input" />
-            <button className="sc-btn sc-btn-primary" onClick={handleConnect} disabled={loading}>{loading ? 'Checking...' : 'Activate'}</button>
-          </div>
-          {error && <div className="sc-row-error">{error}</div>}
+
+      {loading ? (
+        <div className="space-y-3">
+          <div className="h-16 animate-pulse rounded-xl bg-zinc-100" />
+          <div className="h-16 animate-pulse rounded-xl bg-zinc-100" />
+          <div className="h-16 animate-pulse rounded-xl bg-zinc-100" />
+        </div>
+      ) : error ? (
+        <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+          Failed to load platform statuses: {error}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {platforms.map((p, i) => (
+            <PlatformRow
+              key={p.platform}
+              p={p}
+              clientId={clientId}
+              supabaseUrl={supabaseUrl}
+              businessName={businessName}
+              i={i}
+              onDisconnect={disconnectPlatform}
+              onRefresh={refreshPlatforms}
+            />
+          ))}
         </div>
       )}
-      {!isConnected && !needsDesignator && c.auth_type === 'api_key' && (
-        <div className="sc-setup">
-          {c.setup_instructions?.steps && <ol className="sc-steps">{c.setup_instructions.steps.map((s, i) => <li key={i}>{s}</li>)}</ol>}
-          <div className="sc-token-row">
-            <input type="password" placeholder="Paste your API token" value={token} onChange={e => setToken(e.target.value)} className="sc-input" />
-            <button className="sc-btn sc-btn-primary" onClick={handleConnect} disabled={loading}>{loading ? 'Connecting...' : 'Connect'}</button>
-          </div>
-          {error && <div className="sc-row-error">{error}</div>}
-        </div>
-      )}
-    </div>
+
+      <div className="mt-4 border-t border-zinc-200 pt-4">
+        <button
+          onClick={() => navigate('/dashboard')}
+          className="text-sm font-medium text-zinc-600 hover:text-zinc-900"
+        >
+          Back to Dashboard
+        </button>
+      </div>
+    </section>
   );
 }
-
-export { PlatformRow, ConnectorRow };
