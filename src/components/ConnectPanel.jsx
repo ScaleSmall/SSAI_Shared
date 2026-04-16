@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import ReactDOM from 'react-dom';
 import { useConnect } from '../hooks/useConnect.js';
 import { PLATFORM_META } from '../config.js';
 import PlatformIcon from './PlatformIcon.jsx';
@@ -277,8 +278,8 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
         </div>
       )}
 
-      {/* Google OAuth unverified app warning */}
-      {showGoogleWarning && (
+      {/* Google OAuth unverified app warning — rendered via portal to escape sc-row overflow:hidden */}
+      {showGoogleWarning && ReactDOM.createPortal(
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999, backdropFilter: 'blur(4px)' }} onClick={() => setShowGoogleWarning(false)}>
           <div style={{ background: 'var(--bg-card, #1a1a2e)', border: '1px solid var(--border, #333)', borderRadius: 16, padding: '32px 28px', maxWidth: 480, width: '90%', textAlign: 'center', boxShadow: '0 16px 48px rgba(0,0,0,0.5)' }} onClick={e => e.stopPropagation()}>
             <div style={{ fontSize: 28, marginBottom: 12 }}>⚠️</div>
@@ -307,7 +308,8 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
               <button className="sc-btn sc-btn-ghost" onClick={() => setShowGoogleWarning(false)}>Cancel</button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   );
