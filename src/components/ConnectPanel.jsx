@@ -60,19 +60,33 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
 }
 
 function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, onRefresh }) {
-  // Listen for OAuth success postMessage from popup window
+  // Listen for OAuth success — postMessage (primary) + localStorage (fallback for when window.opener is null after redirects)
   useEffect(() => {
     function handleOAuthMessage(event) {
-      // Only accept messages from allowed origins
       const allowedOrigins = ['https://oyyfpkpzalhxztpcdjgq.supabase.co', 'http://localhost:54321'];
       if (!allowedOrigins.some(o => event.origin.startsWith(o) || event.origin === window.location.origin)) return;
       if (event.data?.type === 'oauth-success' && event.data?.platform === p.platform) {
-        console.log(`[ConnectPanel] OAuth success for ${p.platform} — refreshing statuses`);
+        console.log(`[ConnectPanel] OAuth success for ${p.platform} via postMessage — refreshing`);
         if (onRefresh) onRefresh();
       }
     }
+    function handleStorageEvent(event) {
+      if (event.key === 'oauth-success') {
+        try {
+          const data = JSON.parse(event.newValue || '{}');
+          if (data.platform === p.platform) {
+            console.log(`[ConnectPanel] OAuth success for ${p.platform} via localStorage — refreshing`);
+            if (onRefresh) onRefresh();
+          }
+        } catch {}
+      }
+    }
     window.addEventListener('message', handleOAuthMessage);
-    return () => window.removeEventListener('message', handleOAuthMessage);
+    window.addEventListener('storage', handleStorageEvent);
+    return () => {
+      window.removeEventListener('message', handleOAuthMessage);
+      window.removeEventListener('storage', handleStorageEvent);
+    };
   }, [p.platform, onRefresh]);
 
   const [showEmbed, setShowEmbed] = useState(false);
