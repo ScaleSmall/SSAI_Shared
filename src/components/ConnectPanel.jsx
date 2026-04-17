@@ -11,6 +11,29 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
   const { sortedPlatforms, connectors, counts, error, loading, refresh, disconnectPlatform, connectorStatusUrl } = useConnect(clientId, supabaseUrl);
   const hasRR = services && (services.includes('repeat_referral') || services.includes('customer_intelligence'));
 
+  // Detect oauth_success query param (set by oauth-callback redirect)
+  // If this is a popup window, auto-close it. Either way, refresh statuses.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const oauthSuccess = params.get('oauth_success');
+    if (!oauthSuccess) return;
+
+    // Clean the URL (remove query params without reload)
+    const cleanUrl = window.location.pathname;
+    window.history.replaceState({}, '', cleanUrl);
+
+    // Refresh platform statuses
+    refresh();
+
+    // If this is a popup window, close it after a brief delay
+    // The parent window's setInterval will detect w.closed and call onRefresh()
+    if (window.opener || window.history.length <= 2) {
+      setTimeout(() => {
+        window.close();
+      }, 1500);
+    }
+  }, []);
+
   if (!clientId) return (
     <div className={`sc-panel ${className || ''}`}>
       <div className="sc-error">No client ID linked to your account yet. Complete onboarding first.</div>
