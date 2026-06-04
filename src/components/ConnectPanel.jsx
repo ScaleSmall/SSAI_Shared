@@ -35,6 +35,73 @@ function oauthPlatformFor(platform) {
   return platform === 'gbp' ? 'google' : platform;
 }
 
+function cleanDisplayText(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function isRawPlatformIdentifier(value) {
+  const text = cleanDisplayText(value);
+  if (!text) return false;
+  return (
+    text.startsWith('urn:') ||
+    text.includes('/locations/') ||
+    text.includes('/accounts/') ||
+    /^[0-9]{6,}$/.test(text) ||
+    /^UC[A-Za-z0-9_-]{10,}$/.test(text)
+  );
+}
+
+function formatHandle(value) {
+  const text = cleanDisplayText(value);
+  if (!text || isRawPlatformIdentifier(text)) return null;
+  return text.startsWith('@') ? text : `@${text}`;
+}
+
+function firstSafeText(...values) {
+  for (const value of values) {
+    const text = cleanDisplayText(value);
+    if (text && !isRawPlatformIdentifier(text)) return text;
+  }
+  return null;
+}
+
+function currentLinkedInOrgName(details) {
+  const orgUrn = cleanDisplayText(details?.org_urn);
+  const orgs = Array.isArray(details?.available_orgs) ? details.available_orgs : [];
+  const current = orgs.find(org => org?.urn === orgUrn) || null;
+  return firstSafeText(
+    current?.name,
+    current?.display_name,
+    current?.localizedName,
+    current?.localized_name,
+    current?.['organization~']?.localizedName,
+  );
+}
+
+function formatPlatformAccountLabel(platform, details = {}) {
+  switch (platform) {
+    case 'facebook':
+      return firstSafeText(details.page_name, details.name) || formatHandle(details.ig_username);
+    case 'instagram':
+      return formatHandle(details.username || details.ig_username);
+    case 'x':
+    case 'tiktok':
+      return formatHandle(details.username || details.display_name);
+    case 'linkedin':
+      return currentLinkedInOrgName(details);
+    case 'youtube':
+      return firstSafeText(details.channel_title, details.channel_name);
+    case 'gbp':
+      return firstSafeText(details.location, details.location_name, details.account_name);
+    case 'website':
+      return firstSafeText(details.domain);
+    default:
+      return null;
+  }
+}
+
 export default function ConnectPanel({ clientId, supabaseUrl, businessName, services, getToken, className, allowPublisherProxyConfig = false }) {
   const { sortedPlatforms, connectors, counts, uploadPostStatus, error, loading, refresh, disconnectPlatform, connectorStatusUrl, oauthStatusUrl } = useConnect(clientId, supabaseUrl, getToken);
   const hasRR = services && (services.includes('repeat_referral') || services.includes('customer_intelligence'));
@@ -336,7 +403,7 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
   const isLinkedIn = p.platform === 'linkedin';
   const liAvailableOrgs = details.available_orgs || [];
   const liCurrentOrgUrn = details.org_urn;
-  const liCurrentOrgName = liAvailableOrgs.find(o => o.urn === liCurrentOrgUrn)?.name || details.page_id || '';
+  const liCurrentOrgName = currentLinkedInOrgName(details) || '';
   const liNeedsOrgSelection = details.needs_org_selection; // no org set at all
   const liNeedsConfirmation = details.needs_confirmation;  // org set but not confirmed
 
@@ -419,14 +486,13 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
   let linkedInNote = null;
   if (isLinkedIn) {
     if (p.connected && !p.is_expired && liCurrentOrgName) {
-      linkedInNote = liNeedsConfirmation
-        ? `⚠️ Posting to: ${liCurrentOrgName} — please verify this is correct`
-        : `Page: ${liCurrentOrgName}`;
+      linkedInNote = liCurrentOrgName;
     } else if (liNeedsOrgSelection) {
       linkedInNote = 'Authorized — select a LinkedIn page to post to';
     }
   }
 
+  const accountNote = formatPlatformAccountLabel(p.platform, details);
   const embedCode = `<script src="${supabaseUrl}/functions/v1/widget-gallery?format=js" data-client="${clientId}"><\/script>`;
   const handleCopy = () => { navigator.clipboard.writeText(embedCode); setCopied(true); setTimeout(() => setCopied(false), 2500); };
 
@@ -440,7 +506,7 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
             {isLinkedIn && linkedInNote
               ? linkedInNote
               : p.connected && !p.is_expired
-                ? (Object.entries(details).filter(([k, v]) => v && typeof v !== 'object' && k !== 'method').map(([k, v]) => `${k}: ${v}`).join(' · ') || 'Connected')
+                ? (accountNote || 'Connected')
                 : meta.note}
           </div>
         </div>

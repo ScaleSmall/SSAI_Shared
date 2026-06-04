@@ -12,6 +12,12 @@ function includesAll(source, needles, label) {
   }
 }
 
+function excludesAll(source, needles, label) {
+  for (const needle of needles) {
+    assert(!source.includes(needle), `${label} should not include "${needle}"`);
+  }
+}
+
 function appearsInOrder(source, needles, label) {
   let offset = -1;
   for (const needle of needles) {
@@ -38,7 +44,18 @@ includesAll(panel, [
   'Connect ${c.display_name}',
   'allowPublisherProxyConfig = false',
   "action: 'set_upload_post_key'",
+  'formatPlatformAccountLabel',
+  'isRawPlatformIdentifier',
+  'currentLinkedInOrgName',
+  "case 'youtube':",
+  'channel_title',
+  "accountNote || 'Connected'",
 ], 'ConnectPanel cloud OAuth contract');
+
+excludesAll(panel, [
+  'Object.entries(details).filter',
+  'map(([k, v]) => `${k}: ${v}`)',
+], 'ConnectPanel account note privacy contract');
 
 appearsInOrder(panel, [
   'Social Platforms',
