@@ -12,6 +12,11 @@ async function authHeaders(getToken) {
 export function useConnect(clientId, supabaseUrl, getToken) {
   const [platforms, setPlatforms] = useState(null);
   const [connectors, setConnectors] = useState(null);
+  const [uploadPostStatus, setUploadPostStatus] = useState({
+    hasKey: false,
+    hasUser: false,
+    ready: false,
+  });
   const [error, setError] = useState(null);
 
   const { oauthStatusUrl, connectorStatusUrl } = useMemo(
@@ -26,6 +31,11 @@ export function useConnect(clientId, supabaseUrl, getToken) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setPlatforms(data.platforms || []);
+      setUploadPostStatus({
+        hasKey: Boolean(data.has_upload_post_key),
+        hasUser: Boolean(data.has_upload_post_user),
+        ready: Boolean(data.has_upload_post_ready),
+      });
       setError(null);
     } catch (err) {
       setError(`Failed to load platforms: ${err.message}`);
@@ -103,6 +113,7 @@ export function useConnect(clientId, supabaseUrl, getToken) {
 
   return {
     platforms, connectors, sortedPlatforms, counts,
+    uploadPostStatus,
     error, loading: !platforms,
     refresh, fetchPlatforms, fetchConnectors,
     disconnectPlatform,

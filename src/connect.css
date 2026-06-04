@@ -141,6 +141,18 @@
 
 .sc-token-row { display: flex; gap: 8px; }
 
+.sc-row-support-form,
+.sc-row-support-note {
+  padding: 12px 18px 16px;
+  border-top: 1px solid rgba(51, 65, 85, 0.2);
+}
+
+.sc-row-support-note {
+  margin-top: 0;
+  padding-top: 10px;
+  padding-bottom: 12px;
+}
+
 .sc-input {
   flex: 1; padding: 8px 12px;
   background: #0A1221; border: 1px solid #334155;
