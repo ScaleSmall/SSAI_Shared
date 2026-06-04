@@ -1,7 +1,15 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { PLATFORM_ORDER, PLATFORM_META, buildConnectUrls } from '../config.js';
 
-export function useConnect(clientId, supabaseUrl) {
+async function authHeaders(getToken) {
+  const token = getToken ? await getToken() : null;
+  return {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+}
+
+export function useConnect(clientId, supabaseUrl, getToken) {
   const [platforms, setPlatforms] = useState(null);
   const [connectors, setConnectors] = useState(null);
   const [error, setError] = useState(null);
@@ -13,7 +21,8 @@ export function useConnect(clientId, supabaseUrl) {
   const fetchPlatforms = useCallback(async () => {
     if (!clientId) return;
     try {
-      const res = await fetch(`${oauthStatusUrl}?client_id=${clientId}`);
+      const headers = await authHeaders(getToken);
+      const res = await fetch(`${oauthStatusUrl}?client_id=${encodeURIComponent(clientId)}`, { headers });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setPlatforms(data.platforms || []);
@@ -21,12 +30,13 @@ export function useConnect(clientId, supabaseUrl) {
     } catch (err) {
       setError(`Failed to load platforms: ${err.message}`);
     }
-  }, [clientId, oauthStatusUrl]);
+  }, [clientId, oauthStatusUrl, getToken]);
 
   const fetchConnectors = useCallback(async () => {
     if (!clientId) return;
     try {
-      const res = await fetch(`${connectorStatusUrl}?client_id=${clientId}`);
+      const headers = await authHeaders(getToken);
+      const res = await fetch(`${connectorStatusUrl}?client_id=${encodeURIComponent(clientId)}`, { headers });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       // Use all_connectors (includes coming_soon); fall back to my_connectors for older API
@@ -35,7 +45,7 @@ export function useConnect(clientId, supabaseUrl) {
       console.error('Failed to load connectors:', err);
       setConnectors([]);
     }
-  }, [clientId, connectorStatusUrl]);
+  }, [clientId, connectorStatusUrl, getToken]);
 
   useEffect(() => {
     fetchPlatforms();
@@ -75,10 +85,11 @@ export function useConnect(clientId, supabaseUrl) {
   const disconnectPlatform = useCallback(async (platform) => {
     if (!clientId) return;
     try {
+      const headers = await authHeaders(getToken);
       const res = await fetch(oauthStatusUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ client_id: clientId, action: 'disconnect_platform', platform }),
+        headers,
+        body: JSON.stringify({ client_id: clientId, action: 'disconnect_platform', platform, request_id: crypto.randomUUID() }),
       });
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
@@ -88,7 +99,7 @@ export function useConnect(clientId, supabaseUrl) {
       setError(`Failed to disconnect ${platform}: ${err.message}`);
       throw err;
     }
-  }, [clientId, oauthStatusUrl, fetchPlatforms]);
+  }, [clientId, oauthStatusUrl, fetchPlatforms, getToken]);
 
   return {
     platforms, connectors, sortedPlatforms, counts,
@@ -96,5 +107,6 @@ export function useConnect(clientId, supabaseUrl) {
     refresh, fetchPlatforms, fetchConnectors,
     disconnectPlatform,
     connectorStatusUrl,
+    oauthStatusUrl,
   };
 }

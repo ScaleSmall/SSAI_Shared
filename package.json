@@ -4,6 +4,9 @@
   "private": true,
   "main": "src/index.js",
   "type": "module",
+  "scripts": {
+    "check:connect-panel": "node scripts/verify-connect-panel-contract.mjs"
+  },
   "peerDependencies": {
     "react": ">=18.0.0",
     "react-dom": ">=18.0.0"

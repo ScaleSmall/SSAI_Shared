@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useMemo, useState, useEffect } from 'react';
 import ReactDOM from 'react-dom';
 import { useConnect } from '../hooks/useConnect.js';
 import { PLATFORM_META } from '../config.js';
@@ -7,9 +7,74 @@ import ConnectorIcon from './ConnectorIcon.jsx';
 import EmailIdentity from './EmailIdentity.jsx';
 import DataSourcePanel from './DataSourcePanel.jsx';
 
+const CRM_CONNECTOR_TYPES = new Set(['hubspot', 'gohighlevel', 'salesforce']);
+
+function oauthPlatformFor(platform) {
+  return platform === 'gbp' ? 'google' : platform;
+}
+
 export default function ConnectPanel({ clientId, supabaseUrl, businessName, services, getToken, className }) {
-  const { sortedPlatforms, connectors, counts, error, loading, refresh, disconnectPlatform, connectorStatusUrl } = useConnect(clientId, supabaseUrl);
+  const { sortedPlatforms, connectors, counts, error, loading, refresh, disconnectPlatform, connectorStatusUrl } = useConnect(clientId, supabaseUrl, getToken);
   const hasRR = services && (services.includes('repeat_referral') || services.includes('customer_intelligence'));
+  const [oauthBusy, setOauthBusy] = useState(false);
+  const [oauthError, setOauthError] = useState(null);
+
+  const crmConnectors = useMemo(
+    () => (connectors || []).filter(c => CRM_CONNECTOR_TYPES.has(c.connector_type)),
+    [connectors],
+  );
+  const photoConnectors = useMemo(
+    () => (connectors || []).filter(c => !CRM_CONNECTOR_TYPES.has(c.connector_type)),
+    [connectors],
+  );
+
+  const authHeaders = useCallback(async () => {
+    const token = getToken ? await getToken() : null;
+    return {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+  }, [getToken]);
+
+  const startOAuth = useCallback(async (requestedPlatform) => {
+    if (!clientId) return;
+    const popup = window.open('', 'oauth_popup', 'popup,width=600,height=700,noopener=no');
+    if (!popup) {
+      setOauthError('Popup blocked. Please allow popups for this site and try again.');
+      return;
+    }
+    setOauthBusy(true);
+    setOauthError(null);
+    try {
+      const oauthPlatform = oauthPlatformFor(requestedPlatform);
+      const params = new URLSearchParams({
+        platform: oauthPlatform,
+        client_id: clientId,
+        return_to: `${window.location.origin}/oauth-complete`,
+        format: 'json',
+      });
+      if (requestedPlatform === 'gbp') params.set('google_product', 'gbp');
+      const res = await fetch(`${supabaseUrl}/functions/v1/oauth-start?${params.toString()}`, {
+        headers: await authHeaders(),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.auth_url) throw new Error(data.error || `Could not start OAuth (${res.status})`);
+      popup.location.href = data.auth_url;
+      const timer = setInterval(() => {
+        if (popup.closed) {
+          clearInterval(timer);
+          refresh();
+        }
+      }, 800);
+      setTimeout(() => clearInterval(timer), 5 * 60 * 1000);
+    } catch (err) {
+      try { popup.close(); } catch {}
+      setOauthError(err.message || 'Could not start OAuth.');
+    } finally {
+      setOauthBusy(false);
+    }
+  }, [authHeaders, clientId, refresh, supabaseUrl]);
 
   // Detect oauth_success query param (set by oauth-callback redirect)
   // If this is a popup window, auto-close it. Either way, refresh statuses.
@@ -49,6 +114,7 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
       </div>
 
       {error && <div className="sc-error">{error}</div>}
+      {oauthError && <div className="sc-error">{oauthError}</div>}
 
       {loading ? <div className="sc-loading"><div className="sc-spinner" />Loading…</div> : <>
         {/* Social Platforms */}
@@ -56,17 +122,28 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
         <p className="sc-subtitle">Connect the socials you actually use — skip the ones you do not use. You can add more later.</p>
         <div className="sc-list">
           {sortedPlatforms.map((p, i) => (
-            <PlatformRow key={p.platform} p={p} clientId={clientId} supabaseUrl={supabaseUrl} businessName={businessName} i={i} onDisconnect={disconnectPlatform} onRefresh={refresh} />
+            <PlatformRow key={p.platform} p={p} clientId={clientId} supabaseUrl={supabaseUrl} businessName={businessName} i={i} onDisconnect={disconnectPlatform} onRefresh={refresh} onStartOAuth={startOAuth} oauthBusy={oauthBusy} />
           ))}
         </div>
 
+        {/* CRM / Customer Data Sources */}
+        {crmConnectors.length > 0 && <>
+          <div className="sc-section-label" style={{ marginTop: 24 }}>CRM / Customer Data Sources</div>
+          <p className="sc-subtitle">Connect your customer system for Repeat & Referral and Customer Intelligence.</p>
+          <div className="sc-list">
+            {crmConnectors.map(c => (
+              <ConnectorRow key={c.connector_type} c={c} clientId={clientId} endpoint={connectorStatusUrl} getToken={getToken} onRefresh={refresh} onStartOAuth={startOAuth} oauthBusy={oauthBusy} />
+            ))}
+          </div>
+        </>}
+
         {/* Photo Feed Sources */}
-        {connectors && connectors.length > 0 && <>
+        {photoConnectors.length > 0 && <>
           <div className="sc-section-label" style={{ marginTop: 24 }}>Photo Feed Sources</div>
           <p className="sc-subtitle">Connect where your team takes job photos. Connect as many as you use.</p>
           <div className="sc-list">
-            {connectors.map(c => (
-              <ConnectorRow key={c.connector_type} c={c} clientId={clientId} endpoint={connectorStatusUrl} onRefresh={refresh} />
+            {photoConnectors.map(c => (
+              <ConnectorRow key={c.connector_type} c={c} clientId={clientId} endpoint={connectorStatusUrl} getToken={getToken} onRefresh={refresh} onStartOAuth={startOAuth} oauthBusy={oauthBusy} />
             ))}
           </div>
         </>}
@@ -82,7 +159,7 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
   );
 }
 
-function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, onRefresh }) {
+function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, onRefresh, onStartOAuth, oauthBusy }) {
   // Listen for OAuth success — postMessage (primary) + localStorage (fallback for when window.opener is null after redirects)
   useEffect(() => {
     function handleOAuthMessage(event) {
@@ -124,14 +201,11 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
   const meta = PLATFORM_META[p.platform];
   if (!meta) return null;
 
-  // Popup flow: don't send redirect_after — oauth-callback shows success page with postMessage
-  const connectUrl = p.connect_url || '#';
   const isWebsite = p.platform === 'website';
   const isGoogleOAuth = ['youtube', 'gbp', 'google'].includes(p.platform);
 
   const openOAuthPopup = () => {
-    const w = window.open(connectUrl, '_blank', 'popup,width=600,height=700');
-    if (w) { const t = setInterval(() => { if (w.closed) { clearInterval(t); if (onRefresh) onRefresh(); } }, 1000); setTimeout(() => clearInterval(t), 300000); }
+    if (onStartOAuth) onStartOAuth(p.platform);
   };
   const handleConnectClick = () => {
     if (isGoogleOAuth) { setShowGoogleWarning(true); } else { openOAuthPopup(); }
@@ -208,7 +282,7 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
     }
   } else if (p.is_expired) {
     statusBadge = <span className="sc-badge sc-badge-amber">Expired</span>;
-    action = !meta.noOAuth && <button className="sc-btn sc-btn-warn" onClick={handleConnectClick}>Reconnect</button>;
+    action = !meta.noOAuth && <button className="sc-btn sc-btn-warn" onClick={handleConnectClick} disabled={oauthBusy}>Reconnect</button>;
   } else if (!p.enabled) {
     statusBadge = <span className="sc-badge sc-badge-off">Disabled</span>;
   } else if (isLinkedIn && liNeedsOrgSelection) {
@@ -218,7 +292,7 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
     statusBadge = <span className="sc-badge sc-badge-red">Not connected</span>;
     if (isWebsite) action = <button className="sc-btn sc-btn-primary" onClick={() => setShowEmbed(!showEmbed)}>Get embed code</button>;
     else if (meta.noOAuth) action = meta.derived ? <span className="sc-badge sc-badge-off">Connect Facebook first</span> : null;
-    else action = <button className="sc-btn sc-btn-primary" onClick={handleConnectClick}>Connect</button>;
+    else action = <button className="sc-btn sc-btn-primary" onClick={handleConnectClick} disabled={oauthBusy}>Connect</button>;
   }
 
   // LinkedIn detail note
@@ -352,7 +426,15 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
   );
 }
 
-function ConnectorRow({ c, clientId, endpoint, onRefresh }) {
+async function connectorHeaders(getToken) {
+  const token = getToken ? await getToken() : null;
+  return {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+}
+
+function ConnectorRow({ c, clientId, endpoint, getToken, onRefresh, onStartOAuth, oauthBusy }) {
   const [token, setToken] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -385,7 +467,7 @@ function ConnectorRow({ c, clientId, endpoint, onRefresh }) {
         if (!token.trim()) { setError('Enter your API token'); setLoading(false); return; }
         body.api_token = token.trim();
       }
-      const res = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const res = await fetch(endpoint, { method: 'POST', headers: await connectorHeaders(getToken), body: JSON.stringify(body) });
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || 'Failed');
       setToken('');
@@ -397,7 +479,7 @@ function ConnectorRow({ c, clientId, endpoint, onRefresh }) {
   const handleDisconnect = async () => {
     setLoading(true);
     try {
-      await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ connector_type: c.connector_type, client_id: clientId, action: 'disconnect' }) });
+      await fetch(endpoint, { method: 'POST', headers: await connectorHeaders(getToken), body: JSON.stringify({ connector_type: c.connector_type, client_id: clientId, action: 'disconnect' }) });
       if (onRefresh) onRefresh();
     } catch (e) { setError(e.message); }
     finally { setLoading(false); }
@@ -444,6 +526,15 @@ function ConnectorRow({ c, clientId, endpoint, onRefresh }) {
             <input type="password" placeholder="Paste your API token" value={token} onChange={e => setToken(e.target.value)} className="sc-input" />
             <button className="sc-btn sc-btn-primary" onClick={handleConnect} disabled={loading}>{loading ? 'Connecting...' : 'Connect'}</button>
           </div>
+          {error && <div className="sc-row-error">{error}</div>}
+        </div>
+      )}
+      {!isConnected && !needsDesignator && c.auth_type === 'oauth' && (
+        <div className="sc-setup">
+          {c.setup_instructions?.steps && <ol className="sc-steps">{c.setup_instructions.steps.map((s, i) => <li key={i}>{s}</li>)}</ol>}
+          <button className="sc-btn sc-btn-primary" onClick={() => onStartOAuth && onStartOAuth(c.connector_type)} disabled={loading || oauthBusy}>
+            {oauthBusy ? 'Opening...' : `Connect ${c.display_name}`}
+          </button>
           {error && <div className="sc-row-error">{error}</div>}
         </div>
       )}
