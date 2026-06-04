@@ -6,6 +6,7 @@ import PlatformIcon from './PlatformIcon.jsx';
 import ConnectorIcon from './ConnectorIcon.jsx';
 import EmailIdentity from './EmailIdentity.jsx';
 import DataSourcePanel from './DataSourcePanel.jsx';
+import { currentLinkedInOrgName, formatPlatformAccountLabel } from '../utils/platformAccountLabel.js';
 
 const CRM_CONNECTOR_TYPES = new Set(['hubspot', 'gohighlevel', 'salesforce']);
 const PHOTO_CONNECTOR_TYPES = new Set([
@@ -33,73 +34,6 @@ function isPhotoConnector(connector) {
 
 function oauthPlatformFor(platform) {
   return platform === 'gbp' ? 'google' : platform;
-}
-
-function cleanDisplayText(value) {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  return trimmed ? trimmed : null;
-}
-
-function isRawPlatformIdentifier(value) {
-  const text = cleanDisplayText(value);
-  if (!text) return false;
-  return (
-    text.startsWith('urn:') ||
-    text.includes('/locations/') ||
-    text.includes('/accounts/') ||
-    /^[0-9]{6,}$/.test(text) ||
-    /^UC[A-Za-z0-9_-]{10,}$/.test(text)
-  );
-}
-
-function formatHandle(value) {
-  const text = cleanDisplayText(value);
-  if (!text || isRawPlatformIdentifier(text)) return null;
-  return text.startsWith('@') ? text : `@${text}`;
-}
-
-function firstSafeText(...values) {
-  for (const value of values) {
-    const text = cleanDisplayText(value);
-    if (text && !isRawPlatformIdentifier(text)) return text;
-  }
-  return null;
-}
-
-function currentLinkedInOrgName(details) {
-  const orgUrn = cleanDisplayText(details?.org_urn);
-  const orgs = Array.isArray(details?.available_orgs) ? details.available_orgs : [];
-  const current = orgs.find(org => org?.urn === orgUrn) || null;
-  return firstSafeText(
-    current?.name,
-    current?.display_name,
-    current?.localizedName,
-    current?.localized_name,
-    current?.['organization~']?.localizedName,
-  );
-}
-
-function formatPlatformAccountLabel(platform, details = {}) {
-  switch (platform) {
-    case 'facebook':
-      return firstSafeText(details.page_name, details.name) || formatHandle(details.ig_username);
-    case 'instagram':
-      return formatHandle(details.username || details.ig_username);
-    case 'x':
-    case 'tiktok':
-      return formatHandle(details.username || details.display_name);
-    case 'linkedin':
-      return currentLinkedInOrgName(details);
-    case 'youtube':
-      return firstSafeText(details.channel_title, details.channel_name);
-    case 'gbp':
-      return firstSafeText(details.location, details.location_name, details.account_name);
-    case 'website':
-      return firstSafeText(details.domain);
-    default:
-      return null;
-  }
 }
 
 export default function ConnectPanel({ clientId, supabaseUrl, businessName, services, getToken, className, allowPublisherProxyConfig = false }) {

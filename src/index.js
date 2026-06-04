@@ -10,3 +10,11 @@ export { default as EmailIdentity } from './components/EmailIdentity.jsx';
 export { default as DataSourcePanel } from './components/DataSourcePanel.jsx';
 export { useConnect } from './hooks/useConnect.js';
 export { PLATFORM_ORDER, PLATFORM_META, CONNECTOR_ICONS, buildConnectUrls } from './config.js';
+export {
+  cleanDisplayText,
+  currentLinkedInOrgName,
+  firstSafeText,
+  formatHandle,
+  formatPlatformAccountLabel,
+  isRawPlatformIdentifier,
+} from './utils/platformAccountLabel.js';
