@@ -4,8 +4,28 @@
   "private": true,
   "main": "src/index.js",
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    },
+    "./api": {
+      "types": "./src/api.d.ts",
+      "default": "./src/api.js"
+    },
+    "./entity-api": {
+      "types": "./src/entity-api.d.ts",
+      "default": "./src/entity-api.js"
+    },
+    "./ldp-api": {
+      "types": "./src/ldp-api.d.ts",
+      "default": "./src/ldp-api.js"
+    }
+  },
   "scripts": {
-    "check:connect-panel": "node scripts/verify-connect-panel-contract.mjs"
+    "check": "npm run check:connect-panel && npm run check:api-exports",
+    "check:connect-panel": "node scripts/verify-connect-panel-contract.mjs",
+    "check:api-exports": "node scripts/verify-shared-api-contract.mjs"
   },
   "peerDependencies": {
     "react": ">=18.0.0",
