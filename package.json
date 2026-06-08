@@ -20,7 +20,9 @@
     "./ldp-api": {
       "types": "./src/ldp-api.d.ts",
       "default": "./src/ldp-api.js"
-    }
+    },
+    "./src/connect.css": "./src/connect.css",
+    "./connect.css": "./src/connect.css"
   },
   "scripts": {
     "check": "npm run check:connect-panel && npm run check:api-exports",
