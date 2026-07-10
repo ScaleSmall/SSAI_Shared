@@ -25,9 +25,10 @@
     "./connect.css": "./src/connect.css"
   },
   "scripts": {
-    "check": "npm run check:connect-panel && npm run check:api-exports",
+    "check": "node scripts/verify-connect-panel-contract.mjs && node scripts/verify-shared-api-contract.mjs && node scripts/verify-workflow-contracts.mjs",
     "check:connect-panel": "node scripts/verify-connect-panel-contract.mjs",
-    "check:api-exports": "node scripts/verify-shared-api-contract.mjs"
+    "check:api-exports": "node scripts/verify-shared-api-contract.mjs",
+    "check:workflows": "node scripts/verify-workflow-contracts.mjs"
   },
   "peerDependencies": {
     "react": ">=18.0.0",
