@@ -3,23 +3,44 @@ name: Propagate to consumer apps
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      dispatch_connect:
+        description: Dispatch SSAI_Connect rebuild after TikTok review is complete.
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: read
 
 jobs:
   trigger-rebuilds:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
+      - name: Skip protected Connect propagation
+        if: ${{ github.event_name == 'push' || inputs.dispatch_connect != 'true' }}
+        run: |
+          echo "SSAI_Connect dispatch is intentionally skipped while connect.scalesmall.ai is reserved for TikTok OAuth review."
+
       - name: Trigger SSAI_Connect rebuild
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ secrets.SCALESMALL_PAT }}
-          repository: ScaleSmall/SSAI_Connect
-          event-type: shared-updated
-          client-payload: '{"ref": "${{ github.sha }}"}'
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_connect == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.SCALESMALL_PAT }}
+        run: |
+          gh api repos/ScaleSmall/SSAI_Connect/dispatches \
+            --method POST \
+            -f event_type=shared-updated \
+            -F client_payload[ref]='${{ github.sha }}'
 
       - name: Trigger SSAI_Dashboard rebuild
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ secrets.SCALESMALL_PAT }}
-          repository: ScaleSmall/SSAI_Dashboard
-          event-type: shared-updated
-          client-payload: '{"ref": "${{ github.sha }}"}'
+        env:
+          GH_TOKEN: ${{ secrets.SCALESMALL_PAT }}
+        run: |
+          gh api repos/ScaleSmall/SSAI_Dashboard/dispatches \
+            --method POST \
+            -f event_type=shared-updated \
+            -F client_payload[ref]='${{ github.sha }}'
