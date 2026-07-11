@@ -1,7 +1,7 @@
 const DEFAULT_LDP_TIMEOUT_MS = 10000;
 const MAX_LDP_RESPONSE_BYTES = 256 * 1024;
 
-export const LDP_EF_BASE = getPublicEnv('VITE_LDP_API_URL') || 'https://oyyfpkpzalhxztpcdjgq.supabase.co/functions/v1/ldp-api';
+export const LDP_EF_BASE = getPublicEnv('VITE_LDP_API_URL') || 'https://ldp-api.scalesmall.ai';
 
 function getPublicEnv(name) {
   return typeof import.meta !== 'undefined' ? import.meta.env?.[name] || '' : '';

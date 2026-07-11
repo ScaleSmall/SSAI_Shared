@@ -75,6 +75,7 @@ includesAll(entitySource, [
 includesAll(ldpSource, [
   'DEFAULT_LDP_TIMEOUT_MS',
   'MAX_LDP_RESPONSE_BYTES',
+  'https://ldp-api.scalesmall.ai',
   'normalizeLdpPath(path)',
   'AbortController',
   'readJsonWithLimit',
@@ -85,6 +86,7 @@ includesAll(ldpSource, [
 ], 'shared LDP API hardening contract');
 excludesAll(ldpSource, [
   'response.json()',
+  'functions/v1/ldp-api',
 ], 'shared LDP API bounded read contract');
 
 console.log('Shared API subpath exports verified.');
