@@ -20,7 +20,7 @@ if (dirty.length) {
   process.exit(1);
 }
 
-const ignored = git(['status', '--short', '--ignored', '--untracked-files=all'])
+const ignored = git(['status', '--short', '--ignored=matching', '--untracked-files=normal'])
   .split(/\r?\n/)
   .map((line) => line.trimEnd())
   .filter((line) => line.startsWith('!! '));

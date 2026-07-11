@@ -30,11 +30,14 @@ assert.equal(packageJson.exports['./entity-api'].default, './src/entity-api.js')
 assert.equal(packageJson.exports['./ldp-api'].default, './src/ldp-api.js');
 assert.equal(packageJson.engines?.node, '>=24.0.0', 'Shared package must require Node 24');
 assert.equal(scripts.check, 'npm run check:production-readiness', 'Shared check must delegate to production readiness');
+assert.ok(scripts['check:signatures']?.includes('check-npm-signatures.mjs'), 'Shared signatures check must use peer-aware guard');
 
 includesAll(scripts['check:production-readiness'] ?? '', [
   'npm run check:contracts',
   'npm run check:secrets',
   'npm run check:audit',
+  'npm run check:signatures',
+  'git diff --check',
   'npm run check:hygiene',
 ], 'shared production readiness gate');
 
