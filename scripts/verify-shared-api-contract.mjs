@@ -23,10 +23,26 @@ const indexSource = await load('src/index.js');
 const apiSource = await load('src/api.js');
 const entitySource = await load('src/entity-api.js');
 const ldpSource = await load('src/ldp-api.js');
+const scripts = packageJson.scripts ?? {};
 
 assert.equal(packageJson.exports['./api'].default, './src/api.js');
 assert.equal(packageJson.exports['./entity-api'].default, './src/entity-api.js');
 assert.equal(packageJson.exports['./ldp-api'].default, './src/ldp-api.js');
+assert.equal(packageJson.engines?.node, '>=24.0.0', 'Shared package must require Node 24');
+assert.equal(scripts.check, 'npm run check:production-readiness', 'Shared check must delegate to production readiness');
+
+includesAll(scripts['check:production-readiness'] ?? '', [
+  'npm run check:contracts',
+  'npm run check:secrets',
+  'npm run check:audit',
+  'npm run check:hygiene',
+], 'shared production readiness gate');
+
+includesAll(scripts['check:contracts'] ?? '', [
+  'verify-connect-panel-contract.mjs',
+  'verify-shared-api-contract.mjs',
+  'verify-workflow-contracts.mjs',
+], 'shared contract gate');
 
 includesAll(indexSource, [
   "export * from './api.js'",

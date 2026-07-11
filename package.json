@@ -4,6 +4,9 @@
   "private": true,
   "main": "src/index.js",
   "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "exports": {
     ".": {
       "types": "./src/index.d.ts",
@@ -25,9 +28,14 @@
     "./connect.css": "./src/connect.css"
   },
   "scripts": {
-    "check": "node scripts/verify-connect-panel-contract.mjs && node scripts/verify-shared-api-contract.mjs && node scripts/verify-workflow-contracts.mjs",
+    "check": "npm run check:production-readiness",
+    "check:production-readiness": "npm run check:contracts && npm run check:secrets && npm run check:audit && npm run check:hygiene",
+    "check:contracts": "node scripts/verify-connect-panel-contract.mjs && node scripts/verify-shared-api-contract.mjs && node scripts/verify-workflow-contracts.mjs",
+    "check:audit": "npm audit --audit-level=high",
     "check:connect-panel": "node scripts/verify-connect-panel-contract.mjs",
     "check:api-exports": "node scripts/verify-shared-api-contract.mjs",
+    "check:hygiene": "node scripts/check-hygiene.mjs",
+    "check:secrets": "node scripts/check-no-secrets.mjs",
     "check:workflows": "node scripts/verify-workflow-contracts.mjs"
   },
   "peerDependencies": {
