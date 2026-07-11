@@ -427,7 +427,7 @@ function PlatformRow({ p, clientId, supabaseUrl, businessName, i, onDisconnect, 
   }
 
   const accountNote = formatPlatformAccountLabel(p.platform, details);
-  const embedCode = `<script src="${supabaseUrl}/functions/v1/widget-gallery?format=js" data-client="${clientId}"><\/script>`;
+  const embedCode = `<script src="${supabaseUrl}/functions/v1/widget-gallery?format=js" data-client="${clientId}" data-render="auto" data-modules="beacon,gallery,articles"><\/script>`;
   const handleCopy = () => { navigator.clipboard.writeText(embedCode); setCopied(true); setTimeout(() => setCopied(false), 2500); };
 
   return (
