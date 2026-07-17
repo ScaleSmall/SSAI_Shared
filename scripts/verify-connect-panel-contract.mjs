@@ -36,6 +36,7 @@ const panel = await load('src/components/ConnectPanel.jsx');
 const hook = await load('src/hooks/useConnect.js');
 const styles = await load('src/connect.css');
 const accountLabel = await load('src/utils/platformAccountLabel.js');
+const emailIdentity = await load('src/components/EmailIdentity.jsx');
 
 includesAll(panel, [
   "new Set(['hubspot', 'gohighlevel', 'salesforce'])",
@@ -66,6 +67,16 @@ excludesAll(panel, [
   'Object.entries(details).filter',
   'map(([k, v]) => `${k}: ${v}`)',
 ], 'ConnectPanel account note privacy contract');
+
+includesAll(emailIdentity, [
+  'request_id: checkoutRequestIdRef.current',
+  'if (!res.ok || data.error)',
+], 'Email identity checkout verification contract');
+
+excludesAll(emailIdentity, [
+  "params.get('dify_paid') === 'true'",
+  "success_url: window.location.href + '?dify_paid=true'",
+], 'Email identity must not trust client-side payment return parameters');
 
 appearsInOrder(panel, [
   'Social Platforms',

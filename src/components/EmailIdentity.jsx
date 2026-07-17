@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 
 const PROVIDERS = [
   { id: 'godaddy', name: 'GoDaddy', helpUrl: 'https://www.godaddy.com/help/invite-a-delegate-to-access-my-godaddy-account-12376', accessType: 'Delegate Access', accessLevel: 'Products & Domains', steps: ['Log in at godaddy.com', 'Click your name (top-right) → Account Settings', 'Select "Delegate Access" from the menu', 'Click "Invite to Access"', 'Enter name: ScaleSmall, email: admin@scalesmall.ai', 'Select "Products & Domains" as access level', 'Click Invite'] },
@@ -73,6 +73,7 @@ export default function EmailIdentity({ supabaseUrl, getToken, stripePublishable
   const [selectedProvider, setSelectedProvider] = useState(null);
   const [showSelfSetup, setShowSelfSetup] = useState(false);
   const [paymentProcessing, setPaymentProcessing] = useState(false);
+  const checkoutRequestIdRef = useRef(null);
 
   const endpoint = `${supabaseUrl}/functions/v1/rr-domain-verify`;
 
@@ -142,18 +143,19 @@ export default function EmailIdentity({ supabaseUrl, getToken, stripePublishable
   const handleDIFYPayment = async () => {
     setPaymentProcessing(true); setError(null);
     try {
+      checkoutRequestIdRef.current ||= crypto.randomUUID();
       const token = await getToken();
       const res = await fetch(`${supabaseUrl}/functions/v1/stripe-checkout`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           service_slug: 'email_domain_setup',
-          success_url: window.location.href + '?dify_paid=true',
-          cancel_url: window.location.href + '?dify_cancelled=true',
+          request_id: checkoutRequestIdRef.current,
+          cancel_url: window.location.href,
         }),
       });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) throw new Error(data.error || `Checkout returned ${res.status}`);
       if (data.url) {
         window.location.href = data.url; // Redirect to Stripe Checkout
       } else {
@@ -164,27 +166,6 @@ export default function EmailIdentity({ supabaseUrl, getToken, stripePublishable
       setPaymentProcessing(false);
     }
   };
-
-  // Check for payment return
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('dify_paid') === 'true') {
-      setAcknowledged(true); setShowExplainer(false);
-      setShowDIFY(true); setDifyStep('instructions');
-      setSuccess('Payment received! Now follow the steps below to grant us access.');
-      // Clean URL
-      const url = new URL(window.location);
-      url.searchParams.delete('dify_paid');
-      window.history.replaceState({}, '', url);
-    }
-    if (params.get('dify_cancelled') === 'true') {
-      setAcknowledged(true); setShowExplainer(false);
-      setShowDIFY(true); setDifyStep('select_provider');
-      const url = new URL(window.location);
-      url.searchParams.delete('dify_cancelled');
-      window.history.replaceState({}, '', url);
-    }
-  }, []);
 
   const providerInfo = selectedProvider ? PROVIDERS.find(p => p.id === selectedProvider) : null;
 
