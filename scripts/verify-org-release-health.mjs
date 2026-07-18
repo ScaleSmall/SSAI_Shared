@@ -5,6 +5,7 @@ import {
   commitStatusStreamIdentity,
   deploymentJobStreamIdentity,
   deploymentStreamIdentity,
+  evaluateNoHistoryAllowance,
   findProvisionalCheckRecovery,
   findProvisionalWorkflowRecovery,
   findDeploymentCheckRecovery,
@@ -14,6 +15,7 @@ import {
   findSupersedingDeployment,
   findSupersedingWorkflowRun,
   latestByIdentity,
+  partitionWorkflowHealth,
   rateHeadroomDecision,
   recordActivityTime,
   recordOccurrenceTime,
@@ -59,7 +61,32 @@ const pageLimits = scanMode === 'incident'
   ? { workflows: 10, runs: 50, commits: 20, pulls: 10, branches: 10, checks: 20, statuses: 20, deployments: 50, repositories: 10 }
   : { workflows: 10, runs: 10, commits: 5, pulls: 3, branches: 3, checks: 5, statuses: 5, deployments: 10, repositories: 10 };
 
-const allowedNoHistory = new Set(['SSAI_CI_Engine:Retire Production CI Test Token Broker']);
+const noHistoryPolicies = new Map([
+  ['SSAI_CI_Engine:Retire Production CI Test Token Broker', {
+    path: '.github/workflows/retire-production-ci-test-tokens.yml',
+    sourceSha256: '3cd089034a5b52f8ddd0297f1d82d8fc4422bccb7a1aac00e9c7750875f023a5',
+    reason: 'One-shot manual broker-retirement control remains dormant until permanent production test-token retirement is authorized.',
+    witness: {
+      name: 'Production Customer Intelligence Worker',
+      path: '.github/workflows/production-ci-worker.yml',
+      headRepository: 'ScaleSmall/SSAI_CI_Engine',
+      allowedEvents: ['schedule', 'workflow_dispatch'],
+      maxAgeHours: 4,
+    },
+  }],
+  ['SSAI_Analytics_Reporting:Deploy Production Analytics Pages', {
+    path: '.github/workflows/deploy-production-pages.yml',
+    sourceSha256: '1ffee267b32c9a5579455fc8b4684ab28c7be0d187a7f0a50257ce6ad1299cc6',
+    reason: 'Manual-only production release control is dormant; live Analytics Pages health must instead be proven by its scheduled canary.',
+    witness: {
+      name: 'Production Analytics Pages Canary',
+      path: '.github/workflows/production-pages-canary.yml',
+      headRepository: 'ScaleSmall/SSAI_Analytics_Reporting',
+      allowedEvents: ['schedule', 'workflow_dispatch'],
+      maxAgeHours: 30,
+    },
+  }],
+]);
 const acceptableConclusions = new Set(['success', 'neutral', 'skipped']);
 const failedConclusions = new Set(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale']);
 const failedDeploymentStates = new Set(['failure', 'error']);
@@ -110,9 +137,14 @@ if (requestStats.rate_remaining !== null && requestStats.rate_remaining < rateRe
 }
 
 const workflowRows = rows.flatMap((row) => row.workflows);
-const greenWorkflows = workflowRows.filter((row) => row.status === 'completed' && acceptableConclusions.has(row.conclusion));
-const pendingWorkflows = workflowRows.filter((row) => row.status !== 'completed' && row.status !== 'no_history');
-const noHistoryWorkflows = workflowRows.filter((row) => row.status === 'no_history');
+const {
+  green: greenWorkflows,
+  pending: pendingWorkflows,
+  failed: failedWorkflows,
+  allowedNoHistory: allowedNoHistoryWorkflows,
+  unresolvedNoHistory: unresolvedNoHistoryWorkflows,
+  categorized: categorizedWorkflows,
+} = partitionWorkflowHealth(workflowRows, acceptableConclusions);
 const summary = {
   ok: failures.length === 0,
   deferred: false,
@@ -125,7 +157,18 @@ const summary = {
   active_workflows: workflowRows.length,
   green_workflows: greenWorkflows.length,
   pending_workflows: pendingWorkflows.length,
-  allowed_no_history_workflows: noHistoryWorkflows.length,
+  failed_workflows: failedWorkflows.length,
+  allowed_no_history_workflows: allowedNoHistoryWorkflows.length,
+  unresolved_no_history_workflows: unresolvedNoHistoryWorkflows.length,
+  categorized_workflows: categorizedWorkflows,
+  workflow_categories_complete: categorizedWorkflows === workflowRows.length,
+  allowed_no_history_evidence: allowedNoHistoryWorkflows.map((row) => ({
+    repo: row.repo,
+    workflow: row.name,
+    reason: row.no_history_reason,
+    workflow_source_sha256: row.no_history_source_sha256,
+    witness: row.no_history_witness,
+  })),
   current_commit_checks: rows.reduce((total, row) => total + row.checks.length + row.statuses.length, 0),
   lookback_hours: lookbackHours,
   lookback_started_at: cutoffIso,
@@ -175,6 +218,7 @@ async function inspectRepository(repo) {
     collectBranches(repo.name),
     collectRecentDeploymentStatuses(repo.name),
   ]);
+  const headSha = String(commit.sha || '');
 
   const defaultCommitShas = new Set(recentCommits.map((recentCommit) => String(recentCommit.sha || '')));
   const nonDefaultBranches = branches.filter((branch) => branch.name !== defaultBranch
@@ -201,8 +245,37 @@ async function inspectRepository(repo) {
 
     const key = repo.name + ':' + workflow.name;
     if (!run) {
-      if (!allowedNoHistory.has(key)) failures.push(issue(repo.name, workflow.name, 'active workflow has no default-branch run history'));
-      return { name: workflow.name, id: workflow.id, status: 'no_history', conclusion: 'no_history', run_id: null, url: workflow.html_url };
+      const policy = noHistoryPolicies.get(key);
+      const workflowSource = policy ? await collectWorkflowSource(repo.name, workflow.path, headSha) : null;
+      const allowance = evaluateNoHistoryAllowance({
+        workflow,
+        policy,
+        workflowSource,
+        workflows: allWorkflows,
+        runs: recentRuns,
+        defaultBranch,
+        expectedHeadSha: headSha,
+        nowMs,
+      });
+      if (!allowance.allowed) {
+        failures.push(issue(repo.name, workflow.name, 'active workflow has no default-branch run history; ' + allowance.reason));
+      } else {
+        const witnessText = allowance.witness ? ' Witness run ' + allowance.witness.run_id + ' is current.' : '';
+        warnings.push(repo.name + ' / ' + workflow.name + ' has no run history under an exact manual-control allowance.' + witnessText);
+      }
+      return {
+        repo: repo.name,
+        name: workflow.name,
+        id: workflow.id,
+        status: 'no_history',
+        conclusion: 'no_history',
+        run_id: null,
+        url: workflow.html_url,
+        allowed_no_history: allowance.allowed,
+        no_history_reason: allowance.reason,
+        no_history_source_sha256: allowance.workflow_source_sha256 || null,
+        no_history_witness: allowance.witness,
+      };
     }
 
     const ageMs = nowMs - recordOccurrenceTime(run);
@@ -212,12 +285,11 @@ async function inspectRepository(repo) {
     } else if (run.status !== 'completed' && ageMs > stuckMs) {
       failures.push(issue(repo.name, workflow.name, 'run ' + run.id + ' is stuck in ' + run.status + ' for more than ' + stuckMinutes + ' minutes', workflowRunUrl(run)));
     }
-    return { name: workflow.name, id: workflow.id, status: run.status, conclusion, run_id: run.id, url: workflowRunUrl(run) };
+    return { repo: repo.name, name: workflow.name, id: workflow.id, status: run.status, conclusion, run_id: run.id, url: workflowRunUrl(run) };
   });
 
   reconcileWorkflowFailures(repo.name, recentRuns);
 
-  const headSha = String(commit.sha || '');
   const shaMetadata = new Map();
   for (const run of recentRuns.filter((candidate) => recordActivityTime(candidate) >= cutoffMs || Number(candidate.id) === currentRunId)) {
     addShaMetadata(
@@ -363,6 +435,24 @@ async function collectWorkflows(repoName) {
     if (page === pageLimits.workflows) throw truncationError(repoName, 'workflows', pageLimits.workflows);
   }
   throw truncationError(repoName, 'workflows', pageLimits.workflows);
+}
+
+async function collectWorkflowSource(repoName, workflowPath, ref) {
+  const path = String(workflowPath || '').trim();
+  if (!/^\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml$/.test(path)) {
+    throw new Error(repoName + ' no-history policy references an unsafe workflow path.');
+  }
+  const encodedPath = path.split('/').map(encodeURIComponent).join('/');
+  const payload = await api('/repos/' + owner + '/' + repoName + '/contents/' + encodedPath + '?ref=' + encodeURIComponent(ref));
+  const size = Number(payload?.size);
+  const content = String(payload?.content || '').replace(/\s/g, '');
+  if (payload?.type !== 'file' || payload?.encoding !== 'base64' || !Number.isSafeInteger(size) || size < 1 || size > 262_144
+    || content.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(content)) {
+    throw new Error(repoName + ' workflow source response is invalid or exceeds the 256 KiB safety bound.');
+  }
+  const bytes = Buffer.from(content, 'base64');
+  if (bytes.length !== size) throw new Error(repoName + ' workflow source response failed its byte-length integrity check.');
+  return bytes;
 }
 
 async function collectRecentCommits(repoName, defaultBranch) {
@@ -936,7 +1026,10 @@ async function writeStepSummary(result) {
     '- Active workflows: ' + result.active_workflows,
     '- Green workflows: ' + result.green_workflows,
     '- Pending workflows: ' + result.pending_workflows,
+    '- Failed workflows: ' + result.failed_workflows,
     '- Allowed no-history workflows: ' + result.allowed_no_history_workflows,
+    '- Unresolved no-history workflows: ' + result.unresolved_no_history_workflows,
+    '- Categorized workflows: ' + result.categorized_workflows + '/' + result.active_workflows,
     '- Current commit checks/statuses: ' + result.current_commit_checks,
     '- Workflow failures recovered/provisional/unresolved: ' + result.recovered_recent_workflow_attempts + '/' + result.provisional_self_recovering_workflow_attempts + '/' + result.unresolved_recent_workflow_attempts,
     '- Check failures recovered/provisional/unresolved: ' + result.recovered_recent_check_runs + '/' + result.provisional_self_recovering_check_runs + '/' + result.unresolved_recent_check_runs,
@@ -946,6 +1039,16 @@ async function writeStepSummary(result) {
     '- Failures: ' + result.failures.length,
   ];
   if (result.deferred) lines.push('- Deferral reason: ' + result.deferred_reason);
+  if (result.allowed_no_history_evidence.length) {
+    lines.push('', '## Explicit no-history allowances', '', ...result.allowed_no_history_evidence.map((evidence) => {
+      const witness = evidence.witness
+        ? ' Witness: [' + evidence.witness.workflow + ' run ' + evidence.witness.run_id + '](' + safeMarkdownUrl(evidence.witness.url) + ') on `'
+          + evidence.witness.head_sha + '` via `' + evidence.witness.event + '` from `' + evidence.witness.head_repository + '`.'
+        : '';
+      return '- ' + evidence.repo + ' / ' + evidence.workflow + ': ' + evidence.reason
+        + ' Approved source SHA-256: `' + evidence.workflow_source_sha256 + '`.' + witness;
+    }));
+  }
   if (result.failures.length) {
     lines.push('', '## Failures', '', ...result.failures.map((failure) => '- ' + (failure.url ? '[' + failure.repo + ' / ' + failure.owner + '](' + safeMarkdownUrl(failure.url) + ')' : failure.repo + ' / ' + failure.owner) + ': ' + failure.problem));
   }
@@ -967,7 +1070,12 @@ function deferredRateSummary() {
     active_workflows: 0,
     green_workflows: 0,
     pending_workflows: 0,
+    failed_workflows: 0,
     allowed_no_history_workflows: 0,
+    unresolved_no_history_workflows: 0,
+    categorized_workflows: 0,
+    workflow_categories_complete: false,
+    allowed_no_history_evidence: [],
     current_commit_checks: 0,
     lookback_hours: lookbackHours,
     lookback_started_at: cutoffIso,
