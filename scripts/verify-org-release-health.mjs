@@ -1,4 +1,5 @@
 import { appendFile } from 'node:fs/promises';
+import { latestByIdentity } from './release-health-monitor-utils.mjs';
 
 const token = requiredSecret(process.env.SSAI_RELEASE_MONITOR_GITHUB_TOKEN, 'SSAI_RELEASE_MONITOR_GITHUB_TOKEN');
 const owner = safeName(process.env.SSAI_RELEASE_MONITOR_OWNER || 'ScaleSmall', 'SSAI_RELEASE_MONITOR_OWNER');
@@ -77,7 +78,11 @@ async function inspectRepository(repo) {
     api(`/repos/${owner}/${repo.name}/commits/${headSha}/check-runs?filter=latest&per_page=100`),
     api(`/repos/${owner}/${repo.name}/commits/${headSha}/statuses?per_page=100`),
   ]);
-  const checks = (checkPayload.check_runs || []).map((check) => {
+  const latestChecks = latestByIdentity(
+    checkPayload.check_runs || [],
+    (check) => `${check.app?.slug || check.app?.id || 'unknown-app'}:${check.name}`,
+  );
+  const checks = latestChecks.map((check) => {
     const ageMs = Date.now() - new Date(check.started_at || check.created_at || 0).getTime();
     const conclusion = String(check.conclusion || '');
     if (check.status === 'completed' && failedConclusions.has(conclusion)) {
@@ -87,12 +92,7 @@ async function inspectRepository(repo) {
     }
     return { name: check.name, status: check.status, conclusion, url: check.details_url };
   });
-  const seenStatusContexts = new Set();
-  const latestStatuses = (statusPayload || []).filter((status) => {
-    if (seenStatusContexts.has(status.context)) return false;
-    seenStatusContexts.add(status.context);
-    return true;
-  });
+  const latestStatuses = latestByIdentity(statusPayload || [], (status) => status.context);
   const statuses = latestStatuses.map((status) => {
     const ageMs = Date.now() - new Date(status.updated_at || status.created_at || 0).getTime();
     if (['error', 'failure'].includes(status.state)) {

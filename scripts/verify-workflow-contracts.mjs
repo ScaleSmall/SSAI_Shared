@@ -23,6 +23,7 @@ const rejectPattern = (source, pattern, description) => {
 const validate = await readWorkflow('validate.yml');
 const propagate = await readWorkflow('propagate.yml');
 const releaseHealth = await readWorkflow('release-health-monitor.yml');
+const releaseHealthVerifier = await readFile(path.join(repoRoot, 'scripts', 'verify-org-release-health.mjs'), 'utf8');
 const combined = `${validate}\n${propagate}\n${releaseHealth}`;
 
 requireText(validate, 'permissions:\n  contents: read', 'read-only workflow permissions');
@@ -50,6 +51,8 @@ requireText(releaseHealth, 'persist-credentials: false', 'release-health checkou
 requireText(releaseHealth, "node-version: '24'", 'release-health Node runtime');
 requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SCALESMALL_PAT }}', 'release-health organization token source');
 requireText(releaseHealth, 'node scripts/verify-org-release-health.mjs', 'organization release-health verifier');
+requireText(releaseHealthVerifier, 'latestByIdentity(', 'latest current-check selection');
+requireText(releaseHealthVerifier, "check.app?.slug || check.app?.id || 'unknown-app'", 'provider-scoped check identity');
 
 rejectPattern(combined, /ubuntu-latest/, 'floating GitHub runner label');
 rejectPattern(combined, /peter-evans\/repository-dispatch@v\d+/i, 'floating repository-dispatch action');
