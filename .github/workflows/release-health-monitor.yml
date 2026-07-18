@@ -2,6 +2,20 @@ name: Scale Small AI Release Health Monitor
 
 on:
   workflow_dispatch:
+    inputs:
+      scan_mode:
+        description: Continuous 6-hour monitor or explicit exhaustive incident sweep
+        required: true
+        default: continuous
+        type: choice
+        options:
+          - continuous
+          - incident
+      lookback_hours:
+        description: Continuous supports 1-6 hours; incident supports 1-168 hours
+        required: false
+        default: '6'
+        type: string
   schedule:
     - cron: '*/15 * * * *'
 
@@ -19,10 +33,15 @@ jobs:
   verify:
     name: Verify current organization release health
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: ${{ inputs.scan_mode == 'incident' && 45 || 12 }}
     env:
       SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SCALESMALL_PAT }}
       SSAI_RELEASE_MONITOR_STUCK_MINUTES: '45'
+      SSAI_RELEASE_MONITOR_MODE: ${{ inputs.scan_mode || 'continuous' }}
+      SSAI_RELEASE_MONITOR_LOOKBACK_HOURS: ${{ inputs.lookback_hours || '6' }}
+      SSAI_RELEASE_MONITOR_MAX_REQUESTS: ${{ inputs.scan_mode == 'incident' && '3500' || '600' }}
+      SSAI_RELEASE_MONITOR_RATE_RESERVE: ${{ inputs.scan_mode == 'incident' && '250' || '1000' }}
+      SSAI_RELEASE_MONITOR_API_CONCURRENCY: '6'
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
         with:
@@ -41,5 +60,5 @@ jobs:
             exit 1
           fi
 
-      - name: Inspect every current SSAI workflow and deployment check
+      - name: Reconcile current health and every recent failure
         run: node scripts/verify-org-release-health.mjs
