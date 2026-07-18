@@ -20,6 +20,17 @@ const rejectPattern = (source, pattern, description) => {
   }
 };
 
+const requireBalancedExpressions = (source, description) => {
+  const openings = source.match(/\$\{\{/g)?.length ?? 0;
+  const closings = source.match(/\}\}/g)?.length ?? 0;
+  if (openings !== closings) throw new Error(`Unbalanced GitHub expressions in ${description}: ${openings}/${closings}`);
+};
+
+const requireSpaceIndentation = (source, description) => {
+  const tabbedLine = source.split('\n').findIndex((line) => /^\s*\t|\t/.test(line));
+  if (tabbedLine >= 0) throw new Error(`${description} contains a tab on line ${tabbedLine + 1}`);
+};
+
 const validate = await readWorkflow('validate.yml');
 const propagate = await readWorkflow('propagate.yml');
 const releaseHealth = await readWorkflow('release-health-monitor.yml');
@@ -50,9 +61,39 @@ requireText(releaseHealth, 'runs-on: ubuntu-24.04', 'pinned release-health runne
 requireText(releaseHealth, 'persist-credentials: false', 'release-health checkout credential isolation');
 requireText(releaseHealth, "node-version: '24'", 'release-health Node runtime');
 requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SCALESMALL_PAT }}', 'release-health organization token source');
+requireText(releaseHealth, 'scan_mode:', 'explicit continuous/incident release-health mode');
+requireText(releaseHealth, 'type: choice', 'validated release-health mode choice');
+requireText(releaseHealth, '          - continuous\n          - incident', 'release-health mode options');
+requireText(releaseHealth, 'lookback_hours:', 'manual release-health lookback control');
+requireText(releaseHealth, "default: '6'", 'bounded scheduled release-health lookback default');
+requireText(releaseHealth, "timeout-minutes: ${{ inputs.scan_mode == 'incident' && 45 || 12 }}", 'mode-bounded release-health timeout');
+requireText(releaseHealth, "SSAI_RELEASE_MONITOR_MODE: ${{ inputs.scan_mode || 'continuous' }}", 'release-health scan mode');
+requireText(releaseHealth, "SSAI_RELEASE_MONITOR_LOOKBACK_HOURS: ${{ inputs.lookback_hours || '6' }}", 'release-health failure lookback');
+requireText(releaseHealth, "SSAI_RELEASE_MONITOR_MAX_REQUESTS: ${{ inputs.scan_mode == 'incident' && '3500' || '600' }}", 'release-health API request budget');
+requireText(releaseHealth, "SSAI_RELEASE_MONITOR_RATE_RESERVE: ${{ inputs.scan_mode == 'incident' && '250' || '1000' }}", 'release-health API reserve');
+requireText(releaseHealth, "SSAI_RELEASE_MONITOR_API_CONCURRENCY: '6'", 'release-health global API concurrency');
 requireText(releaseHealth, 'node scripts/verify-org-release-health.mjs', 'organization release-health verifier');
 requireText(releaseHealthVerifier, 'latestByIdentity(', 'latest current-check selection');
-requireText(releaseHealthVerifier, "check.app?.slug || check.app?.id || 'unknown-app'", 'provider-scoped check identity');
+requireText(releaseHealthVerifier, 'findSupersedingWorkflowRun(', 'recent workflow failure recovery selection');
+requireText(releaseHealthVerifier, 'findSupersedingCheck(', 'recent external check failure recovery selection');
+requireText(releaseHealthVerifier, 'findDeploymentCheckRecovery(', 'cross-trigger deployment recovery proof');
+requireText(releaseHealthVerifier, 'findMergedPullCheckRecovery(', 'merged pull-request recovery proof');
+requireText(releaseHealthVerifier, 'associateChecksWithPulls(', 'force-pushed pull-request recovery association');
+requireText(releaseHealthVerifier, 'findSupersedingCommitStatus(', 'recent classic commit-status recovery selection');
+requireText(releaseHealthVerifier, 'findSupersedingDeployment(', 'recent deployment failure recovery selection');
+requireText(releaseHealthVerifier, "'/attempts/' + attemptNumber", 'rerun-attempt failure inventory');
+requireText(releaseHealthVerifier, 'collectWorkflows(repo.name)', 'paginated workflow inventory');
+requireText(releaseHealthVerifier, 'collectBranches(repo.name)', 'independent all-branch commit inventory');
+requireText(releaseHealthVerifier, 'collectRecentCommitStatuses(', 'recent classic commit-status inventory');
+requireText(releaseHealthVerifier, "identity_source = 'github-actions-job'", 'deployment-to-job stream binding');
+requireText(releaseHealthVerifier, 'findCurrentSelfRunRecovery(', 'self-latch workflow recovery guard');
+requireText(releaseHealthVerifier, 'findCurrentSelfCheckRecovery(', 'self-latch check recovery guard');
+requireText(releaseHealthVerifier, 'createConcurrencyGate(apiConcurrency)', 'global GitHub API concurrency gate');
+requireText(releaseHealthVerifier, 'GitHub API request budget exhausted', 'fail-closed API request budget');
+requireText(releaseHealthVerifier, 'throw truncationError(', 'fail-closed pagination');
+
+requireBalancedExpressions(releaseHealth, 'release-health workflow');
+requireSpaceIndentation(releaseHealth, 'release-health workflow');
 
 rejectPattern(combined, /ubuntu-latest/, 'floating GitHub runner label');
 rejectPattern(combined, /peter-evans\/repository-dispatch@v\d+/i, 'floating repository-dispatch action');
