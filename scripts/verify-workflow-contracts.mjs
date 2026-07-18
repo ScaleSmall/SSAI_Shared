@@ -22,7 +22,8 @@ const rejectPattern = (source, pattern, description) => {
 
 const validate = await readWorkflow('validate.yml');
 const propagate = await readWorkflow('propagate.yml');
-const combined = `${validate}\n${propagate}`;
+const releaseHealth = await readWorkflow('release-health-monitor.yml');
+const combined = `${validate}\n${propagate}\n${releaseHealth}`;
 
 requireText(validate, 'permissions:\n  contents: read', 'read-only workflow permissions');
 requireText(validate, 'runs-on: ubuntu-24.04', 'pinned validation runner');
@@ -39,6 +40,16 @@ requireText(propagate, "repos/ScaleSmall/SSAI_Connect/dispatches", 'manual Conne
 requireText(propagate, "github.event_name == 'workflow_dispatch' && inputs.dispatch_connect == 'true'", 'manual Connect dispatch guard');
 requireText(propagate, "repos/ScaleSmall/SSAI_Dashboard/dispatches", 'Dashboard dispatch target');
 requireText(propagate, 'GH_TOKEN: ${{ secrets.SCALESMALL_PAT }}', 'repository dispatch token source');
+
+requireText(releaseHealth, 'workflow_dispatch:', 'manual release-health control');
+requireText(releaseHealth, "cron: '*/15 * * * *'", '15-minute release-health schedule');
+requireText(releaseHealth, 'permissions:\n  contents: read', 'read-only release-health permissions');
+requireText(releaseHealth, 'cancel-in-progress: false', 'non-cancelling release-health serialization');
+requireText(releaseHealth, 'runs-on: ubuntu-24.04', 'pinned release-health runner');
+requireText(releaseHealth, 'persist-credentials: false', 'release-health checkout credential isolation');
+requireText(releaseHealth, "node-version: '24'", 'release-health Node runtime');
+requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SCALESMALL_PAT }}', 'release-health organization token source');
+requireText(releaseHealth, 'node scripts/verify-org-release-health.mjs', 'organization release-health verifier');
 
 rejectPattern(combined, /ubuntu-latest/, 'floating GitHub runner label');
 rejectPattern(combined, /peter-evans\/repository-dispatch@v\d+/i, 'floating repository-dispatch action');
