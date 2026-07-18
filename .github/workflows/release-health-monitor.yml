@@ -1,0 +1,45 @@
+name: Scale Small AI Release Health Monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
+
+concurrency:
+  group: scale-small-ai-release-health-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  verify:
+    name: Verify current organization release health
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SCALESMALL_PAT }}
+      SSAI_RELEASE_MONITOR_STUCK_MINUTES: '45'
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24'
+
+      - name: Verify monitor credential is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${#SSAI_RELEASE_MONITOR_GITHUB_TOKEN}" -lt 20 ]; then
+            echo "::error::SCALESMALL_PAT must provide read access to the private SSAI repositories"
+            exit 1
+          fi
+
+      - name: Inspect every current SSAI workflow and deployment check
+        run: node scripts/verify-org-release-health.mjs
