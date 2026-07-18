@@ -15,6 +15,7 @@ import {
   findSupersedingWorkflowRun,
   latestByIdentity,
   recordActivityTime,
+  rateHeadroomDecision,
   workflowStreamIdentity,
 } from './release-health-monitor-utils.mjs';
 
@@ -34,6 +35,11 @@ const statuses = latestByIdentity([
 assert.equal(statuses.length, 1);
 assert.equal(statuses[0].state, 'success', 'latest commit status must replace an older state for the same context');
 assert.throws(() => latestByIdentity([{}], () => ''), /identity must not be empty/);
+assert.equal(rateHeadroomDecision('continuous', 1600, 1000, 600), 'run');
+assert.equal(rateHeadroomDecision('continuous', 1599, 1000, 600), 'defer', 'continuous monitoring must back off without creating a failure storm');
+assert.equal(rateHeadroomDecision('incident', 3749, 250, 3500), 'fail', 'an explicit incident sweep must fail closed when exhaustive coverage is impossible');
+assert.equal(rateHeadroomDecision('incident', 3750, 250, 3500), 'run');
+assert.throws(() => rateHeadroomDecision('continuous', -1, 1000, 600), /remaining must be a non-negative integer/);
 
 const failedRun = {
   id: 301,

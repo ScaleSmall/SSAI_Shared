@@ -14,6 +14,7 @@ import {
   findSupersedingDeployment,
   findSupersedingWorkflowRun,
   latestByIdentity,
+  rateHeadroomDecision,
   recordActivityTime,
   recordOccurrenceTime,
   workflowStreamIdentity,
@@ -72,7 +73,26 @@ const unresolvedEvidence = { workflows: [], checks: [], statuses: [], deployment
 const requestStats = { requests: 0, retries: 0, rate_remaining: null, rate_reset_at: null };
 const apiGate = createConcurrencyGate(apiConcurrency);
 
-const repositories = (await listRepositories())
+// GitHub's /rate_limit endpoint can be served from a different cache/rate
+// context than repository APIs. Probe an authenticated core endpoint so the
+// preflight uses the same quota bucket the inventory will actually consume.
+await api('/user');
+if (!Number.isSafeInteger(requestStats.rate_remaining)) {
+  throw new Error('GitHub API rate-limit headers were unavailable. The scan cannot prove sufficient request headroom and is failing closed.');
+}
+const rateDecision = rateHeadroomDecision(scanMode, requestStats.rate_remaining, rateReserve, maxRequests);
+if (rateDecision === 'fail') {
+  throw new Error('Incident scan requires at least ' + (rateReserve + maxRequests)
+    + ' GitHub API requests of starting headroom, but only ' + requestStats.rate_remaining
+    + ' remain. Retry after the rate limit resets at ' + (requestStats.rate_reset_at || 'the provider reset time') + '.');
+}
+if (rateDecision === 'defer') {
+  const deferredSummary = deferredRateSummary();
+  console.log(JSON.stringify(deferredSummary, null, 2));
+  console.error('::warning::Continuous release-health scan deferred until GitHub API quota resets; no inventory was sampled or reported as healthy.');
+  await writeStepSummary(deferredSummary);
+} else {
+  const repositories = (await listRepositories())
   .filter((repo) => repo.owner?.login === owner && !repo.archived && String(repo.name).startsWith(repoPrefix))
   .sort((left, right) => left.name.localeCompare(right.name));
 
@@ -95,6 +115,8 @@ const pendingWorkflows = workflowRows.filter((row) => row.status !== 'completed'
 const noHistoryWorkflows = workflowRows.filter((row) => row.status === 'no_history');
 const summary = {
   ok: failures.length === 0,
+  deferred: false,
+  inventory_complete: true,
   checked_at: new Date().toISOString(),
   owner,
   repository_prefix: repoPrefix,
@@ -139,7 +161,8 @@ const summary = {
 console.log(JSON.stringify(summary, null, 2));
 await writeStepSummary(summary);
 
-if (failures.length > 0) process.exit(1);
+  if (failures.length > 0) process.exitCode = 1;
+}
 
 async function inspectRepository(repo) {
   const defaultBranch = String(repo.default_branch || 'main');
@@ -906,6 +929,8 @@ async function writeStepSummary(result) {
   const lines = [
     '# Scale Small AI release health',
     '',
+    '- Deferred: ' + (result.deferred ? 'yes' : 'no'),
+    '- Inventory complete: ' + (result.inventory_complete ? 'yes' : 'no'),
     '- Mode/lookback: ' + result.scan_mode + '/' + result.lookback_hours + 'h',
     '- Repositories: ' + result.repositories,
     '- Active workflows: ' + result.active_workflows,
@@ -920,11 +945,60 @@ async function writeStepSummary(result) {
     '- GitHub API requests/budget/retries: ' + result.github_api_requests + '/' + result.github_api_request_budget + '/' + result.github_api_retries,
     '- Failures: ' + result.failures.length,
   ];
+  if (result.deferred) lines.push('- Deferral reason: ' + result.deferred_reason);
   if (result.failures.length) {
     lines.push('', '## Failures', '', ...result.failures.map((failure) => '- ' + (failure.url ? '[' + failure.repo + ' / ' + failure.owner + '](' + safeMarkdownUrl(failure.url) + ')' : failure.repo + ' / ' + failure.owner) + ': ' + failure.problem));
   }
   if (result.warnings.length) lines.push('', '## Warnings', '', ...result.warnings.map((warning) => '- ' + warning));
   await appendFile(path, lines.join('\n') + '\n', 'utf8');
+}
+
+function deferredRateSummary() {
+  return {
+    ok: null,
+    deferred: true,
+    inventory_complete: false,
+    deferred_reason: 'Insufficient GitHub API quota to complete the bounded scan while preserving the configured reserve.',
+    checked_at: new Date().toISOString(),
+    owner,
+    repository_prefix: repoPrefix,
+    scan_mode: scanMode,
+    repositories: 0,
+    active_workflows: 0,
+    green_workflows: 0,
+    pending_workflows: 0,
+    allowed_no_history_workflows: 0,
+    current_commit_checks: 0,
+    lookback_hours: lookbackHours,
+    lookback_started_at: cutoffIso,
+    rerun_origin_hours: rerunOriginHours,
+    deployment_origin_hours: deploymentOriginHours,
+    recent_unsuccessful_workflow_attempts: 0,
+    recovered_recent_workflow_attempts: 0,
+    provisional_self_recovering_workflow_attempts: 0,
+    unresolved_recent_workflow_attempts: 0,
+    recent_failed_check_runs: 0,
+    recovered_recent_check_runs: 0,
+    provisional_self_recovering_check_runs: 0,
+    unresolved_recent_check_runs: 0,
+    recent_failed_commit_statuses: 0,
+    recovered_recent_commit_statuses: 0,
+    unresolved_recent_commit_statuses: 0,
+    recent_failed_deployment_statuses: 0,
+    recovered_recent_deployment_statuses: 0,
+    unresolved_recent_deployment_statuses: 0,
+    recent_failure_recoveries: { workflows: [], checks: [], statuses: [], deployments: [] },
+    provisional_self_recoveries: { workflows: [], checks: [] },
+    unresolved_recent_failures: { workflows: [], checks: [], statuses: [], deployments: [] },
+    github_api_request_budget: maxRequests,
+    github_api_requests: requestStats.requests,
+    github_api_retries: requestStats.retries,
+    github_api_rate_reserve: rateReserve,
+    github_api_rate_remaining: requestStats.rate_remaining,
+    github_api_rate_reset_at: requestStats.rate_reset_at,
+    failures: [],
+    warnings: ['Continuous scan deferred for API quota; a later scheduled run must complete the inventory.'],
+  };
 }
 
 function addShaMetadata(metadataBySha, rawSha, rawBranch, rawEvent, source, isDefault = false, rawHeadRepository = '', rawPullNumbers = []) {

@@ -12,6 +12,15 @@ export function latestByIdentity(records, identityOf) {
   return [...latest.values()];
 }
 
+export function rateHeadroomDecision(scanMode, remaining, reserve, requestBudget) {
+  if (!['continuous', 'incident'].includes(scanMode)) throw new Error('scanMode must be continuous or incident');
+  for (const [name, value] of [['remaining', remaining], ['reserve', reserve], ['requestBudget', requestBudget]]) {
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error(name + ' must be a non-negative integer');
+  }
+  if (remaining >= reserve + requestBudget) return 'run';
+  return scanMode === 'continuous' ? 'defer' : 'fail';
+}
+
 export function workflowStreamIdentity(run) {
   if (!run || typeof run !== 'object') throw new TypeError('run must be an object');
   const branch = String(run.head_branch || '').trim()

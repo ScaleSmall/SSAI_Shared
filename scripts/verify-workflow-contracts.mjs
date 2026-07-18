@@ -90,6 +90,9 @@ requireText(releaseHealthVerifier, 'findCurrentSelfRunRecovery(', 'self-latch wo
 requireText(releaseHealthVerifier, 'findCurrentSelfCheckRecovery(', 'self-latch check recovery guard');
 requireText(releaseHealthVerifier, 'createConcurrencyGate(apiConcurrency)', 'global GitHub API concurrency gate');
 requireText(releaseHealthVerifier, 'GitHub API request budget exhausted', 'fail-closed API request budget');
+requireText(releaseHealthVerifier, "await api('/user')", 'representative core rate-limit preflight');
+requireText(releaseHealthVerifier, "rateDecision === 'defer'", 'continuous rate-limit backpressure');
+requireText(releaseHealthVerifier, "rateDecision === 'fail'", 'incident rate-limit fail-closed gate');
 requireText(releaseHealthVerifier, 'throw truncationError(', 'fail-closed pagination');
 
 requireBalancedExpressions(releaseHealth, 'release-health workflow');
