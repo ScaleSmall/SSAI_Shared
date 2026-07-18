@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import {
   associateChecksWithPulls,
   checkStreamIdentity,
   commitStatusStreamIdentity,
   deploymentJobStreamIdentity,
   deploymentStreamIdentity,
+  evaluateNoHistoryAllowance,
   findProvisionalCheckRecovery,
   findProvisionalWorkflowRecovery,
   findDeploymentCheckRecovery,
@@ -14,6 +16,7 @@ import {
   findSupersedingDeployment,
   findSupersedingWorkflowRun,
   latestByIdentity,
+  partitionWorkflowHealth,
   recordActivityTime,
   rateHeadroomDecision,
   workflowStreamIdentity,
@@ -40,6 +43,169 @@ assert.equal(rateHeadroomDecision('continuous', 1599, 1000, 600), 'defer', 'cont
 assert.equal(rateHeadroomDecision('incident', 3749, 250, 3500), 'fail', 'an explicit incident sweep must fail closed when exhaustive coverage is impossible');
 assert.equal(rateHeadroomDecision('incident', 3750, 250, 3500), 'run');
 assert.throws(() => rateHeadroomDecision('continuous', -1, 1000, 600), /remaining must be a non-negative integer/);
+
+const workflowPartitions = partitionWorkflowHealth([
+  { status: 'completed', conclusion: 'success' },
+  { status: 'in_progress', conclusion: null },
+  { status: 'completed', conclusion: 'failure' },
+  { status: 'no_history', conclusion: 'no_history', allowed_no_history: true },
+  { status: 'no_history', conclusion: 'no_history', allowed_no_history: false },
+], new Set(['success', 'neutral', 'skipped']));
+assert.deepEqual(
+  [workflowPartitions.green.length, workflowPartitions.pending.length, workflowPartitions.failed.length,
+    workflowPartitions.allowedNoHistory.length, workflowPartitions.unresolvedNoHistory.length, workflowPartitions.categorized],
+  [1, 1, 1, 1, 1, 5],
+  'workflow summary categories must cover every active workflow exactly once',
+);
+
+const manualWorkflow = {
+  id: 800,
+  name: 'Deploy Production Analytics Pages',
+  path: '.github/workflows/deploy-production-pages.yml',
+  state: 'active',
+};
+const witnessWorkflow = {
+  id: 801,
+  name: 'Production Analytics Pages Canary',
+  path: '.github/workflows/production-pages-canary.yml',
+  state: 'active',
+};
+const manualWorkflowSource = 'name: Deploy Production Analytics Pages\non:\n  workflow_dispatch:\n';
+const noHistoryPolicy = {
+  path: manualWorkflow.path,
+  sourceSha256: createHash('sha256').update(manualWorkflowSource).digest('hex'),
+  reason: 'Manual releases require a current production canary.',
+  witness: {
+    name: witnessWorkflow.name,
+    path: witnessWorkflow.path,
+    headRepository: 'ScaleSmall/SSAI_Analytics_Reporting',
+    allowedEvents: ['schedule', 'workflow_dispatch'],
+    maxAgeHours: 30,
+  },
+};
+const witnessRun = {
+  id: 802,
+  workflow_id: witnessWorkflow.id,
+  head_branch: 'main',
+  head_sha: 'a'.repeat(40),
+  head_repository: { full_name: 'ScaleSmall/SSAI_Analytics_Reporting' },
+  event: 'workflow_dispatch',
+  status: 'completed',
+  conclusion: 'success',
+  run_started_at: '2026-07-18T13:00:00Z',
+  html_url: 'https://github.com/ScaleSmall/SSAI_Analytics_Reporting/actions/runs/802',
+};
+const noHistoryAllowance = evaluateNoHistoryAllowance({
+  workflow: manualWorkflow,
+  policy: noHistoryPolicy,
+  workflowSource: manualWorkflowSource,
+  workflows: [manualWorkflow, witnessWorkflow],
+  runs: [witnessRun],
+  defaultBranch: 'main',
+  expectedHeadSha: 'a'.repeat(40),
+  nowMs: Date.parse('2026-07-18T14:00:00Z'),
+});
+assert.equal(noHistoryAllowance.allowed, true, 'manual no-history workflows require exact fresh witness evidence');
+assert.equal(noHistoryAllowance.witness?.run_id, witnessRun.id);
+assert.equal(noHistoryAllowance.witness?.head_sha, 'a'.repeat(40));
+assert.equal(noHistoryAllowance.witness?.event, 'workflow_dispatch');
+assert.equal(noHistoryAllowance.witness?.head_repository, 'ScaleSmall/SSAI_Analytics_Reporting');
+assert.equal(noHistoryAllowance.witness?.url, witnessRun.html_url);
+assert.equal(evaluateNoHistoryAllowance({
+  workflow: { ...manualWorkflow, path: '.github/workflows/moved.yml' },
+  policy: noHistoryPolicy,
+  workflowSource: manualWorkflowSource,
+  workflows: [manualWorkflow, witnessWorkflow],
+  runs: [witnessRun],
+  defaultBranch: 'main',
+  expectedHeadSha: 'a'.repeat(40),
+  nowMs: Date.parse('2026-07-18T14:00:00Z'),
+}).allowed, false, 'a moved manual workflow must invalidate its allowance');
+assert.equal(evaluateNoHistoryAllowance({
+  workflow: manualWorkflow,
+  policy: noHistoryPolicy,
+  workflowSource: manualWorkflowSource,
+  workflows: [manualWorkflow, witnessWorkflow],
+  runs: [{ ...witnessRun, conclusion: 'failure' }],
+  defaultBranch: 'main',
+  expectedHeadSha: 'a'.repeat(40),
+  nowMs: Date.parse('2026-07-18T14:00:00Z'),
+}).allowed, false, 'a failed witness must fail closed');
+assert.equal(evaluateNoHistoryAllowance({
+  workflow: manualWorkflow,
+  policy: noHistoryPolicy,
+  workflowSource: manualWorkflowSource,
+  workflows: [manualWorkflow, witnessWorkflow],
+  runs: [{ ...witnessRun, run_started_at: '2026-07-16T00:00:00Z' }],
+  defaultBranch: 'main',
+  expectedHeadSha: 'a'.repeat(40),
+  nowMs: Date.parse('2026-07-18T14:00:00Z'),
+}).allowed, false, 'a stale witness must fail closed');
+assert.equal(evaluateNoHistoryAllowance({
+  workflow: manualWorkflow,
+  policy: null,
+  workflowSource: manualWorkflowSource,
+  workflows: [],
+  runs: [],
+  defaultBranch: 'main',
+  expectedHeadSha: 'a'.repeat(40),
+  nowMs: Date.parse('2026-07-18T14:00:00Z'),
+}).allowed, false, 'unconfigured no-history workflows must fail closed');
+assert.equal(evaluateNoHistoryAllowance({
+  workflow: manualWorkflow,
+  policy: {
+    path: manualWorkflow.path,
+    sourceSha256: createHash('sha256').update(manualWorkflowSource).digest('hex'),
+    reason: 'Exact one-shot manual control.',
+    witness: false,
+  },
+  workflowSource: manualWorkflowSource,
+  workflows: [manualWorkflow],
+  runs: [],
+  defaultBranch: 'main',
+  expectedHeadSha: 'a'.repeat(40),
+  nowMs: Date.parse('2026-07-18T14:00:00Z'),
+}).allowed, false, 'a falsy witness policy must fail closed');
+assert.equal(evaluateNoHistoryAllowance({
+  workflow: manualWorkflow,
+  policy: noHistoryPolicy,
+  workflowSource: manualWorkflowSource,
+  workflows: [manualWorkflow, witnessWorkflow],
+  runs: [witnessRun],
+  defaultBranch: 'main',
+  expectedHeadSha: 'b'.repeat(40),
+  nowMs: Date.parse('2026-07-18T14:00:00Z'),
+}).allowed, false, 'witness evidence from a prior main commit must fail closed');
+assert.equal(evaluateNoHistoryAllowance({
+  workflow: manualWorkflow,
+  policy: noHistoryPolicy,
+  workflowSource: manualWorkflowSource + '# changed semantics\n',
+  workflows: [manualWorkflow, witnessWorkflow],
+  runs: [witnessRun],
+  defaultBranch: 'main',
+  expectedHeadSha: 'a'.repeat(40),
+  nowMs: Date.parse('2026-07-18T14:00:00Z'),
+}).allowed, false, 'changed workflow source must invalidate the no-history allowance');
+assert.equal(evaluateNoHistoryAllowance({
+  workflow: manualWorkflow,
+  policy: noHistoryPolicy,
+  workflowSource: manualWorkflowSource,
+  workflows: [manualWorkflow, witnessWorkflow],
+  runs: [{ ...witnessRun, event: 'pull_request' }],
+  defaultBranch: 'main',
+  expectedHeadSha: 'a'.repeat(40),
+  nowMs: Date.parse('2026-07-18T14:00:00Z'),
+}).allowed, false, 'an unapproved witness trigger must fail closed');
+assert.equal(evaluateNoHistoryAllowance({
+  workflow: manualWorkflow,
+  policy: noHistoryPolicy,
+  workflowSource: manualWorkflowSource,
+  workflows: [manualWorkflow, witnessWorkflow],
+  runs: [{ ...witnessRun, head_repository: { full_name: 'untrusted/fork' } }],
+  defaultBranch: 'main',
+  expectedHeadSha: 'a'.repeat(40),
+  nowMs: Date.parse('2026-07-18T14:00:00Z'),
+}).allowed, false, 'witness evidence from an unapproved repository must fail closed');
 
 const failedRun = {
   id: 301,

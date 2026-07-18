@@ -74,6 +74,13 @@ requireText(releaseHealth, "SSAI_RELEASE_MONITOR_RATE_RESERVE: ${{ inputs.scan_m
 requireText(releaseHealth, "SSAI_RELEASE_MONITOR_API_CONCURRENCY: '6'", 'release-health global API concurrency');
 requireText(releaseHealth, 'node scripts/verify-org-release-health.mjs', 'organization release-health verifier');
 requireText(releaseHealthVerifier, 'latestByIdentity(', 'latest current-check selection');
+requireText(releaseHealthVerifier, 'evaluateNoHistoryAllowance(', 'evidence-gated manual workflow allowance');
+requireText(releaseHealthVerifier, 'collectWorkflowSource(', 'exact no-history workflow source verification');
+requireText(releaseHealthVerifier, 'sourceSha256:', 'approved workflow source digest');
+requireText(releaseHealthVerifier, 'partitionWorkflowHealth(', 'exhaustive workflow health categorization');
+requireText(releaseHealthVerifier, 'workflow_categories_complete', 'workflow category completeness assertion');
+requireText(releaseHealthVerifier, 'unresolved_no_history_workflows', 'explicit unresolved no-history accounting');
+requireText(releaseHealthVerifier, 'allowed_no_history_evidence', 'auditable no-history evidence summary');
 requireText(releaseHealthVerifier, 'findSupersedingWorkflowRun(', 'recent workflow failure recovery selection');
 requireText(releaseHealthVerifier, 'findSupersedingCheck(', 'recent external check failure recovery selection');
 requireText(releaseHealthVerifier, 'findDeploymentCheckRecovery(', 'cross-trigger deployment recovery proof');
