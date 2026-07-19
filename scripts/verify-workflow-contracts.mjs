@@ -44,6 +44,25 @@ requireText(validate, "node-version: '24'", 'current Node runtime');
 requireText(validate, 'run: npm run check', 'full shared package check');
 
 requireText(propagate, 'workflow_dispatch:', 'manual propagation control');
+requireText(
+  propagate,
+  "    paths:\n      - 'src/**'\n      - 'package.json'\n      - 'package-lock.json'",
+  'package-only automatic propagation scope',
+);
+const propagationPathBlocks = [...propagate.matchAll(/^    paths:\n((?:      - [^\n]+\n)+)/gm)];
+if (propagationPathBlocks.length !== 1) {
+  throw new Error(`Expected exactly one automatic propagation path block; found ${propagationPathBlocks.length}`);
+}
+const automaticPropagationPaths = propagationPathBlocks[0][1]
+  .trim()
+  .split('\n')
+  .map((line) => line.replace(/^\s*-\s*/, '').replace(/^['\"]|['\"]$/g, ''));
+const expectedPropagationPaths = ['src/**', 'package.json', 'package-lock.json'];
+if (JSON.stringify(automaticPropagationPaths) !== JSON.stringify(expectedPropagationPaths)) {
+  throw new Error(
+    `Automatic propagation paths must be exactly package-bearing files: ${automaticPropagationPaths.join(', ')}`,
+  );
+}
 requireText(propagate, 'dispatch_connect:', 'protected Connect dispatch gate');
 requireText(propagate, 'permissions:\n  contents: read', 'read-only propagation permissions');
 requireText(propagate, 'runs-on: ubuntu-24.04', 'pinned propagation runner');
