@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -101,14 +102,25 @@ requireText(releaseHealthVerifier, 'partitionWorkflowHealth(', 'exhaustive workf
 requireText(releaseHealthVerifier, 'workflow_categories_complete', 'workflow category completeness assertion');
 requireText(releaseHealthVerifier, 'unresolved_no_history_workflows', 'explicit unresolved no-history accounting');
 requireText(releaseHealthVerifier, 'allowed_no_history_evidence', 'auditable no-history evidence summary');
-requireText(releaseHealthVerifier, 'findSupersedingWorkflowRun(', 'recent workflow failure recovery selection');
 requireText(releaseHealthVerifier, 'verifyForwardFixRecoveryPolicy(', 'source-hashed current-main forward-fix policy');
 requireText(releaseHealthVerifier, 'findForwardFixWorkflowRun(', 'bounded cross-trigger workflow forward-fix recovery');
 requireText(releaseHealthVerifier, 'findForwardFixCheck(', 'bounded cross-trigger check forward-fix recovery');
 requireText(releaseHealthVerifier, 'findProvisionalForwardFixWorkflowRecovery(', 'bounded forward-fix workflow self-latch');
 requireText(releaseHealthVerifier, 'findProvisionalForwardFixCheckRecovery(', 'bounded forward-fix check self-latch');
+requireText(releaseHealthVerifier, 'findTrustedMonitorCheckRecovery(', 'source-verified monitor check recovery');
+requireText(releaseHealthVerifier, 'findProvisionalTrustedMonitorCheckRecoveryFromRun(', 'check-index-independent monitor self-latch');
+requireText(releaseHealthVerifier, 'isTrustedMonitorRecoveryPolicy(', 'explicit trusted-monitor policy gate');
+requireText(releaseHealthVerifier, 'findPolicyBoundWorkflowRecovery(', 'coverage-aware workflow recovery selection');
+requireText(releaseHealthVerifier, 'findPolicyBoundCheckRecovery(', 'coverage-aware check recovery selection');
+requireText(releaseHealthVerifier, 'const directRecovery = trustedMonitorPolicy ? null : policyBoundRecovery;', 'trusted monitor generic-recovery bypass prevention');
+requireText(releaseHealthVerifier, "monitorSelfRecoveryContract: 'release-health-monitor-v1'", 'trusted monitor recovery contract');
+requireText(releaseHealthVerifier, 'source_run_attempt:', 'exact current run-attempt binding');
+requireText(
+  releaseHealthVerifier,
+  `sourceSha256: '${createHash('sha256').update(releaseHealth).digest('hex')}'`,
+  'release-health recovery policy exact normalized workflow digest',
+);
 requireText(releaseHealthVerifier, "const excludedRepositories = new Set(['SSAI_Connect'])", 'protected Connect exclusion');
-requireText(releaseHealthVerifier, 'findSupersedingCheck(', 'recent external check failure recovery selection');
 requireText(releaseHealthVerifier, 'findDeploymentCheckRecovery(', 'cross-trigger deployment recovery proof');
 requireText(releaseHealthVerifier, 'findMergedPullCheckRecovery(', 'merged pull-request recovery proof');
 requireText(releaseHealthVerifier, 'associateChecksWithPulls(', 'force-pushed pull-request recovery association');
@@ -119,8 +131,8 @@ requireText(releaseHealthVerifier, 'collectWorkflows(repo.name)', 'paginated wor
 requireText(releaseHealthVerifier, 'collectBranches(repo.name)', 'independent all-branch commit inventory');
 requireText(releaseHealthVerifier, 'collectRecentCommitStatuses(', 'recent classic commit-status inventory');
 requireText(releaseHealthVerifier, "identity_source = 'github-actions-job'", 'deployment-to-job stream binding');
-requireText(releaseHealthVerifier, 'findCurrentSelfRunRecovery(', 'self-latch workflow recovery guard');
-requireText(releaseHealthVerifier, 'findCurrentSelfCheckRecovery(', 'self-latch check recovery guard');
+requireText(releaseHealthVerifier, 'findPolicyBoundProvisionalWorkflowRecovery(', 'policy-bound workflow self-latch guard');
+requireText(releaseHealthVerifier, 'findPolicyBoundProvisionalCheckRecovery(', 'policy-bound check self-latch guard');
 requireText(releaseHealthVerifier, 'createConcurrencyGate(apiConcurrency)', 'global GitHub API concurrency gate');
 requireText(releaseHealthVerifier, 'GitHub API request budget exhausted', 'fail-closed API request budget');
 requireText(releaseHealthVerifier, "await api('/user')", 'representative core rate-limit preflight');
