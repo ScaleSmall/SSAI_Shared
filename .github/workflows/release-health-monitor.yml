@@ -1,4 +1,5 @@
 name: Scale Small AI Release Health Monitor
+run-name: Release health monitor [${{ inputs.scan_mode || 'continuous' }}:${{ inputs.lookback_hours || '6' }}h]
 
 on:
   workflow_dispatch:

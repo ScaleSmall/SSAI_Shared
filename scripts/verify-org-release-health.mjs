@@ -6,6 +6,10 @@ import {
   deploymentJobStreamIdentity,
   deploymentStreamIdentity,
   evaluateNoHistoryAllowance,
+  findForwardFixCheck,
+  findForwardFixWorkflowRun,
+  findProvisionalForwardFixCheckRecovery,
+  findProvisionalForwardFixWorkflowRecovery,
   findProvisionalCheckRecovery,
   findProvisionalWorkflowRecovery,
   findDeploymentCheckRecovery,
@@ -19,12 +23,14 @@ import {
   rateHeadroomDecision,
   recordActivityTime,
   recordOccurrenceTime,
+  verifyForwardFixRecoveryPolicy,
   workflowStreamIdentity,
 } from './release-health-monitor-utils.mjs';
 
 const token = requiredSecret(process.env.SSAI_RELEASE_MONITOR_GITHUB_TOKEN, 'SSAI_RELEASE_MONITOR_GITHUB_TOKEN');
 const owner = safeName(process.env.SSAI_RELEASE_MONITOR_OWNER || 'ScaleSmall', 'SSAI_RELEASE_MONITOR_OWNER');
 const repoPrefix = safeName(process.env.SSAI_RELEASE_MONITOR_REPO_PREFIX || 'SSAI_', 'SSAI_RELEASE_MONITOR_REPO_PREFIX');
+const excludedRepositories = new Set(['SSAI_Connect']);
 const scanMode = enumValue(process.env.SSAI_RELEASE_MONITOR_MODE || 'continuous', ['continuous', 'incident'], 'SSAI_RELEASE_MONITOR_MODE');
 const stuckMinutes = boundedNumber(process.env.SSAI_RELEASE_MONITOR_STUCK_MINUTES, 45, 15, 240);
 const requestedLookbackHours = boundedNumber(process.env.SSAI_RELEASE_MONITOR_LOOKBACK_HOURS, 6, 1, 168);
@@ -87,6 +93,28 @@ const noHistoryPolicies = new Map([
     },
   }],
 ]);
+const forwardFixRecoveryPolicies = new Map([
+  ['SSAI_PoW:315750527', {
+    workflowId: 315750527,
+    path: '.github/workflows/n8n-production-exactness.yml',
+    sourceSha256: 'e9a9baf81da16082915e555acfac678865f9a0cc82cde65fcac984cfb6a4b7a2',
+    headRepository: 'ScaleSmall/SSAI_PoW',
+    failedEvents: ['schedule'],
+    recoveryEvents: ['workflow_dispatch'],
+    jobNames: ['verify-production'],
+    recoveryDisplayTitles: ['Production n8n workflow exactness'],
+  }],
+  ['SSAI_Shared:315630665', {
+    workflowId: 315630665,
+    path: '.github/workflows/release-health-monitor.yml',
+    sourceSha256: '3672ed17290279e20d75336e810d9327a59786c16a77332aa5be2f4adb0238a1',
+    headRepository: 'ScaleSmall/SSAI_Shared',
+    failedEvents: ['schedule'],
+    recoveryEvents: ['workflow_dispatch'],
+    jobNames: ['Verify current organization release health'],
+    recoveryDisplayTitles: ['Release health monitor [continuous:6h]'],
+  }],
+]);
 const acceptableConclusions = new Set(['success', 'neutral', 'skipped']);
 const failedConclusions = new Set(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale']);
 const failedDeploymentStates = new Set(['failure', 'error']);
@@ -120,7 +148,10 @@ if (rateDecision === 'defer') {
   await writeStepSummary(deferredSummary);
 } else {
   const repositories = (await listRepositories())
-  .filter((repo) => repo.owner?.login === owner && !repo.archived && String(repo.name).startsWith(repoPrefix))
+  .filter((repo) => repo.owner?.login === owner
+    && !repo.archived
+    && String(repo.name).startsWith(repoPrefix)
+    && !excludedRepositories.has(String(repo.name)))
   .sort((left, right) => left.name.localeCompare(right.name));
 
 if (repositories.length === 0) {
@@ -221,6 +252,7 @@ async function inspectRepository(repo) {
   const headSha = String(commit.sha || '');
 
   const defaultCommitShas = new Set(recentCommits.map((recentCommit) => String(recentCommit.sha || '')));
+  defaultCommitShas.add(headSha);
   const nonDefaultBranches = branches.filter((branch) => branch.name !== defaultBranch
     && Date.parse(String(branch.commit?.committedDate || '')) >= cutoffMs);
   const branchCommitGroups = await mapLimit(nonDefaultBranches, 3, async (branch) => {
@@ -232,6 +264,19 @@ async function inspectRepository(repo) {
   const recentPullCommits = pullCommitGroups.flat();
 
   const workflows = allWorkflows.filter((workflow) => workflow.state === 'active');
+  const verifiedForwardFixPolicies = await resolveForwardFixRecoveryPolicies(
+    repo.name,
+    workflows,
+    headSha,
+  );
+  await addVerifiedForwardFixOriginShas({
+    repoName: repo.name,
+    runs: recentRuns,
+    currentHeadSha: headSha,
+    defaultBranch,
+    defaultCommitShas,
+    policies: verifiedForwardFixPolicies,
+  });
   const pullByNumber = new Map(recentPulls.map((pull) => [Number(pull.number), pull]));
   const workflowHealth = await mapLimit(workflows, 5, async (workflow) => {
     const recentCandidates = recentRuns
@@ -288,7 +333,12 @@ async function inspectRepository(repo) {
     return { repo: repo.name, name: workflow.name, id: workflow.id, status: run.status, conclusion, run_id: run.id, url: workflowRunUrl(run) };
   });
 
-  reconcileWorkflowFailures(repo.name, recentRuns);
+  reconcileWorkflowFailures(repo.name, recentRuns, {
+    currentHeadSha: headSha,
+    defaultBranch,
+    defaultCommitShas,
+    policies: verifiedForwardFixPolicies,
+  });
 
   const shaMetadata = new Map();
   for (const run of recentRuns.filter((candidate) => recordActivityTime(candidate) >= cutoffMs || Number(candidate.id) === currentRunId)) {
@@ -332,7 +382,11 @@ async function inspectRepository(repo) {
   const statuses = enrichCommitStatuses(commitStatuses, shaMetadata, defaultBranch);
   const deploymentStatuses = enrichDeploymentStatuses(deploymentCollection.statuses, checks);
 
-  reconcileCheckFailures(repo.name, checks, deploymentStatuses, pullByNumber, defaultBranch);
+  reconcileCheckFailures(repo.name, checks, deploymentStatuses, pullByNumber, defaultBranch, {
+    currentHeadSha: headSha,
+    defaultCommitShas,
+    policies: verifiedForwardFixPolicies,
+  });
   reconcileCommitStatusFailures(repo.name, statuses);
   reconcileDeploymentFailures(repo.name, deploymentStatuses);
 
@@ -453,6 +507,54 @@ async function collectWorkflowSource(repoName, workflowPath, ref) {
   const bytes = Buffer.from(content, 'base64');
   if (bytes.length !== size) throw new Error(repoName + ' workflow source response failed its byte-length integrity check.');
   return bytes;
+}
+
+async function resolveForwardFixRecoveryPolicies(repoName, workflows, headSha) {
+  const verified = new Map();
+  const configured = [...forwardFixRecoveryPolicies.entries()]
+    .filter(([key]) => key.startsWith(repoName + ':'))
+    .map(([, policy]) => policy);
+  await mapLimit(configured, 2, async (policy) => {
+    const workflow = workflows.find((candidate) => Number(candidate.id) === Number(policy.workflowId));
+    if (!workflow) return;
+    const workflowSource = await collectWorkflowSource(repoName, policy.path, headSha);
+    const resolved = verifyForwardFixRecoveryPolicy({ workflow, policy, workflowSource });
+    if (resolved) verified.set(resolved.workflowId, resolved);
+  });
+  return verified;
+}
+
+async function addVerifiedForwardFixOriginShas({
+  repoName,
+  runs,
+  currentHeadSha,
+  defaultBranch,
+  defaultCommitShas,
+  policies,
+}) {
+  const candidates = [...new Set(runs
+    .filter((run) => {
+      const policy = policies.get(Number(run.workflow_id));
+      return policy
+        && run.head_branch === defaultBranch
+        && run.head_repository?.full_name === policy.headRepository
+        && policy.failedEvents.has(String(run.event || ''))
+        && run.status === 'completed'
+        && failedConclusions.has(String(run.conclusion || ''))
+        && /^[a-f0-9]{40}$/i.test(String(run.head_sha || ''))
+        && run.head_sha !== currentHeadSha
+        && !defaultCommitShas.has(run.head_sha);
+    })
+    .map((run) => String(run.head_sha)))];
+  await mapLimit(candidates, 2, async (originSha) => {
+    const comparison = await api('/repos/' + owner + '/' + repoName + '/compare/'
+      + encodeURIComponent(originSha) + '...' + encodeURIComponent(currentHeadSha));
+    if (comparison?.status === 'ahead'
+      && comparison?.base_commit?.sha === originSha
+      && comparison?.merge_base_commit?.sha === originSha) {
+      defaultCommitShas.add(originSha);
+    }
+  });
 }
 
 async function collectRecentCommits(repoName, defaultBranch) {
@@ -653,6 +755,7 @@ async function enrichChecks(repoName, rawChecks, runs, shaMetadata, defaultBranc
       source_run_id: sourceRunId || null,
       workflow_id: sourceRun?.workflow_id || null,
       event: sourceRun?.event || '',
+      source_run_display_title: sourceRun?.display_title || '',
       head_branch: branch,
       head_repository: headRepository,
       pull_numbers: authoritativePullNumbers(check, sourceRun, metadata),
@@ -701,12 +804,33 @@ function enrichDeploymentStatuses(rawStatuses, checks) {
   });
 }
 
-function reconcileWorkflowFailures(repoName, runs) {
+function reconcileWorkflowFailures(repoName, runs, {
+  currentHeadSha,
+  defaultBranch,
+  defaultCommitShas,
+  policies,
+}) {
   for (const run of runs.filter((candidate) => candidate.status === 'completed'
     && failedConclusions.has(String(candidate.conclusion || ''))
     && recordActivityTime(candidate) >= cutoffMs)) {
-    const recovery = findSupersedingWorkflowRun(run, runs);
-    const current = findCurrentSelfRunRecovery(repoName, run, runs);
+    const directRecovery = findSupersedingWorkflowRun(run, runs);
+    const policy = policies.get(Number(run.workflow_id));
+    const forwardFixRecovery = directRecovery || !policy ? null : findForwardFixWorkflowRun(run, runs, {
+      policy,
+      currentHeadSha,
+      defaultBranch,
+      defaultCommitShas,
+    });
+    const recovery = directRecovery || forwardFixRecovery;
+    const directCurrent = findCurrentSelfRunRecovery(repoName, run, runs);
+    const forwardFixCurrent = directCurrent || !policy ? null : findProvisionalForwardFixWorkflowRecovery(
+      run,
+      runs,
+      currentRunId,
+      currentRunAttempt,
+      { policy, currentHeadSha, defaultBranch, defaultCommitShas },
+    );
+    const current = directCurrent || forwardFixCurrent;
     const evidence = {
       repo: repoName,
       workflow: String(run.name || run.workflow_id || 'unknown'),
@@ -720,29 +844,53 @@ function reconcileWorkflowFailures(repoName, runs) {
       recovered_by_run_id: recovery?.id || null,
       recovered_by_attempt: recovery ? Number(recovery.run_attempt || 1) : null,
       recovery_url: recovery ? workflowRunUrl(recovery) : '',
+      recovery_kind: directRecovery ? 'same-trigger-stream' : forwardFixRecovery ? 'verified-current-main-forward-fix' : '',
     };
     if (recovery) {
       recoveryEvidence.workflows.push(evidence);
     } else if (current) {
-      provisionalEvidence.workflows.push({ ...evidence, provisional_recovery_run_id: current.id, provisional_recovery_attempt: Number(current.run_attempt || 1) });
+      provisionalEvidence.workflows.push({
+        ...evidence,
+        provisional_recovery_run_id: current.id,
+        provisional_recovery_attempt: Number(current.run_attempt || 1),
+        provisional_recovery_kind: directCurrent ? 'same-trigger-self-latch' : 'verified-current-main-forward-fix-self-latch',
+      });
     } else {
       unresolvedEvidence.workflows.push(evidence);
-      failures.push(issue(repoName, evidence.workflow, 'recent ' + evidence.event + ' run ' + evidence.run_id + ' attempt ' + evidence.run_attempt + ' concluded ' + evidence.conclusion + ' without a later same-workflow/branch/event success', evidence.url));
+      failures.push(issue(repoName, evidence.workflow, 'recent ' + evidence.event + ' run ' + evidence.run_id + ' attempt ' + evidence.run_attempt + ' concluded ' + evidence.conclusion + ' without a later same-trigger success or verified current-main forward fix', evidence.url));
     }
   }
 }
 
-function reconcileCheckFailures(repoName, checks, deploymentStatuses, pullByNumber, defaultBranch) {
+function reconcileCheckFailures(repoName, checks, deploymentStatuses, pullByNumber, defaultBranch, {
+  currentHeadSha,
+  defaultCommitShas,
+  policies,
+}) {
   for (const check of checks.filter((candidate) => candidate.status === 'completed'
     && failedConclusions.has(String(candidate.conclusion || ''))
     && recordActivityTime(candidate) >= cutoffMs)) {
     const directRecovery = findSupersedingCheck(check, checks);
-    const deploymentRecovery = directRecovery ? null : findDeploymentCheckRecovery(check, deploymentStatuses, checks);
-    const mergedPullRecovery = directRecovery || deploymentRecovery
+    const policy = policies.get(Number(check.workflow_id));
+    const forwardFixRecovery = directRecovery || !policy ? null : findForwardFixCheck(check, checks, {
+      policy,
+      currentHeadSha,
+      defaultBranch,
+      defaultCommitShas,
+    });
+    const deploymentRecovery = directRecovery || forwardFixRecovery ? null : findDeploymentCheckRecovery(check, deploymentStatuses, checks);
+    const mergedPullRecovery = directRecovery || forwardFixRecovery || deploymentRecovery
       ? null
       : findMergedPullCheckRecovery(check, checks, pullByNumber, defaultBranch);
-    const recovery = directRecovery || deploymentRecovery?.check || mergedPullRecovery?.check || null;
-    const current = findCurrentSelfCheckRecovery(repoName, check, checks);
+    const recovery = directRecovery || forwardFixRecovery || deploymentRecovery?.check || mergedPullRecovery?.check || null;
+    const directCurrent = findCurrentSelfCheckRecovery(repoName, check, checks);
+    const forwardFixCurrent = directCurrent || !policy ? null : findProvisionalForwardFixCheckRecovery(
+      check,
+      checks,
+      currentRunId,
+      { policy, currentHeadSha, defaultBranch, defaultCommitShas },
+    );
+    const current = directCurrent || forwardFixCurrent;
     const evidence = {
       repo: repoName,
       check: String(check.name || 'unknown'),
@@ -757,6 +905,8 @@ function reconcileCheckFailures(repoName, checks, deploymentStatuses, pullByNumb
       recovery_url: String(recovery?.details_url || ''),
       recovery_kind: directRecovery
         ? 'same-trigger-stream'
+        : forwardFixRecovery
+          ? 'verified-current-main-forward-fix'
         : deploymentRecovery
           ? 'successful-deployment'
           : mergedPullRecovery
@@ -766,7 +916,11 @@ function reconcileCheckFailures(repoName, checks, deploymentStatuses, pullByNumb
     if (recovery) {
       recoveryEvidence.checks.push(evidence);
     } else if (current) {
-      provisionalEvidence.checks.push({ ...evidence, provisional_recovery_check_run_id: current.id });
+      provisionalEvidence.checks.push({
+        ...evidence,
+        provisional_recovery_check_run_id: current.id,
+        provisional_recovery_kind: directCurrent ? 'same-trigger-self-latch' : 'verified-current-main-forward-fix-self-latch',
+      });
     } else {
       unresolvedEvidence.checks.push(evidence);
       failures.push(issue(repoName, evidence.check, 'recent ' + evidence.provider + ' check ' + evidence.check_run_id + ' concluded ' + evidence.conclusion + ' without a later success in stream ' + evidence.stream, evidence.url));

@@ -7,6 +7,10 @@ import {
   deploymentJobStreamIdentity,
   deploymentStreamIdentity,
   evaluateNoHistoryAllowance,
+  findForwardFixCheck,
+  findForwardFixWorkflowRun,
+  findProvisionalForwardFixCheckRecovery,
+  findProvisionalForwardFixWorkflowRecovery,
   findProvisionalCheckRecovery,
   findProvisionalWorkflowRecovery,
   findDeploymentCheckRecovery,
@@ -19,6 +23,7 @@ import {
   partitionWorkflowHealth,
   recordActivityTime,
   rateHeadroomDecision,
+  verifyForwardFixRecoveryPolicy,
   workflowStreamIdentity,
 } from './release-health-monitor-utils.mjs';
 
@@ -228,6 +233,132 @@ assert.equal(workflowRecovery?.id, 305, 'workflow recovery must require the same
 assert.equal(findSupersedingWorkflowRun({ ...failedRun, id: 306, created_at: '2026-07-18T10:00:00Z' }, [failedRun]), null);
 assert.match(workflowStreamIdentity({ ...failedRun, head_branch: null }), /sha-/i, 'missing branches must fail closed to the exact SHA');
 
+const forwardFixSource = 'name: Production n8n workflow exactness\non:\n  schedule:\n  workflow_dispatch:\n';
+const forwardFixWorkflow = {
+  id: 315750527,
+  name: 'Production n8n workflow exactness',
+  path: '.github/workflows/n8n-production-exactness.yml',
+  state: 'active',
+};
+const forwardFixPolicy = verifyForwardFixRecoveryPolicy({
+  workflow: forwardFixWorkflow,
+  workflowSource: forwardFixSource,
+  policy: {
+    workflowId: forwardFixWorkflow.id,
+    path: forwardFixWorkflow.path,
+    sourceSha256: createHash('sha256').update(forwardFixSource).digest('hex'),
+    headRepository: 'ScaleSmall/SSAI_PoW',
+    failedEvents: ['schedule'],
+    recoveryEvents: ['workflow_dispatch'],
+    jobNames: ['verify-production'],
+    recoveryDisplayTitles: ['Production n8n workflow exactness'],
+  },
+});
+assert.ok(forwardFixPolicy, 'an exact active source-hashed workflow policy must verify');
+const oldMainSha = '1'.repeat(40);
+const currentMainSha = '2'.repeat(40);
+const forwardFixFailure = {
+  ...failedRun,
+  workflow_id: forwardFixWorkflow.id,
+  head_sha: oldMainSha,
+  head_repository: { full_name: 'ScaleSmall/SSAI_PoW' },
+  event: 'schedule',
+};
+const forwardFixSuccess = {
+  ...forwardFixFailure,
+  id: 399,
+  head_sha: currentMainSha,
+  event: 'workflow_dispatch',
+  display_title: 'Production n8n workflow exactness',
+  status: 'completed',
+  conclusion: 'success',
+  created_at: '2026-07-18T09:30:00Z',
+};
+const forwardFixSearch = {
+  policy: forwardFixPolicy,
+  currentHeadSha: currentMainSha,
+  defaultBranch: 'main',
+  defaultCommitShas: new Set([oldMainSha, currentMainSha]),
+};
+assert.equal(
+  findForwardFixWorkflowRun(forwardFixFailure, [forwardFixFailure, forwardFixSuccess], forwardFixSearch)?.id,
+  399,
+  'a source-hashed current-main success may prove an explicitly approved forward fix across trigger types',
+);
+assert.equal(
+  findForwardFixWorkflowRun(
+    { ...forwardFixFailure, head_sha: currentMainSha },
+    [forwardFixSuccess],
+    forwardFixSearch,
+  ),
+  null,
+  'a same-commit manual run must not mask a scheduled failure',
+);
+assert.equal(verifyForwardFixRecoveryPolicy({
+  workflow: forwardFixWorkflow,
+  workflowSource: forwardFixSource + '# changed behavior\n',
+  policy: {
+    workflowId: forwardFixWorkflow.id,
+    path: forwardFixWorkflow.path,
+    sourceSha256: createHash('sha256').update(forwardFixSource).digest('hex'),
+    headRepository: 'ScaleSmall/SSAI_PoW',
+    failedEvents: ['schedule'],
+    recoveryEvents: ['workflow_dispatch'],
+    jobNames: ['verify-production'],
+    recoveryDisplayTitles: ['Production n8n workflow exactness'],
+  },
+}), null, 'changed workflow semantics must disable cross-trigger recovery');
+
+const provisionalForwardFixRun = {
+  ...forwardFixSuccess,
+  id: 997,
+  run_attempt: 1,
+  status: 'in_progress',
+  conclusion: null,
+};
+assert.equal(
+  findProvisionalForwardFixWorkflowRecovery(
+    forwardFixFailure,
+    [forwardFixFailure, provisionalForwardFixRun],
+    997,
+    1,
+    forwardFixSearch,
+  )?.id,
+  997,
+  'an exact in-progress forward-fix run may provisionally clear its own predecessor failure',
+);
+assert.equal(
+  findProvisionalForwardFixWorkflowRecovery(
+    forwardFixFailure,
+    [forwardFixFailure, { ...provisionalForwardFixRun, display_title: 'Release health monitor [incident:168h]' }],
+    997,
+    1,
+    forwardFixSearch,
+  ),
+  null,
+  'an in-progress run with an unapproved display title must not provisionally mask a predecessor failure',
+);
+assert.equal(
+  findProvisionalForwardFixWorkflowRecovery(
+    forwardFixFailure,
+    [forwardFixFailure, provisionalForwardFixRun],
+    996,
+    1,
+    forwardFixSearch,
+  ),
+  null,
+  'an in-progress run that is not the current run must not provisionally mask a predecessor failure',
+);
+assert.equal(
+  findForwardFixWorkflowRun(
+    forwardFixFailure,
+    [forwardFixFailure, { ...forwardFixSuccess, display_title: 'Release health monitor [incident:168h]' }],
+    forwardFixSearch,
+  ),
+  null,
+  'a terminal run with an unapproved display title must not recover a predecessor failure',
+);
+
 const currentRun = { ...failedRun, id: 999, run_attempt: 2, status: 'in_progress', conclusion: null, created_at: '2026-07-18T09:10:00Z' };
 assert.equal(
   findProvisionalWorkflowRecovery(failedRun, [failedRun, currentRun], 999, 2)?.id,
@@ -269,6 +400,89 @@ const failedCheck = {
   conclusion: 'failure',
   started_at: '2026-07-18T09:00:00Z',
 };
+const forwardFixFailedCheck = {
+  ...failedCheck,
+  workflow_id: forwardFixWorkflow.id,
+  name: 'verify-production',
+  event: 'schedule',
+  head_sha: oldMainSha,
+  head_repository: 'ScaleSmall/SSAI_PoW',
+};
+const forwardFixSuccessfulCheck = {
+  ...forwardFixFailedCheck,
+  id: 598,
+  event: 'workflow_dispatch',
+  head_sha: currentMainSha,
+  source_run_display_title: 'Production n8n workflow exactness',
+  conclusion: 'success',
+  started_at: '2026-07-18T09:30:00Z',
+};
+assert.equal(
+  findForwardFixCheck(forwardFixFailedCheck, [forwardFixFailedCheck, forwardFixSuccessfulCheck], forwardFixSearch)?.id,
+  598,
+  'only an approved job on the exact current-main forward fix may recover a cross-trigger check',
+);
+assert.equal(
+  findForwardFixCheck(
+    { ...forwardFixFailedCheck, name: 'dry-run' },
+    [{ ...forwardFixSuccessfulCheck, name: 'dry-run' }],
+    forwardFixSearch,
+  ),
+  null,
+  'an unapproved dry-run job must never mask a production check failure',
+);
+const provisionalForwardFixCheck = {
+  ...forwardFixSuccessfulCheck,
+  id: 597,
+  source_run_id: 997,
+  status: 'in_progress',
+  conclusion: null,
+};
+assert.equal(
+  findProvisionalForwardFixCheckRecovery(
+    forwardFixFailedCheck,
+    [forwardFixFailedCheck, provisionalForwardFixCheck],
+    997,
+    forwardFixSearch,
+  )?.id,
+  597,
+  'the exact current forward-fix check may provisionally clear its own predecessor failure',
+);
+assert.equal(
+  findProvisionalForwardFixCheckRecovery(
+    forwardFixFailedCheck,
+    [
+      forwardFixFailedCheck,
+      { ...provisionalForwardFixCheck, source_run_display_title: 'Release health monitor [incident:168h]' },
+    ],
+    997,
+    forwardFixSearch,
+  ),
+  null,
+  'an in-progress check from a run with an unapproved display title must not mask a predecessor failure',
+);
+assert.equal(
+  findProvisionalForwardFixCheckRecovery(
+    forwardFixFailedCheck,
+    [forwardFixFailedCheck, provisionalForwardFixCheck],
+    996,
+    forwardFixSearch,
+  ),
+  null,
+  'an in-progress check from a different current run must not mask a predecessor failure',
+);
+assert.equal(
+  findForwardFixCheck(
+    forwardFixFailedCheck,
+    [
+      forwardFixFailedCheck,
+      { ...forwardFixSuccessfulCheck, source_run_display_title: 'Release health monitor [incident:168h]' },
+    ],
+    forwardFixSearch,
+  ),
+  null,
+  'a terminal check from a run with an unapproved display title must not recover a predecessor failure',
+);
 assert.equal(
   deploymentJobStreamIdentity({ ...failedCheck, event: 'push', head_repository: 'ScaleSmall/SSAI_RR' }),
   deploymentJobStreamIdentity({ ...failedCheck, event: 'workflow_dispatch', head_repository: 'ScaleSmall/SSAI_RR' }),
