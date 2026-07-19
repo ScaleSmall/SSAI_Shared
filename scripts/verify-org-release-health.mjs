@@ -132,6 +132,16 @@ const auditedMonitorSourceEvidence = new Map([
     scriptSourceSha256: '7a783131a8eaac171b4f4e70ecbe84945db44d16217e08976c0f4f5af8906b6d',
     utilsSourceSha256: 'ad0b6b22c6b19cbfa8752130928b982f0bf8bbfe35c70430c2a739f5256ac4b6',
   }],
+  ['3cff6a902e93a2abd2a1781607bd98cfc0193de5', {
+    workflowSourceSha256: currentMonitorWorkflowSourceSha256,
+    scriptSourceSha256: 'dd13257d64ce8698397112197112253a1fbac9009426b2571611101109557aa3',
+    utilsSourceSha256: '8ba6ba55581a0afe6f1d034965864bf055464cf2a1a23aea04614b87a99e9420',
+  }],
+  ['3ceb9f2e58580a1f5e8514259ec59b26d9c40a65', {
+    workflowSourceSha256: currentMonitorWorkflowSourceSha256,
+    scriptSourceSha256: '8eb30c18aaaa5e537635f3d83463590ed3fe20f14c2be5bd468303e102d1cc64',
+    utilsSourceSha256: 'ad0b6b22c6b19cbfa8752130928b982f0bf8bbfe35c70430c2a739f5256ac4b6',
+  }],
 ]);
 const auditedMonitorOrigin = (
   runId,
@@ -212,6 +222,15 @@ const forwardFixRecoveryPolicies = new Map([
       auditedMonitorOrigin(29697092554, 1, 88219602143, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
       auditedMonitorOrigin(29698681710, 1, 88223813796, '2ee88f7cca1468f35695d08fff629b7400869a78', 'workflow_dispatch', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
       auditedMonitorOrigin(29699095663, 1, 88224952994, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      // This complete incident found only two failed CI deployment streams and
+      // their exact checks/deployments. Both inventory-order failures were
+      // superseded by successful CI deployment 29703504869, so recovery must
+      // still cover the earliest failed deployment predicate.
+      auditedMonitorOrigin(29703046855, 1, 88235277228, '3cff6a902e93a2abd2a1781607bd98cfc0193de5', 'workflow_dispatch', 'Release health monitor [incident:168h]', 'incident', 168, currentMonitorWorkflowSourceSha256, '2026-07-19T20:06:02Z'),
+      // This exact incident stopped at the fail-closed API headroom gate before
+      // inventory: 2547 remained, 3750 was required, reset 21:26:15Z. A later
+      // exhaustive incident may recover it from its own start predicate.
+      auditedMonitorOrigin(29703666102, 1, 88236901134, '3cff6a902e93a2abd2a1781607bd98cfc0193de5', 'workflow_dispatch', 'Release health monitor [incident:168h]', 'incident', 168, currentMonitorWorkflowSourceSha256, '2026-07-19T21:03:24Z'),
       // The first source-verified incident run was complete and had no current
       // production, no-history, status, or deployment red. Its only unresolved
       // records were the exact 24 attempts above, so the next incident scan may
@@ -221,6 +240,11 @@ const forwardFixRecoveryPolicies = new Map([
       // inventory: 2474 remained, 3750 was required, reset 22:27:02Z. A later
       // incident may recover it only by completing the exhaustive scan.
       auditedMonitorOrigin(29705959736, 1, 88242895212, '5a4ece6019c44c585f4f67b2bc3a7c50bc55f61d', 'workflow_dispatch', 'Release health monitor [incident:168h]', 'incident', 168, currentMonitorWorkflowSourceSha256, '2026-07-19T22:20:08Z'),
+      // This complete incident found no current product, no-history, status, or
+      // deployment failures. Its only unresolved records were the two exact
+      // audited monitor attempts above, so transitive recovery must preserve
+      // their earliest production predicate rather than merely this run time.
+      auditedMonitorOrigin(29706178612, 1, 88243477832, '3ceb9f2e58580a1f5e8514259ec59b26d9c40a65', 'workflow_dispatch', 'Release health monitor [incident:168h]', 'incident', 168, currentMonitorWorkflowSourceSha256, '2026-07-19T20:06:02Z'),
     ],
   }],
 ]);
