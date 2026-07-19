@@ -292,6 +292,12 @@ export function verifyForwardFixRecoveryPolicy({ workflow, policy, workflowSourc
   const recoveryEvents = exactNonEmptyStringSet(policy.recoveryEvents);
   const jobNames = exactNonEmptyStringSet(policy.jobNames);
   const recoveryDisplayTitles = exactNonEmptyStringSet(policy.recoveryDisplayTitles);
+  const monitorSelfRecoveryConfigured = policy.monitorSelfRecoveryContract !== undefined
+    || policy.monitorSelfRecoveryEvents !== undefined;
+  const monitorSelfRecoveryContract = String(policy.monitorSelfRecoveryContract || '').trim();
+  const monitorSelfRecoveryEvents = monitorSelfRecoveryConfigured
+    ? exactNonEmptyStringSet(policy.monitorSelfRecoveryEvents)
+    : null;
   const expectedSourceSha256 = String(policy.sourceSha256 || '').trim().toLowerCase();
   const sourceBytes = typeof workflowSource === 'string' ? Buffer.from(workflowSource, 'utf8') : workflowSource;
   if (!Number.isSafeInteger(expectedWorkflowId) || expectedWorkflowId < 1
@@ -300,6 +306,8 @@ export function verifyForwardFixRecoveryPolicy({ workflow, policy, workflowSourc
     || String(workflow.path || '') !== expectedPath
     || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(expectedRepository)
     || !failedEvents || !recoveryEvents || !jobNames || !recoveryDisplayTitles
+    || (monitorSelfRecoveryConfigured
+      && (monitorSelfRecoveryContract !== 'release-health-monitor-v1' || !monitorSelfRecoveryEvents))
     || !/^[a-f0-9]{64}$/.test(expectedSourceSha256)
     || !Buffer.isBuffer(sourceBytes)) return null;
   const actualSourceSha256 = createHash('sha256').update(sourceBytes).digest('hex');
@@ -313,8 +321,67 @@ export function verifyForwardFixRecoveryPolicy({ workflow, policy, workflowSourc
     recoveryEvents,
     jobNames,
     recoveryDisplayTitles,
+    monitorSelfRecoveryContract,
+    monitorSelfRecoveryEvents,
     sourceSha256: actualSourceSha256,
   });
+}
+
+export function isTrustedMonitorRecoveryPolicy(policy) {
+  return policy?.verified === true
+    && policy.monitorSelfRecoveryContract === 'release-health-monitor-v1'
+    && policy.monitorSelfRecoveryEvents instanceof Set
+    && policy.monitorSelfRecoveryEvents.size > 0;
+}
+
+export function findPolicyBoundWorkflowRecovery(failedRun, runs, policy, options) {
+  return isTrustedMonitorRecoveryPolicy(policy)
+    ? findTrustedMonitorWorkflowRecovery(failedRun, runs, { ...options, policy })
+    : findSupersedingWorkflowRun(failedRun, runs);
+}
+
+export function findPolicyBoundProvisionalWorkflowRecovery(
+  failedRun,
+  runs,
+  currentRunId,
+  currentRunAttempt,
+  policy,
+  options,
+) {
+  return isTrustedMonitorRecoveryPolicy(policy)
+    ? findProvisionalTrustedMonitorWorkflowRecovery(
+      failedRun,
+      runs,
+      currentRunId,
+      currentRunAttempt,
+      { ...options, policy },
+    )
+    : findProvisionalWorkflowRecovery(failedRun, runs, currentRunId, currentRunAttempt);
+}
+
+export function findPolicyBoundCheckRecovery(failedCheck, checks, policy, options) {
+  return isTrustedMonitorRecoveryPolicy(policy)
+    ? findTrustedMonitorCheckRecovery(failedCheck, checks, { ...options, policy })
+    : findSupersedingCheck(failedCheck, checks);
+}
+
+export function findPolicyBoundProvisionalCheckRecovery(
+  failedCheck,
+  checks,
+  currentRunId,
+  currentRunAttempt,
+  policy,
+  options,
+) {
+  return isTrustedMonitorRecoveryPolicy(policy)
+    ? findProvisionalTrustedMonitorCheckRecovery(
+      failedCheck,
+      checks,
+      currentRunId,
+      currentRunAttempt,
+      { ...options, policy },
+    )
+    : findProvisionalCheckRecovery(failedCheck, checks, currentRunId, currentRunAttempt);
 }
 
 export function findForwardFixWorkflowRun(failedRun, runs, {
@@ -385,7 +452,13 @@ export function findProvisionalForwardFixWorkflowRecovery(failedRun, runs, curre
     && candidate?.status !== 'completed') || null;
 }
 
-export function findProvisionalForwardFixCheckRecovery(failedCheck, checks, currentRunId, options) {
+export function findProvisionalForwardFixCheckRecovery(
+  failedCheck,
+  checks,
+  currentRunId,
+  currentRunAttempt,
+  options,
+) {
   if (!failedCheck || typeof failedCheck !== 'object') throw new TypeError('failedCheck must be an object');
   if (!Array.isArray(checks)) throw new TypeError('checks must be an array');
   const { policy, currentHeadSha, defaultBranch, defaultCommitShas } = options;
@@ -394,6 +467,7 @@ export function findProvisionalForwardFixCheckRecovery(failedCheck, checks, curr
     || !policy.jobNames.has(String(failedCheck.name || ''))
     || !isEligibleForwardFixOrigin(failedCheck, policy, currentHeadSha, defaultBranch, defaultCommitShas)) return null;
   return checks.find((candidate) => Number(candidate?.source_run_id) === Number(currentRunId)
+    && Number(candidate?.source_run_attempt || 1) === Number(currentRunAttempt || 1)
     && String(candidate?.app?.slug || '') === 'github-actions'
     && Number(candidate?.workflow_id) === policy.workflowId
     && candidate?.name === failedCheck.name
@@ -403,6 +477,116 @@ export function findProvisionalForwardFixCheckRecovery(failedCheck, checks, curr
     && policy.recoveryEvents.has(String(candidate?.event || ''))
     && policy.recoveryDisplayTitles.has(String(candidate?.source_run_display_title || ''))
     && occurrenceTime(candidate) > occurrenceTime(failedCheck)
+    && candidate?.status !== 'completed') || null;
+}
+
+export function findTrustedMonitorWorkflowRecovery(failedRun, runs, options) {
+  if (!failedRun || typeof failedRun !== 'object') throw new TypeError('failedRun must be an object');
+  if (!Array.isArray(runs)) throw new TypeError('runs must be an array');
+  const { policy, currentHeadSha, defaultBranch, defaultCommitShas } = options;
+  validateTrustedMonitorSearch(policy, currentHeadSha, defaultBranch, defaultCommitShas);
+  if (!isEligibleTrustedMonitorOrigin(failedRun, policy, currentHeadSha, defaultBranch, defaultCommitShas)) return null;
+  const later = runs.filter((candidate) => isTrustedMonitorWorkflowCandidate(
+    candidate,
+    failedRun,
+    policy,
+    currentHeadSha,
+    defaultBranch,
+  )
+    && candidate?.status === 'completed'
+    && candidate?.conclusion === 'success')
+    .sort(compareNewestFirst)[0];
+  return later || null;
+}
+
+export function findProvisionalTrustedMonitorWorkflowRecovery(
+  failedRun,
+  runs,
+  currentRunId,
+  currentRunAttempt,
+  options,
+) {
+  if (!failedRun || typeof failedRun !== 'object') throw new TypeError('failedRun must be an object');
+  if (!Array.isArray(runs)) throw new TypeError('runs must be an array');
+  const { policy, currentHeadSha, defaultBranch, defaultCommitShas } = options;
+  validateTrustedMonitorSearch(policy, currentHeadSha, defaultBranch, defaultCommitShas);
+  if (!isEligibleTrustedMonitorOrigin(failedRun, policy, currentHeadSha, defaultBranch, defaultCommitShas)) return null;
+  return runs.find((candidate) => Number(candidate?.id) === Number(currentRunId)
+    && Number(candidate?.run_attempt || 1) === Number(currentRunAttempt || 1)
+    && isTrustedMonitorWorkflowCandidate(candidate, failedRun, policy, currentHeadSha, defaultBranch)
+    && candidate?.status !== 'completed') || null;
+}
+
+export function findTrustedMonitorCheckRecovery(failedCheck, checks, options) {
+  if (!failedCheck || typeof failedCheck !== 'object') throw new TypeError('failedCheck must be an object');
+  if (!Array.isArray(checks)) throw new TypeError('checks must be an array');
+  const { policy, currentHeadSha, defaultBranch, defaultCommitShas } = options;
+  validateTrustedMonitorSearch(policy, currentHeadSha, defaultBranch, defaultCommitShas);
+  if (!isEligibleTrustedMonitorCheckOrigin(
+    failedCheck,
+    policy,
+    currentHeadSha,
+    defaultBranch,
+    defaultCommitShas,
+  )) return null;
+  const later = checks.filter((candidate) => isTrustedMonitorCheckCandidate(
+    candidate,
+    failedCheck,
+    policy,
+    currentHeadSha,
+    defaultBranch,
+  )
+    && candidate?.status === 'completed'
+    && candidate?.conclusion === 'success')
+    .sort(compareNewestFirst)[0];
+  return later || null;
+}
+
+export function findProvisionalTrustedMonitorCheckRecovery(
+  failedCheck,
+  checks,
+  currentRunId,
+  currentRunAttempt,
+  options,
+) {
+  if (!failedCheck || typeof failedCheck !== 'object') throw new TypeError('failedCheck must be an object');
+  if (!Array.isArray(checks)) throw new TypeError('checks must be an array');
+  const { policy, currentHeadSha, defaultBranch, defaultCommitShas } = options;
+  validateTrustedMonitorSearch(policy, currentHeadSha, defaultBranch, defaultCommitShas);
+  if (!isEligibleTrustedMonitorCheckOrigin(
+    failedCheck,
+    policy,
+    currentHeadSha,
+    defaultBranch,
+    defaultCommitShas,
+  )) return null;
+  return checks.find((candidate) => Number(candidate?.source_run_id) === Number(currentRunId)
+    && Number(candidate?.source_run_attempt || 1) === Number(currentRunAttempt || 1)
+    && isTrustedMonitorCheckCandidate(candidate, failedCheck, policy, currentHeadSha, defaultBranch)
+    && candidate?.status !== 'completed') || null;
+}
+
+export function findProvisionalTrustedMonitorCheckRecoveryFromRun(
+  failedCheck,
+  runs,
+  currentRunId,
+  currentRunAttempt,
+  options,
+) {
+  if (!failedCheck || typeof failedCheck !== 'object') throw new TypeError('failedCheck must be an object');
+  if (!Array.isArray(runs)) throw new TypeError('runs must be an array');
+  const { policy, currentHeadSha, defaultBranch, defaultCommitShas } = options;
+  validateTrustedMonitorSearch(policy, currentHeadSha, defaultBranch, defaultCommitShas);
+  if (!isEligibleTrustedMonitorCheckOrigin(
+    failedCheck,
+    policy,
+    currentHeadSha,
+    defaultBranch,
+    defaultCommitShas,
+  )) return null;
+  return runs.find((candidate) => Number(candidate?.id) === Number(currentRunId)
+    && Number(candidate?.run_attempt || 1) === Number(currentRunAttempt || 1)
+    && isTrustedMonitorWorkflowCandidate(candidate, failedCheck, policy, currentHeadSha, defaultBranch)
     && candidate?.status !== 'completed') || null;
 }
 
@@ -443,11 +627,12 @@ export function findSupersedingCheck(failedCheck, checks) {
   return later || null;
 }
 
-export function findProvisionalCheckRecovery(failedCheck, checks, currentRunId) {
+export function findProvisionalCheckRecovery(failedCheck, checks, currentRunId, currentRunAttempt = 1) {
   if (!failedCheck || typeof failedCheck !== 'object') throw new TypeError('failedCheck must be an object');
   if (!Array.isArray(checks)) throw new TypeError('checks must be an array');
   const failedIdentity = checkStreamIdentity(failedCheck);
   return checks.find((candidate) => Number(candidate?.source_run_id) === Number(currentRunId)
+    && Number(candidate?.source_run_attempt || 1) === Number(currentRunAttempt || 1)
     && checkStreamIdentity(candidate) === failedIdentity
     && occurrenceTime(candidate) > occurrenceTime(failedCheck)
     && candidate?.status !== 'completed') || null;
@@ -581,6 +766,85 @@ function validateForwardFixSearch(policy, currentHeadSha, defaultBranch, default
   }
   if (!String(defaultBranch || '').trim()) throw new Error('defaultBranch must not be empty');
   if (!(defaultCommitShas instanceof Set)) throw new TypeError('defaultCommitShas must be a Set');
+}
+
+function validateTrustedMonitorSearch(policy, currentHeadSha, defaultBranch, defaultCommitShas) {
+  validateForwardFixSearch(policy, currentHeadSha, defaultBranch, defaultCommitShas);
+  if (!isTrustedMonitorRecoveryPolicy(policy)) {
+    throw new TypeError('trusted monitor recovery policy must be source-verified');
+  }
+}
+
+function isEligibleTrustedMonitorOrigin(record, policy, currentHeadSha, defaultBranch, defaultCommitShas) {
+  const failedSha = String(record?.head_sha || '');
+  const headRepository = String(record?.head_repository?.full_name || record?.head_repository || '');
+  return Number(record?.workflow_id) === policy.workflowId
+    && record?.head_branch === defaultBranch
+    && headRepository === policy.headRepository
+    && policy.monitorSelfRecoveryEvents.has(String(record?.event || ''))
+    && isTrustedReleaseHealthMonitorTitle(record?.display_title || record?.source_run_display_title)
+    && /^[a-f0-9]{40}$/i.test(failedSha)
+    && defaultCommitShas.has(failedSha)
+    && defaultCommitShas.has(currentHeadSha);
+}
+
+function isEligibleTrustedMonitorCheckOrigin(
+  record,
+  policy,
+  currentHeadSha,
+  defaultBranch,
+  defaultCommitShas,
+) {
+  return String(record?.app?.slug || '') === 'github-actions'
+    && policy.jobNames.has(String(record?.name || ''))
+    && isEligibleTrustedMonitorOrigin(record, policy, currentHeadSha, defaultBranch, defaultCommitShas);
+}
+
+function isTrustedMonitorWorkflowCandidate(candidate, failedRun, policy, currentHeadSha, defaultBranch) {
+  return Number(candidate?.workflow_id) === policy.workflowId
+    && candidate?.head_branch === defaultBranch
+    && candidate?.head_sha === currentHeadSha
+    && candidate?.head_repository?.full_name === policy.headRepository
+    && policy.monitorSelfRecoveryEvents.has(String(candidate?.event || ''))
+    && trustedMonitorCoverageDominates(
+      candidate?.display_title,
+      failedRun?.display_title || failedRun?.source_run_display_title,
+    )
+    && occurrenceTime(candidate) > occurrenceTime(failedRun);
+}
+
+function isTrustedMonitorCheckCandidate(candidate, failedCheck, policy, currentHeadSha, defaultBranch) {
+  return String(candidate?.app?.slug || '') === 'github-actions'
+    && Number(candidate?.workflow_id) === policy.workflowId
+    && candidate?.name === failedCheck.name
+    && candidate?.head_branch === defaultBranch
+    && candidate?.head_sha === currentHeadSha
+    && candidate?.head_repository === policy.headRepository
+    && policy.monitorSelfRecoveryEvents.has(String(candidate?.event || ''))
+    && trustedMonitorCoverageDominates(
+      candidate?.source_run_display_title,
+      failedCheck?.source_run_display_title || failedCheck?.display_title,
+    )
+    && occurrenceTime(candidate) > occurrenceTime(failedCheck);
+}
+
+function isTrustedReleaseHealthMonitorTitle(value) {
+  return parseTrustedReleaseHealthMonitorTitle(value) !== null;
+}
+
+function trustedMonitorCoverageDominates(candidateTitle, failedTitle) {
+  const candidate = parseTrustedReleaseHealthMonitorTitle(candidateTitle);
+  const failed = parseTrustedReleaseHealthMonitorTitle(failedTitle);
+  if (!candidate || !failed || candidate.hours < failed.hours) return false;
+  return failed.mode !== 'incident' || candidate.mode === 'incident';
+}
+
+function parseTrustedReleaseHealthMonitorTitle(value) {
+  const match = /^Release health monitor \[(continuous|incident):([1-9]\d{0,2})h\]$/.exec(String(value || ''));
+  if (!match) return null;
+  const hours = Number(match[2]);
+  if (match[1] === 'continuous' ? hours > 6 : hours > 168) return null;
+  return { mode: match[1], hours };
 }
 
 function isEligibleForwardFixOrigin(record, policy, currentHeadSha, defaultBranch, defaultCommitShas) {

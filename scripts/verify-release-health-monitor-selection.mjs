@@ -9,8 +9,15 @@ import {
   evaluateNoHistoryAllowance,
   findForwardFixCheck,
   findForwardFixWorkflowRun,
+  findPolicyBoundCheckRecovery,
+  findPolicyBoundProvisionalCheckRecovery,
+  findPolicyBoundProvisionalWorkflowRecovery,
+  findPolicyBoundWorkflowRecovery,
   findProvisionalForwardFixCheckRecovery,
   findProvisionalForwardFixWorkflowRecovery,
+  findProvisionalTrustedMonitorCheckRecovery,
+  findProvisionalTrustedMonitorCheckRecoveryFromRun,
+  findProvisionalTrustedMonitorWorkflowRecovery,
   findProvisionalCheckRecovery,
   findProvisionalWorkflowRecovery,
   findDeploymentCheckRecovery,
@@ -19,6 +26,9 @@ import {
   findSupersedingCommitStatus,
   findSupersedingDeployment,
   findSupersedingWorkflowRun,
+  findTrustedMonitorCheckRecovery,
+  findTrustedMonitorWorkflowRecovery,
+  isTrustedMonitorRecoveryPolicy,
   latestByIdentity,
   partitionWorkflowHealth,
   recordActivityTime,
@@ -255,6 +265,7 @@ const forwardFixPolicy = verifyForwardFixRecoveryPolicy({
   },
 });
 assert.ok(forwardFixPolicy, 'an exact active source-hashed workflow policy must verify');
+assert.equal(isTrustedMonitorRecoveryPolicy(forwardFixPolicy), false, 'a generic forward-fix policy must not enter trusted monitor recovery');
 const oldMainSha = '1'.repeat(40);
 const currentMainSha = '2'.repeat(40);
 const forwardFixFailure = {
@@ -367,6 +378,222 @@ assert.equal(
 );
 assert.equal(findProvisionalWorkflowRecovery(failedRun, [failedRun, currentRun], 998, 2), null, 'an unrelated run must not suppress a failure');
 
+const monitorSource = 'name: Scale Small AI Release Health Monitor\nrun-name: Release health monitor [mode:hours]\non:\n  schedule:\n  workflow_dispatch:\n';
+const monitorWorkflow = {
+  id: 315630665,
+  name: 'Scale Small AI Release Health Monitor',
+  path: '.github/workflows/release-health-monitor.yml',
+  state: 'active',
+};
+const monitorPolicyInput = {
+  workflowId: monitorWorkflow.id,
+  path: monitorWorkflow.path,
+  sourceSha256: createHash('sha256').update(monitorSource).digest('hex'),
+  headRepository: 'ScaleSmall/SSAI_Shared',
+  failedEvents: ['schedule'],
+  recoveryEvents: ['workflow_dispatch'],
+  jobNames: ['Verify current organization release health'],
+  recoveryDisplayTitles: ['Release health monitor [continuous:6h]'],
+  monitorSelfRecoveryContract: 'release-health-monitor-v1',
+  monitorSelfRecoveryEvents: ['schedule', 'workflow_dispatch'],
+};
+const monitorPolicy = verifyForwardFixRecoveryPolicy({
+  workflow: monitorWorkflow,
+  workflowSource: monitorSource,
+  policy: monitorPolicyInput,
+});
+assert.ok(monitorPolicy, 'trusted monitor recovery requires an exact source-hashed policy');
+assert.equal(isTrustedMonitorRecoveryPolicy(monitorPolicy), true, 'the exact monitor policy must enter trusted monitor recovery');
+assert.equal(verifyForwardFixRecoveryPolicy({
+  workflow: monitorWorkflow,
+  workflowSource: monitorSource,
+  policy: { ...monitorPolicyInput, monitorSelfRecoveryEvents: [] },
+}), null, 'an empty trusted monitor event set must fail closed');
+
+const monitorOldSha = '3'.repeat(40);
+const monitorCurrentSha = '4'.repeat(40);
+const monitorSearch = {
+  policy: monitorPolicy,
+  currentHeadSha: monitorCurrentSha,
+  defaultBranch: 'main',
+  defaultCommitShas: new Set([monitorOldSha, monitorCurrentSha]),
+};
+const scheduledMonitorFailure = {
+  ...failedRun,
+  id: 701,
+  workflow_id: monitorWorkflow.id,
+  head_sha: monitorOldSha,
+  head_repository: { full_name: 'ScaleSmall/SSAI_Shared' },
+  event: 'schedule',
+  display_title: 'Release health monitor [continuous:6h]',
+  created_at: '2026-07-18T09:00:00Z',
+};
+const manualContinuousMonitorFailure = {
+  ...scheduledMonitorFailure,
+  id: 702,
+  head_sha: monitorCurrentSha,
+  event: 'workflow_dispatch',
+  created_at: '2026-07-18T09:01:00Z',
+};
+const manualIncidentMonitorFailure = {
+  ...manualContinuousMonitorFailure,
+  id: 703,
+  display_title: 'Release health monitor [incident:168h]',
+  created_at: '2026-07-18T09:02:00Z',
+};
+const currentIncidentMonitorRun = {
+  ...manualIncidentMonitorFailure,
+  id: 799,
+  run_attempt: 2,
+  status: 'in_progress',
+  conclusion: null,
+  created_at: '2026-07-18T09:10:00Z',
+};
+const currentScheduledMonitorRun = {
+  ...manualContinuousMonitorFailure,
+  id: 798,
+  run_attempt: 1,
+  event: 'schedule',
+  status: 'in_progress',
+  conclusion: null,
+  created_at: '2026-07-18T09:09:00Z',
+};
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    scheduledMonitorFailure,
+    [scheduledMonitorFailure, currentIncidentMonitorRun],
+    799,
+    2,
+    monitorSearch,
+  )?.id,
+  799,
+  'an exact current incident scan may self-latch an older scheduled monitor failure',
+);
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    manualContinuousMonitorFailure,
+    [manualContinuousMonitorFailure, currentScheduledMonitorRun],
+    798,
+    1,
+    monitorSearch,
+  )?.id,
+  798,
+  'an exact current scheduled scan may self-latch an older dispatch failure with equal coverage',
+);
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    manualIncidentMonitorFailure,
+    [manualIncidentMonitorFailure, { ...currentScheduledMonitorRun, id: 797 }],
+    797,
+    1,
+    monitorSearch,
+  ),
+  null,
+  'a continuous scan must not claim recovery of a broader incident scan',
+);
+const currentManualContinuousMonitorRun = {
+  ...currentScheduledMonitorRun,
+  id: 796,
+  event: 'workflow_dispatch',
+  created_at: '2026-07-18T09:11:00Z',
+};
+const completedManualContinuousMonitorRun = {
+  ...currentManualContinuousMonitorRun,
+  id: 795,
+  status: 'completed',
+  conclusion: 'success',
+  created_at: '2026-07-18T09:12:00Z',
+};
+assert.equal(
+  findSupersedingWorkflowRun(
+    manualIncidentMonitorFailure,
+    [manualIncidentMonitorFailure, completedManualContinuousMonitorRun],
+  )?.id,
+  795,
+  'the generic same-trigger selector demonstrates why trusted monitor policy binding is required',
+);
+assert.equal(
+  findPolicyBoundWorkflowRecovery(
+    manualIncidentMonitorFailure,
+    [manualIncidentMonitorFailure, completedManualContinuousMonitorRun],
+    monitorPolicy,
+    monitorSearch,
+  ),
+  null,
+  'the actual policy-bound workflow selector must reject narrower same-trigger recovery',
+);
+assert.equal(
+  findPolicyBoundProvisionalWorkflowRecovery(
+    manualIncidentMonitorFailure,
+    [manualIncidentMonitorFailure, currentManualContinuousMonitorRun],
+    796,
+    1,
+    monitorPolicy,
+    monitorSearch,
+  ),
+  null,
+  'the actual policy-bound workflow self-latch must reject a narrower same-trigger scan',
+);
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    scheduledMonitorFailure,
+    [scheduledMonitorFailure, currentIncidentMonitorRun],
+    799,
+    1,
+    monitorSearch,
+  ),
+  null,
+  'a prior run attempt must not self-latch the current monitor attempt',
+);
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    scheduledMonitorFailure,
+    [scheduledMonitorFailure, { ...currentIncidentMonitorRun, head_repository: { full_name: 'untrusted/fork' } }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a fork run must not recover a trusted monitor failure',
+);
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    scheduledMonitorFailure,
+    [scheduledMonitorFailure, { ...currentIncidentMonitorRun, display_title: 'Release health monitor [incident:169h]' }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'an out-of-contract scan title must fail closed',
+);
+const completedIncidentMonitorRun = {
+  ...currentIncidentMonitorRun,
+  id: 800,
+  run_attempt: 1,
+  status: 'completed',
+  conclusion: 'success',
+  created_at: '2026-07-18T09:20:00Z',
+};
+assert.equal(
+  findTrustedMonitorWorkflowRecovery(
+    manualIncidentMonitorFailure,
+    [manualIncidentMonitorFailure, completedIncidentMonitorRun],
+    monitorSearch,
+  )?.id,
+  800,
+  'a completed incident scan may recover a prior same-SHA incident failure',
+);
+assert.equal(
+  findTrustedMonitorWorkflowRecovery(
+    { ...scheduledMonitorFailure, workflow_id: 123 },
+    [completedIncidentMonitorRun],
+    monitorSearch,
+  ),
+  null,
+  'an arbitrary workflow failure must never use trusted monitor recovery',
+);
+
 const failedDeployment = {
   id: 401,
   deployment_id: 40,
@@ -443,6 +670,7 @@ assert.equal(
     forwardFixFailedCheck,
     [forwardFixFailedCheck, provisionalForwardFixCheck],
     997,
+    1,
     forwardFixSearch,
   )?.id,
   597,
@@ -456,6 +684,7 @@ assert.equal(
       { ...provisionalForwardFixCheck, source_run_display_title: 'Release health monitor [incident:168h]' },
     ],
     997,
+    1,
     forwardFixSearch,
   ),
   null,
@@ -466,6 +695,7 @@ assert.equal(
     forwardFixFailedCheck,
     [forwardFixFailedCheck, provisionalForwardFixCheck],
     996,
+    1,
     forwardFixSearch,
   ),
   null,
@@ -482,6 +712,162 @@ assert.equal(
   ),
   null,
   'a terminal check from a run with an unapproved display title must not recover a predecessor failure',
+);
+
+const scheduledMonitorFailedCheck = {
+  ...failedCheck,
+  id: 810,
+  workflow_id: monitorWorkflow.id,
+  name: 'Verify current organization release health',
+  event: 'schedule',
+  head_sha: monitorOldSha,
+  head_repository: 'ScaleSmall/SSAI_Shared',
+  source_run_display_title: 'Release health monitor [continuous:6h]',
+  started_at: '2026-07-18T09:00:00Z',
+};
+const incidentMonitorFailedCheck = {
+  ...scheduledMonitorFailedCheck,
+  id: 811,
+  event: 'workflow_dispatch',
+  head_sha: monitorCurrentSha,
+  source_run_display_title: 'Release health monitor [incident:168h]',
+  started_at: '2026-07-18T09:02:00Z',
+};
+const currentIncidentMonitorCheck = {
+  ...incidentMonitorFailedCheck,
+  id: 899,
+  source_run_id: 799,
+  source_run_attempt: 2,
+  status: 'in_progress',
+  conclusion: null,
+  started_at: '2026-07-18T09:10:00Z',
+};
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecovery(
+    scheduledMonitorFailedCheck,
+    [scheduledMonitorFailedCheck, currentIncidentMonitorCheck],
+    799,
+    2,
+    monitorSearch,
+  )?.id,
+  899,
+  'the exact current incident job may provisionally recover a scheduled monitor check',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecovery(
+    scheduledMonitorFailedCheck,
+    [scheduledMonitorFailedCheck, { ...currentIncidentMonitorCheck, name: 'untrusted-job' }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a different job must never recover the monitor check',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecovery(
+    scheduledMonitorFailedCheck,
+    [scheduledMonitorFailedCheck, currentIncidentMonitorCheck],
+    799,
+    1,
+    monitorSearch,
+  ),
+  null,
+  'a check from a prior run attempt must not self-latch the current attempt',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecoveryFromRun(
+    scheduledMonitorFailedCheck,
+    [scheduledMonitorFailure, currentIncidentMonitorRun],
+    799,
+    2,
+    monitorSearch,
+  )?.id,
+  799,
+  'the exact current workflow run may bind recovery while GitHub has not indexed its check yet',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecoveryFromRun(
+    incidentMonitorFailedCheck,
+    [manualIncidentMonitorFailure, currentScheduledMonitorRun],
+    798,
+    1,
+    monitorSearch,
+  ),
+  null,
+  'a narrower continuous run must not provisionally recover an incident check',
+);
+const currentManualContinuousMonitorCheck = {
+  ...currentIncidentMonitorCheck,
+  id: 898,
+  source_run_id: 796,
+  source_run_attempt: 1,
+  source_run_display_title: 'Release health monitor [continuous:6h]',
+  started_at: '2026-07-18T09:11:00Z',
+};
+const completedManualContinuousMonitorCheck = {
+  ...currentManualContinuousMonitorCheck,
+  id: 897,
+  status: 'completed',
+  conclusion: 'success',
+  started_at: '2026-07-18T09:12:00Z',
+};
+assert.equal(
+  findSupersedingCheck(
+    incidentMonitorFailedCheck,
+    [incidentMonitorFailedCheck, completedManualContinuousMonitorCheck],
+  )?.id,
+  897,
+  'the generic check selector demonstrates the same-trigger coverage bypass',
+);
+assert.equal(
+  findPolicyBoundCheckRecovery(
+    incidentMonitorFailedCheck,
+    [incidentMonitorFailedCheck, completedManualContinuousMonitorCheck],
+    monitorPolicy,
+    monitorSearch,
+  ),
+  null,
+  'the actual policy-bound check selector must reject narrower same-trigger recovery',
+);
+assert.equal(
+  findPolicyBoundProvisionalCheckRecovery(
+    incidentMonitorFailedCheck,
+    [incidentMonitorFailedCheck, currentManualContinuousMonitorCheck],
+    796,
+    1,
+    monitorPolicy,
+    monitorSearch,
+  ),
+  null,
+  'the actual policy-bound check self-latch must reject a narrower same-trigger scan',
+);
+const completedIncidentMonitorCheck = {
+  ...currentIncidentMonitorCheck,
+  id: 900,
+  source_run_id: 800,
+  source_run_attempt: 1,
+  status: 'completed',
+  conclusion: 'success',
+  started_at: '2026-07-18T09:20:00Z',
+};
+assert.equal(
+  findTrustedMonitorCheckRecovery(
+    incidentMonitorFailedCheck,
+    [incidentMonitorFailedCheck, completedIncidentMonitorCheck],
+    monitorSearch,
+  )?.id,
+  900,
+  'a completed exact monitor job may recover a prior cross-trigger check',
+);
+assert.equal(
+  findTrustedMonitorCheckRecovery(
+    { ...incidentMonitorFailedCheck, app: { slug: 'external-provider' } },
+    [completedIncidentMonitorCheck],
+    monitorSearch,
+  ),
+  null,
+  'an external provider failure must remain outside trusted monitor recovery',
 );
 assert.equal(
   deploymentJobStreamIdentity({ ...failedCheck, event: 'push', head_repository: 'ScaleSmall/SSAI_RR' }),
@@ -614,13 +1000,14 @@ assert.notEqual(
   'external checks with ambiguous branches must fail closed to their exact SHA',
 );
 
-const currentCheck = { ...failedCheck, id: 599, source_run_id: 999, status: 'in_progress', conclusion: null, started_at: '2026-07-18T09:10:00Z' };
+const currentCheck = { ...failedCheck, id: 599, source_run_id: 999, source_run_attempt: 2, status: 'in_progress', conclusion: null, started_at: '2026-07-18T09:10:00Z' };
 assert.equal(
-  findProvisionalCheckRecovery(failedCheck, [failedCheck, currentCheck], 999)?.id,
+  findProvisionalCheckRecovery(failedCheck, [failedCheck, currentCheck], 999, 2)?.id,
   599,
   'the in-progress monitor check must provisionally clear its own previous failure',
 );
-assert.equal(findProvisionalCheckRecovery(failedCheck, [failedCheck, currentCheck], 998), null);
+assert.equal(findProvisionalCheckRecovery(failedCheck, [failedCheck, currentCheck], 998, 2), null);
+assert.equal(findProvisionalCheckRecovery(failedCheck, [failedCheck, currentCheck], 999, 1), null, 'a prior run attempt must not self-latch the current attempt');
 
 const failedStatus = {
   id: 601,
