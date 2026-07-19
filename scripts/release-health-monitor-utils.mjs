@@ -282,6 +282,130 @@ export function findSupersedingWorkflowRun(failedRun, runs) {
   return later || null;
 }
 
+export function verifyForwardFixRecoveryPolicy({ workflow, policy, workflowSource }) {
+  if (!workflow || typeof workflow !== 'object') throw new TypeError('workflow must be an object');
+  if (!policy || typeof policy !== 'object' || Array.isArray(policy)) return null;
+  const expectedWorkflowId = Number(policy.workflowId);
+  const expectedPath = String(policy.path || '').trim();
+  const expectedRepository = String(policy.headRepository || '').trim();
+  const failedEvents = exactNonEmptyStringSet(policy.failedEvents);
+  const recoveryEvents = exactNonEmptyStringSet(policy.recoveryEvents);
+  const jobNames = exactNonEmptyStringSet(policy.jobNames);
+  const recoveryDisplayTitles = exactNonEmptyStringSet(policy.recoveryDisplayTitles);
+  const expectedSourceSha256 = String(policy.sourceSha256 || '').trim().toLowerCase();
+  const sourceBytes = typeof workflowSource === 'string' ? Buffer.from(workflowSource, 'utf8') : workflowSource;
+  if (!Number.isSafeInteger(expectedWorkflowId) || expectedWorkflowId < 1
+    || Number(workflow.id) !== expectedWorkflowId
+    || workflow.state !== 'active'
+    || String(workflow.path || '') !== expectedPath
+    || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(expectedRepository)
+    || !failedEvents || !recoveryEvents || !jobNames || !recoveryDisplayTitles
+    || !/^[a-f0-9]{64}$/.test(expectedSourceSha256)
+    || !Buffer.isBuffer(sourceBytes)) return null;
+  const actualSourceSha256 = createHash('sha256').update(sourceBytes).digest('hex');
+  if (actualSourceSha256 !== expectedSourceSha256) return null;
+  return Object.freeze({
+    verified: true,
+    workflowId: expectedWorkflowId,
+    path: expectedPath,
+    headRepository: expectedRepository,
+    failedEvents,
+    recoveryEvents,
+    jobNames,
+    recoveryDisplayTitles,
+    sourceSha256: actualSourceSha256,
+  });
+}
+
+export function findForwardFixWorkflowRun(failedRun, runs, {
+  policy,
+  currentHeadSha,
+  defaultBranch,
+  defaultCommitShas,
+}) {
+  if (!failedRun || typeof failedRun !== 'object') throw new TypeError('failedRun must be an object');
+  if (!Array.isArray(runs)) throw new TypeError('runs must be an array');
+  validateForwardFixSearch(policy, currentHeadSha, defaultBranch, defaultCommitShas);
+  if (!isEligibleForwardFixOrigin(failedRun, policy, currentHeadSha, defaultBranch, defaultCommitShas)) return null;
+  const later = runs.filter((candidate) => Number(candidate?.workflow_id) === policy.workflowId
+    && candidate?.head_branch === defaultBranch
+    && candidate?.head_sha === currentHeadSha
+    && candidate?.head_repository?.full_name === policy.headRepository
+    && policy.recoveryEvents.has(String(candidate?.event || ''))
+    && policy.recoveryDisplayTitles.has(String(candidate?.display_title || ''))
+    && occurrenceTime(candidate) > occurrenceTime(failedRun)
+    && candidate?.status === 'completed'
+    && candidate?.conclusion === 'success')
+    .sort(compareNewestFirst)[0];
+  return later || null;
+}
+
+export function findForwardFixCheck(failedCheck, checks, {
+  policy,
+  currentHeadSha,
+  defaultBranch,
+  defaultCommitShas,
+}) {
+  if (!failedCheck || typeof failedCheck !== 'object') throw new TypeError('failedCheck must be an object');
+  if (!Array.isArray(checks)) throw new TypeError('checks must be an array');
+  validateForwardFixSearch(policy, currentHeadSha, defaultBranch, defaultCommitShas);
+  if (String(failedCheck.app?.slug || '') !== 'github-actions'
+    || !policy.jobNames.has(String(failedCheck.name || ''))
+    || !isEligibleForwardFixOrigin(failedCheck, policy, currentHeadSha, defaultBranch, defaultCommitShas)) return null;
+  const later = checks.filter((candidate) => String(candidate?.app?.slug || '') === 'github-actions'
+    && Number(candidate?.workflow_id) === policy.workflowId
+    && candidate?.name === failedCheck.name
+    && candidate?.head_branch === defaultBranch
+    && candidate?.head_sha === currentHeadSha
+    && candidate?.head_repository === policy.headRepository
+    && policy.recoveryEvents.has(String(candidate?.event || ''))
+    && policy.recoveryDisplayTitles.has(String(candidate?.source_run_display_title || ''))
+    && occurrenceTime(candidate) > occurrenceTime(failedCheck)
+    && candidate?.status === 'completed'
+    && candidate?.conclusion === 'success')
+    .sort(compareNewestFirst)[0];
+  return later || null;
+}
+
+export function findProvisionalForwardFixWorkflowRecovery(failedRun, runs, currentRunId, currentRunAttempt, options) {
+  if (!failedRun || typeof failedRun !== 'object') throw new TypeError('failedRun must be an object');
+  if (!Array.isArray(runs)) throw new TypeError('runs must be an array');
+  const { policy, currentHeadSha, defaultBranch, defaultCommitShas } = options;
+  validateForwardFixSearch(policy, currentHeadSha, defaultBranch, defaultCommitShas);
+  if (!isEligibleForwardFixOrigin(failedRun, policy, currentHeadSha, defaultBranch, defaultCommitShas)) return null;
+  return runs.find((candidate) => Number(candidate?.id) === Number(currentRunId)
+    && Number(candidate?.run_attempt || 1) === Number(currentRunAttempt || 1)
+    && Number(candidate?.workflow_id) === policy.workflowId
+    && candidate?.head_branch === defaultBranch
+    && candidate?.head_sha === currentHeadSha
+    && candidate?.head_repository?.full_name === policy.headRepository
+    && policy.recoveryEvents.has(String(candidate?.event || ''))
+    && policy.recoveryDisplayTitles.has(String(candidate?.display_title || ''))
+    && occurrenceTime(candidate) > occurrenceTime(failedRun)
+    && candidate?.status !== 'completed') || null;
+}
+
+export function findProvisionalForwardFixCheckRecovery(failedCheck, checks, currentRunId, options) {
+  if (!failedCheck || typeof failedCheck !== 'object') throw new TypeError('failedCheck must be an object');
+  if (!Array.isArray(checks)) throw new TypeError('checks must be an array');
+  const { policy, currentHeadSha, defaultBranch, defaultCommitShas } = options;
+  validateForwardFixSearch(policy, currentHeadSha, defaultBranch, defaultCommitShas);
+  if (String(failedCheck.app?.slug || '') !== 'github-actions'
+    || !policy.jobNames.has(String(failedCheck.name || ''))
+    || !isEligibleForwardFixOrigin(failedCheck, policy, currentHeadSha, defaultBranch, defaultCommitShas)) return null;
+  return checks.find((candidate) => Number(candidate?.source_run_id) === Number(currentRunId)
+    && String(candidate?.app?.slug || '') === 'github-actions'
+    && Number(candidate?.workflow_id) === policy.workflowId
+    && candidate?.name === failedCheck.name
+    && candidate?.head_branch === defaultBranch
+    && candidate?.head_sha === currentHeadSha
+    && candidate?.head_repository === policy.headRepository
+    && policy.recoveryEvents.has(String(candidate?.event || ''))
+    && policy.recoveryDisplayTitles.has(String(candidate?.source_run_display_title || ''))
+    && occurrenceTime(candidate) > occurrenceTime(failedCheck)
+    && candidate?.status !== 'completed') || null;
+}
+
 export function findProvisionalWorkflowRecovery(failedRun, runs, currentRunId, currentRunAttempt = 1) {
   if (!failedRun || typeof failedRun !== 'object') throw new TypeError('failedRun must be an object');
   if (!Array.isArray(runs)) throw new TypeError('runs must be an array');
@@ -442,6 +566,41 @@ function compareOccurrence(left, right) {
   const timeDifference = occurrenceTime(left) - occurrenceTime(right);
   if (timeDifference !== 0) return timeDifference;
   return numericId(left?.id) - numericId(right?.id);
+}
+
+function validateForwardFixSearch(policy, currentHeadSha, defaultBranch, defaultCommitShas) {
+  if (!policy || policy.verified !== true
+    || !(policy.failedEvents instanceof Set)
+    || !(policy.recoveryEvents instanceof Set)
+    || !(policy.jobNames instanceof Set)
+    || !(policy.recoveryDisplayTitles instanceof Set)) {
+    throw new TypeError('forward-fix recovery policy must be verified');
+  }
+  if (!/^[a-f0-9]{40}$/i.test(String(currentHeadSha || ''))) {
+    throw new Error('currentHeadSha must be an exact commit SHA');
+  }
+  if (!String(defaultBranch || '').trim()) throw new Error('defaultBranch must not be empty');
+  if (!(defaultCommitShas instanceof Set)) throw new TypeError('defaultCommitShas must be a Set');
+}
+
+function isEligibleForwardFixOrigin(record, policy, currentHeadSha, defaultBranch, defaultCommitShas) {
+  const failedSha = String(record?.head_sha || '');
+  const headRepository = String(record?.head_repository?.full_name || record?.head_repository || '');
+  return Number(record?.workflow_id) === policy.workflowId
+    && record?.head_branch === defaultBranch
+    && headRepository === policy.headRepository
+    && policy.failedEvents.has(String(record?.event || ''))
+    && /^[a-f0-9]{40}$/i.test(failedSha)
+    && failedSha !== currentHeadSha
+    && defaultCommitShas.has(failedSha)
+    && defaultCommitShas.has(currentHeadSha);
+}
+
+function exactNonEmptyStringSet(value) {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const normalized = value.map((item) => String(item || '').trim());
+  if (normalized.some((item) => !item) || new Set(normalized).size !== normalized.length) return null;
+  return new Set(normalized);
 }
 
 function compareNewestFirst(left, right) {

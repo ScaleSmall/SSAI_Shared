@@ -64,6 +64,7 @@ requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SCALE
 requireText(releaseHealth, 'scan_mode:', 'explicit continuous/incident release-health mode');
 requireText(releaseHealth, 'type: choice', 'validated release-health mode choice');
 requireText(releaseHealth, '          - continuous\n          - incident', 'release-health mode options');
+requireText(releaseHealth, "run-name: Release health monitor [${{ inputs.scan_mode || 'continuous' }}:${{ inputs.lookback_hours || '6' }}h]", 'input-bound release-health run identity');
 requireText(releaseHealth, 'lookback_hours:', 'manual release-health lookback control');
 requireText(releaseHealth, "default: '6'", 'bounded scheduled release-health lookback default');
 requireText(releaseHealth, "timeout-minutes: ${{ inputs.scan_mode == 'incident' && 45 || 12 }}", 'mode-bounded release-health timeout');
@@ -82,6 +83,12 @@ requireText(releaseHealthVerifier, 'workflow_categories_complete', 'workflow cat
 requireText(releaseHealthVerifier, 'unresolved_no_history_workflows', 'explicit unresolved no-history accounting');
 requireText(releaseHealthVerifier, 'allowed_no_history_evidence', 'auditable no-history evidence summary');
 requireText(releaseHealthVerifier, 'findSupersedingWorkflowRun(', 'recent workflow failure recovery selection');
+requireText(releaseHealthVerifier, 'verifyForwardFixRecoveryPolicy(', 'source-hashed current-main forward-fix policy');
+requireText(releaseHealthVerifier, 'findForwardFixWorkflowRun(', 'bounded cross-trigger workflow forward-fix recovery');
+requireText(releaseHealthVerifier, 'findForwardFixCheck(', 'bounded cross-trigger check forward-fix recovery');
+requireText(releaseHealthVerifier, 'findProvisionalForwardFixWorkflowRecovery(', 'bounded forward-fix workflow self-latch');
+requireText(releaseHealthVerifier, 'findProvisionalForwardFixCheckRecovery(', 'bounded forward-fix check self-latch');
+requireText(releaseHealthVerifier, "const excludedRepositories = new Set(['SSAI_Connect'])", 'protected Connect exclusion');
 requireText(releaseHealthVerifier, 'findSupersedingCheck(', 'recent external check failure recovery selection');
 requireText(releaseHealthVerifier, 'findDeploymentCheckRecovery(', 'cross-trigger deployment recovery proof');
 requireText(releaseHealthVerifier, 'findMergedPullCheckRecovery(', 'merged pull-request recovery proof');
