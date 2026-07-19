@@ -14,33 +14,93 @@ on:
           - 'false'
           - 'true'
 
-permissions:
-  contents: read
+permissions: {}
+
+concurrency:
+  group: propagate-consumers-${{ github.repository }}-${{ github.sha }}-${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_connect == 'true' && github.run_id || 'dashboard-only' }}
+  cancel-in-progress: false
 
 jobs:
   trigger-rebuilds:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Skip protected Connect propagation
         if: ${{ github.event_name == 'push' || inputs.dispatch_connect != 'true' }}
         run: |
           echo "SSAI_Connect dispatch is intentionally skipped while connect.scalesmall.ai is reserved for TikTok OAuth review."
 
+      - name: Trigger SSAI_Dashboard rebuild
+        env:
+          GH_TOKEN: ${{ secrets.SSAI_DASHBOARD_DISPATCH_TOKEN }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          readonly expected_repository='ScaleSmall/SSAI_Shared'
+          readonly expected_ref='refs/heads/main'
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::Dashboard propagation token is not configured."
+            exit 1
+          fi
+
+          if [ "$SOURCE_REPOSITORY" != "$expected_repository" ]; then
+            echo "::error::Refusing Dashboard propagation from an unexpected repository."
+            exit 1
+          fi
+
+          if [ "$SOURCE_REF" != "$expected_ref" ]; then
+            echo "::error::Refusing Dashboard propagation from a non-main source ref."
+            exit 1
+          fi
+
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Refusing Dashboard propagation with an invalid source commit."
+            exit 1
+          fi
+
+          jq -cn \
+            --arg repository "$SOURCE_REPOSITORY" \
+            --arg source_ref "$SOURCE_REF" \
+            --arg sha "$SOURCE_SHA" \
+            '{event_type:"shared-updated",client_payload:{schema_version:2,repository:$repository,source_ref:$source_ref,sha:$sha,ref:$sha}}' \
+            | gh api repos/ScaleSmall/SSAI_Dashboard/dispatches \
+                --method POST \
+                --input - \
+                --silent
+
       - name: Trigger SSAI_Connect rebuild
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_connect == 'true' }}
         env:
-          GH_TOKEN: ${{ secrets.SCALESMALL_PAT }}
+          GH_TOKEN: ${{ secrets.SSAI_CONNECT_DISPATCH_TOKEN }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
-          gh api repos/ScaleSmall/SSAI_Connect/dispatches \
-            --method POST \
-            -f event_type=shared-updated \
-            -F client_payload[ref]='${{ github.sha }}'
+          set -euo pipefail
 
-      - name: Trigger SSAI_Dashboard rebuild
-        env:
-          GH_TOKEN: ${{ secrets.SCALESMALL_PAT }}
-        run: |
-          gh api repos/ScaleSmall/SSAI_Dashboard/dispatches \
-            --method POST \
-            -f event_type=shared-updated \
-            -F client_payload[ref]='${{ github.sha }}'
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::The dedicated SSAI_Connect dispatch token is not configured."
+            exit 1
+          fi
+
+          if [ "$SOURCE_REPOSITORY" != 'ScaleSmall/SSAI_Shared' ] || [ "$SOURCE_REF" != 'refs/heads/main' ]; then
+            echo "::error::Refusing protected Connect propagation from anything except SSAI_Shared main."
+            exit 1
+          fi
+
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Refusing protected Connect propagation with an invalid source commit."
+            exit 1
+          fi
+
+          jq -cn \
+            --arg sha "$SOURCE_SHA" \
+            '{event_type:"shared-updated",client_payload:{ref:$sha}}' \
+            | gh api repos/ScaleSmall/SSAI_Connect/dispatches \
+                --method POST \
+                --input - \
+                --silent

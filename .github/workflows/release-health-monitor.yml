@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ inputs.scan_mode == 'incident' && 45 || 12 }}
     env:
-      SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SCALESMALL_PAT }}
+      SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SSAI_RELEASE_MONITOR_READ_TOKEN }}
       SSAI_RELEASE_MONITOR_STUCK_MINUTES: '45'
       SSAI_RELEASE_MONITOR_MODE: ${{ inputs.scan_mode || 'continuous' }}
       SSAI_RELEASE_MONITOR_LOOKBACK_HOURS: ${{ inputs.lookback_hours || '6' }}
@@ -56,7 +56,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${#SSAI_RELEASE_MONITOR_GITHUB_TOKEN}" -lt 20 ]; then
-            echo "::error::SCALESMALL_PAT must provide read access to the private SSAI repositories"
+            echo "::error::SSAI_RELEASE_MONITOR_READ_TOKEN must provide read-only access to the in-scope private SSAI repositories and their Actions metadata"
             exit 1
           fi
 
