@@ -97,6 +97,66 @@ const noHistoryPolicies = new Map([
     },
   }],
 ]);
+const legacyMonitorTitle = 'Scale Small AI Release Health Monitor';
+const legacySnapshotWorkflowSourceSha256 = '0faccc93dd783cd0c76ecd837bcd5bb6cbb046b2670a0f7f41d039e433c49b04';
+const legacyBoundedWorkflowSourceSha256 = '1adbb7b1738f9562968a644b8854bf7fc04496eea976809cae83429204f14858';
+const currentMonitorWorkflowSourceSha256 = '3672ed17290279e20d75336e810d9327a59786c16a77332aa5be2f4adb0238a1';
+const auditedMonitorSourceEvidence = new Map([
+  ['82fc98124d0b5412e3591c9357da76ba7f324737', {
+    workflowSourceSha256: legacySnapshotWorkflowSourceSha256,
+    scriptSourceSha256: '1f4b7d0700abd526c1da9f6f048c4ffc1b943cac51a9811ab47f486339bf5233',
+    utilsSourceSha256: null,
+  }],
+  ['826e4bd44784dc06d507cef6df0b0bd4c27ce51b', {
+    workflowSourceSha256: legacyBoundedWorkflowSourceSha256,
+    scriptSourceSha256: 'ab2f0cb331e4abbdb265e3f4bf2d55bd8498a142945a88f035eb3d799ad729a8',
+    utilsSourceSha256: 'a1134fd75c7218cbd0bd60fbbb62f1f385f003caafddefb1637b66d7fefcb306',
+  }],
+  ['7c5761cb101c93de492b55fb544af14d747076d3', {
+    workflowSourceSha256: legacyBoundedWorkflowSourceSha256,
+    scriptSourceSha256: 'e066575bd20137a09928a1e5bedc68083f57611480f58c3d9d50320269272b6b',
+    utilsSourceSha256: '912fb227ef10a03fb45643fb1b337f9827423179ca3d39959f8ac1ffe9cd5a78',
+  }],
+  ['2ee88f7cca1468f35695d08fff629b7400869a78', {
+    workflowSourceSha256: legacyBoundedWorkflowSourceSha256,
+    scriptSourceSha256: 'fd87d5f0413ac7e15542c649c83e3d156a168d6a9c3d1da69548b771152fa6bd',
+    utilsSourceSha256: 'dc33eab5f1182ae2244b3934aa013f41e099294dac2fab1307e63a40a6e45b48',
+  }],
+  ['256eddb68de8c5f4d52e1b424631e3beef1387ae', {
+    workflowSourceSha256: currentMonitorWorkflowSourceSha256,
+    scriptSourceSha256: '81fa74492549661e9af45220471ba9392bcc3e44c2cbbd43ea415fa53a3861ae',
+    utilsSourceSha256: 'c44b19a4849593680c992dad8ae85a37bc87b899e7a66312045ff17b09d1cfd6',
+  }],
+]);
+const auditedMonitorOrigin = (
+  runId,
+  runAttempt,
+  checkRunId,
+  headSha,
+  event,
+  displayTitle,
+  coverageMode,
+  coverageHours,
+  workflowSourceSha256,
+  coverageStartedAt,
+) => {
+  const sourceEvidence = auditedMonitorSourceEvidence.get(headSha);
+  if (!sourceEvidence || sourceEvidence.workflowSourceSha256 !== workflowSourceSha256) {
+    throw new Error('Audited monitor source evidence is missing or inconsistent for ' + headSha + '.');
+  }
+  return {
+    runId,
+    runAttempt,
+    checkRunId,
+    headSha,
+    event,
+    displayTitle,
+    coverageMode,
+    coverageHours,
+    ...sourceEvidence,
+    ...(coverageStartedAt ? { coverageStartedAt } : {}),
+  };
+};
 const forwardFixRecoveryPolicies = new Map([
   ['SSAI_PoW:315750527', {
     workflowId: 315750527,
@@ -119,6 +179,40 @@ const forwardFixRecoveryPolicies = new Map([
     recoveryDisplayTitles: ['Release health monitor [continuous:6h]'],
     monitorSelfRecoveryContract: 'release-health-monitor-v1',
     monitorSelfRecoveryEvents: ['schedule', 'workflow_dispatch'],
+    // Exact, immutable attempts whose pre-run-name coverage and failure
+    // predicates were reconstructed from GitHub metadata, logs, and the source
+    // at each default-branch commit. No unlisted generic title is trusted.
+    auditedMonitorOrigins: [
+      auditedMonitorOrigin(29638546298, 1, 88065007292, '82fc98124d0b5412e3591c9357da76ba7f324737', 'workflow_dispatch', legacyMonitorTitle, 'incident', 168, legacySnapshotWorkflowSourceSha256, '2026-07-18T09:04:30Z'),
+      auditedMonitorOrigin(29638605524, 1, 88065154975, '82fc98124d0b5412e3591c9357da76ba7f324737', 'workflow_dispatch', legacyMonitorTitle, 'incident', 168, legacySnapshotWorkflowSourceSha256, '2026-07-18T09:04:30Z'),
+      auditedMonitorOrigin(29646585368, 1, 88085761786, '826e4bd44784dc06d507cef6df0b0bd4c27ce51b', 'workflow_dispatch', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29647911322, 1, 88089143117, '7c5761cb101c93de492b55fb544af14d747076d3', 'workflow_dispatch', legacyMonitorTitle, 'incident', 168, legacyBoundedWorkflowSourceSha256, '2026-07-18T13:47:31Z'),
+      auditedMonitorOrigin(29649650403, 1, 88093662012, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29654185740, 1, 88105503984, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29656236744, 1, 88111016982, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29658639760, 1, 88117312495, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29660632726, 1, 88122577706, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29662513423, 1, 88127459946, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29664360347, 1, 88132200888, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29666205608, 1, 88136933929, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29672532340, 1, 88154008729, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29676775338, 1, 88165488989, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29680730786, 1, 88176313324, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29683741127, 1, 88184372919, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29685649354, 1, 88189329304, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29687398415, 1, 88194018679, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29690404816, 1, 88201983366, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29692821939, 1, 88208443973, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29694906744, 1, 88213880181, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29697092554, 1, 88219602143, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29698681710, 1, 88223813796, '2ee88f7cca1468f35695d08fff629b7400869a78', 'workflow_dispatch', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      auditedMonitorOrigin(29699095663, 1, 88224952994, '2ee88f7cca1468f35695d08fff629b7400869a78', 'schedule', legacyMonitorTitle, 'continuous', 6, legacyBoundedWorkflowSourceSha256),
+      // The first source-verified incident run was complete and had no current
+      // production, no-history, status, or deployment red. Its only unresolved
+      // records were the exact 24 attempts above, so the next incident scan may
+      // recover it only if its window still includes their earliest predicate.
+      auditedMonitorOrigin(29704911896, 1, 88240157445, '256eddb68de8c5f4d52e1b424631e3beef1387ae', 'workflow_dispatch', 'Release health monitor [incident:168h]', 'incident', 168, currentMonitorWorkflowSourceSha256, '2026-07-18T09:04:30Z'),
+    ],
   }],
 ]);
 const acceptableConclusions = new Set(['success', 'neutral', 'skipped']);
@@ -382,7 +476,14 @@ async function inspectRepository(repo) {
     collectRecentCommitStatuses(repo.name, shaMetadata, headSha),
   ]);
   const checks = associateChecksWithPulls(
-    await enrichChecks(repo.name, [...recentCheckPayload, ...currentHeadChecks], recentRuns, shaMetadata, defaultBranch),
+    await enrichChecks(
+      repo.name,
+      [...recentCheckPayload, ...currentHeadChecks],
+      recentRuns,
+      shaMetadata,
+      defaultBranch,
+      verifiedForwardFixPolicies,
+    ),
     recentPulls,
   );
   const statuses = enrichCommitStatuses(commitStatuses, shaMetadata, defaultBranch);
@@ -537,16 +638,30 @@ async function collectWorkflowSource(repoName, workflowPath, ref) {
   if (!/^\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml$/.test(path)) {
     throw new Error(repoName + ' no-history policy references an unsafe workflow path.');
   }
+  return collectRepositorySource(repoName, path, ref, false);
+}
+
+async function collectMonitorImplementationSource(repoName, sourcePath, ref, allowMissing = false) {
+  const path = String(sourcePath || '').trim();
+  if (!['scripts/verify-org-release-health.mjs', 'scripts/release-health-monitor-utils.mjs'].includes(path)) {
+    throw new Error(repoName + ' audited monitor policy references an unsafe implementation path.');
+  }
+  return collectRepositorySource(repoName, path, ref, allowMissing);
+}
+
+async function collectRepositorySource(repoName, path, ref, allowMissing) {
   const encodedPath = path.split('/').map(encodeURIComponent).join('/');
-  const payload = await api('/repos/' + owner + '/' + repoName + '/contents/' + encodedPath + '?ref=' + encodeURIComponent(ref));
+  const pathname = '/repos/' + owner + '/' + repoName + '/contents/' + encodedPath + '?ref=' + encodeURIComponent(ref);
+  const payload = allowMissing ? await apiOptional(pathname) : await api(pathname);
+  if (payload === null) return null;
   const size = Number(payload?.size);
   const content = String(payload?.content || '').replace(/\s/g, '');
   if (payload?.type !== 'file' || payload?.encoding !== 'base64' || !Number.isSafeInteger(size) || size < 1 || size > 262_144
     || content.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(content)) {
-    throw new Error(repoName + ' workflow source response is invalid or exceeds the 256 KiB safety bound.');
+    throw new Error(repoName + ' source response for ' + path + ' is invalid or exceeds the 256 KiB safety bound.');
   }
   const bytes = Buffer.from(content, 'base64');
-  if (bytes.length !== size) throw new Error(repoName + ' workflow source response failed its byte-length integrity check.');
+  if (bytes.length !== size) throw new Error(repoName + ' source response for ' + path + ' failed its byte-length integrity check.');
   return bytes;
 }
 
@@ -562,7 +677,32 @@ async function resolveForwardFixRecoveryPolicies(repoName, workflows, headSha) {
       return;
     }
     const workflowSource = await collectWorkflowSource(repoName, policy.path, headSha);
-    const resolved = verifyForwardFixRecoveryPolicy({ workflow, policy, workflowSource });
+    const auditedOriginSources = new Map();
+    const auditedHeads = [...new Set((policy.auditedMonitorOrigins || []).map((origin) => origin.headSha))];
+    await mapLimit(auditedHeads, 2, async (originHeadSha) => {
+      const origin = policy.auditedMonitorOrigins.find((candidate) => candidate.headSha === originHeadSha);
+      const [originWorkflowSource, scriptSource, utilsSource] = await Promise.all([
+        collectWorkflowSource(repoName, policy.path, originHeadSha),
+        collectMonitorImplementationSource(repoName, 'scripts/verify-org-release-health.mjs', originHeadSha),
+        collectMonitorImplementationSource(
+          repoName,
+          'scripts/release-health-monitor-utils.mjs',
+          originHeadSha,
+          origin?.utilsSourceSha256 === null,
+        ),
+      ]);
+      auditedOriginSources.set(originHeadSha, {
+        workflowSource: originWorkflowSource,
+        scriptSource,
+        utilsSource,
+      });
+    });
+    const resolved = verifyForwardFixRecoveryPolicy({
+      workflow,
+      policy,
+      workflowSource,
+      auditedOriginSources,
+    });
     if (!resolved) {
       failures.push(issue(repoName, policy.path, 'configured recovery policy failed its exact workflow identity or source-digest verification'));
       return;
@@ -778,7 +918,16 @@ async function collectRecentDeploymentStatuses(repoName) {
   return { deployments, statuses };
 }
 
-async function enrichChecks(repoName, rawChecks, runs, shaMetadata, defaultBranch) {
+async function enrichChecks(repoName, rawChecks, runs, shaMetadata, defaultBranch, policies) {
+  const auditedOriginByCheckId = new Map();
+  for (const policy of policies.values()) {
+    for (const origin of policy.auditedMonitorOrigins || []) {
+      if (auditedOriginByCheckId.has(origin.checkRunId)) {
+        throw new Error(repoName + ' has duplicate audited monitor check identity ' + origin.checkRunId + '.');
+      }
+      auditedOriginByCheckId.set(origin.checkRunId, origin);
+    }
+  }
   const runById = new Map();
   for (const run of [...runs].sort((left, right) => recordOccurrenceTime(left) - recordOccurrenceTime(right))) {
     runById.set(Number(run.id), run);
@@ -796,6 +945,7 @@ async function enrichChecks(repoName, rawChecks, runs, shaMetadata, defaultBranc
   return uniqueChecks.map((check) => {
     const sourceRunId = actionsRunId(check.details_url);
     const sourceRun = sourceRunId ? runById.get(sourceRunId) : null;
+    const auditedOrigin = auditedOriginByCheckId.get(Number(check.id));
     const metadata = shaMetadata.get(String(check.head_sha || ''));
     const branch = sourceRun?.head_branch || authoritativeCheckBranch(check, metadata, defaultBranch);
     const headRepository = String(sourceRun?.head_repository?.full_name
@@ -804,7 +954,7 @@ async function enrichChecks(repoName, rawChecks, runs, shaMetadata, defaultBranc
     const enriched = {
       ...check,
       source_run_id: sourceRunId || null,
-      source_run_attempt: Number(sourceRun?.run_attempt || 1),
+      source_run_attempt: Number(auditedOrigin?.runAttempt || sourceRun?.run_attempt || 1),
       workflow_id: sourceRun?.workflow_id || null,
       event: sourceRun?.event || '',
       source_run_display_title: sourceRun?.display_title || '',
@@ -1133,6 +1283,15 @@ async function api(pathname) {
   }));
 }
 
+async function apiOptional(pathname) {
+  return apiGate(() => apiRequest({
+    label: pathname,
+    url: 'https://api.github.com' + pathname,
+    method: 'GET',
+    allowNotFound: true,
+  }));
+}
+
 async function graphql(query, variables, label) {
   return apiGate(async () => {
     const payload = await apiRequest({
@@ -1149,7 +1308,7 @@ async function graphql(query, variables, label) {
   });
 }
 
-async function apiRequest({ label, url, method, body = undefined }) {
+async function apiRequest({ label, url, method, body = undefined, allowNotFound = false }) {
   let lastError;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     enforceRequestBudget(label);
@@ -1172,6 +1331,7 @@ async function apiRequest({ label, url, method, body = undefined }) {
       });
       updateRateBudget(response);
       if (response.ok) return await response.json();
+      if (allowNotFound && response.status === 404) return null;
       const message = (await response.text()).slice(0, 500).replace(/\s+/g, ' ');
       lastError = new Error('GitHub API ' + label + ' returned HTTP ' + response.status + ': ' + message);
       if (!isRetryableResponse(response)) break;

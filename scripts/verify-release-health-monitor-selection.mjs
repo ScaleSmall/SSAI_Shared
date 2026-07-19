@@ -385,6 +385,11 @@ const monitorWorkflow = {
   path: '.github/workflows/release-health-monitor.yml',
   state: 'active',
 };
+const monitorOldSha = '3'.repeat(40);
+const monitorCurrentSha = '4'.repeat(40);
+const auditedHistoricalWorkflowSource = Buffer.from('name: legacy monitor\non:\n  workflow_dispatch:\n', 'utf8');
+const auditedHistoricalScriptSource = Buffer.from('console.log("legacy monitor");\n', 'utf8');
+const auditedHistoricalUtilsSource = Buffer.from('export const legacy = true;\n', 'utf8');
 const monitorPolicyInput = {
   workflowId: monitorWorkflow.id,
   path: monitorWorkflow.path,
@@ -396,11 +401,43 @@ const monitorPolicyInput = {
   recoveryDisplayTitles: ['Release health monitor [continuous:6h]'],
   monitorSelfRecoveryContract: 'release-health-monitor-v1',
   monitorSelfRecoveryEvents: ['schedule', 'workflow_dispatch'],
+  auditedMonitorOrigins: [{
+    runId: 704,
+    runAttempt: 1,
+    checkRunId: 812,
+    headSha: monitorOldSha,
+    event: 'workflow_dispatch',
+    displayTitle: 'Scale Small AI Release Health Monitor',
+    coverageMode: 'continuous',
+    coverageHours: 6,
+    workflowSourceSha256: createHash('sha256').update(auditedHistoricalWorkflowSource).digest('hex'),
+    scriptSourceSha256: createHash('sha256').update(auditedHistoricalScriptSource).digest('hex'),
+    utilsSourceSha256: createHash('sha256').update(auditedHistoricalUtilsSource).digest('hex'),
+  }, {
+    runId: 705,
+    runAttempt: 1,
+    checkRunId: 813,
+    headSha: monitorOldSha,
+    event: 'workflow_dispatch',
+    displayTitle: 'Release health monitor [incident:168h]',
+    coverageMode: 'incident',
+    coverageHours: 168,
+    coverageStartedAt: '2026-07-18T09:00:00Z',
+    workflowSourceSha256: createHash('sha256').update(auditedHistoricalWorkflowSource).digest('hex'),
+    scriptSourceSha256: createHash('sha256').update(auditedHistoricalScriptSource).digest('hex'),
+    utilsSourceSha256: createHash('sha256').update(auditedHistoricalUtilsSource).digest('hex'),
+  }],
 };
+const auditedOriginSources = new Map([[monitorOldSha, {
+  workflowSource: auditedHistoricalWorkflowSource,
+  scriptSource: auditedHistoricalScriptSource,
+  utilsSource: auditedHistoricalUtilsSource,
+}]]);
 const monitorPolicy = verifyForwardFixRecoveryPolicy({
   workflow: monitorWorkflow,
   workflowSource: monitorSource,
   policy: monitorPolicyInput,
+  auditedOriginSources,
 });
 assert.ok(monitorPolicy, 'trusted monitor recovery requires an exact source-hashed policy');
 assert.equal(isTrustedMonitorRecoveryPolicy(monitorPolicy), true, 'the exact monitor policy must enter trusted monitor recovery');
@@ -408,10 +445,57 @@ assert.equal(verifyForwardFixRecoveryPolicy({
   workflow: monitorWorkflow,
   workflowSource: monitorSource,
   policy: { ...monitorPolicyInput, monitorSelfRecoveryEvents: [] },
+  auditedOriginSources,
 }), null, 'an empty trusted monitor event set must fail closed');
-
-const monitorOldSha = '3'.repeat(40);
-const monitorCurrentSha = '4'.repeat(40);
+assert.equal(verifyForwardFixRecoveryPolicy({
+  workflow: monitorWorkflow,
+  workflowSource: monitorSource,
+  policy: monitorPolicyInput,
+}), null, 'audited monitor origins must fail closed when historical source evidence is unavailable');
+assert.equal(verifyForwardFixRecoveryPolicy({
+  workflow: monitorWorkflow,
+  workflowSource: monitorSource,
+  policy: monitorPolicyInput,
+  auditedOriginSources: new Map([[monitorOldSha, {
+    workflowSource: auditedHistoricalWorkflowSource,
+    scriptSource: auditedHistoricalScriptSource,
+    utilsSource: Buffer.from('tampered\n', 'utf8'),
+  }]]),
+}), null, 'a historical implementation digest mismatch must invalidate the entire recovery policy');
+const absentUtilsPolicyInput = {
+  ...monitorPolicyInput,
+  auditedMonitorOrigins: [{
+    ...monitorPolicyInput.auditedMonitorOrigins[0],
+    utilsSourceSha256: null,
+  }],
+};
+assert.ok(verifyForwardFixRecoveryPolicy({
+  workflow: monitorWorkflow,
+  workflowSource: monitorSource,
+  policy: absentUtilsPolicyInput,
+  auditedOriginSources: new Map([[monitorOldSha, {
+    workflowSource: auditedHistoricalWorkflowSource,
+    scriptSource: auditedHistoricalScriptSource,
+    utilsSource: null,
+  }]]),
+}), 'an audited historical absence must be verified as an exact null source');
+assert.equal(verifyForwardFixRecoveryPolicy({
+  workflow: monitorWorkflow,
+  workflowSource: monitorSource,
+  policy: absentUtilsPolicyInput,
+  auditedOriginSources,
+}), null, 'a file appearing where historical absence was asserted must invalidate the policy');
+assert.equal(verifyForwardFixRecoveryPolicy({
+  workflow: monitorWorkflow,
+  workflowSource: monitorSource,
+  policy: {
+    ...monitorPolicyInput,
+    auditedMonitorOrigins: monitorPolicyInput.auditedMonitorOrigins.map((origin, index) => (
+      index === 0 ? { ...origin, checkRunId: 0 } : origin
+    )),
+  },
+  auditedOriginSources,
+}), null, 'an invalid audited check identity must fail closed');
 const monitorSearch = {
   policy: monitorPolicy,
   currentHeadSha: monitorCurrentSha,
@@ -476,9 +560,9 @@ assert.equal(
     798,
     1,
     monitorSearch,
-  )?.id,
-  798,
-  'an exact current scheduled scan may self-latch an older dispatch failure with equal coverage',
+  ),
+  null,
+  'a later six-hour scan must not suppress the leading edge of an earlier six-hour window',
 );
 assert.equal(
   findProvisionalTrustedMonitorWorkflowRecovery(
@@ -575,14 +659,94 @@ const completedIncidentMonitorRun = {
   conclusion: 'success',
   created_at: '2026-07-18T09:20:00Z',
 };
+const auditedLegacyMonitorFailure = {
+  ...manualContinuousMonitorFailure,
+  id: 704,
+  run_attempt: 1,
+  head_sha: monitorOldSha,
+  event: 'workflow_dispatch',
+  display_title: 'Scale Small AI Release Health Monitor',
+  created_at: '2026-07-18T09:01:00Z',
+};
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    auditedLegacyMonitorFailure,
+    [auditedLegacyMonitorFailure, currentIncidentMonitorRun],
+    799,
+    2,
+    monitorSearch,
+  )?.id,
+  799,
+  'an exhaustive incident may provisionally cover an exact source-audited legacy six-hour origin',
+);
+for (const mutation of [
+  { id: 706 },
+  { run_attempt: 2 },
+  { head_sha: '5'.repeat(40) },
+  { event: 'schedule' },
+  { display_title: 'Scale Small AI Release Health Monitor ' },
+  { head_repository: { full_name: 'untrusted/fork' } },
+  { head_branch: 'feature' },
+]) {
+  assert.equal(
+    findProvisionalTrustedMonitorWorkflowRecovery(
+      { ...auditedLegacyMonitorFailure, ...mutation },
+      [currentIncidentMonitorRun],
+      799,
+      2,
+      monitorSearch,
+    ),
+    null,
+    'every immutable audited workflow identity field must match exactly',
+  );
+}
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    auditedLegacyMonitorFailure,
+    [auditedLegacyMonitorFailure, currentScheduledMonitorRun],
+    798,
+    1,
+    monitorSearch,
+  ),
+  null,
+  'a narrow continuous run must not cover the audited legacy six-hour window',
+);
+const auditedPriorIncidentFailure = {
+  ...manualIncidentMonitorFailure,
+  id: 705,
+  run_attempt: 1,
+  head_sha: monitorOldSha,
+};
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    auditedPriorIncidentFailure,
+    [auditedPriorIncidentFailure, currentIncidentMonitorRun],
+    799,
+    2,
+    monitorSearch,
+  )?.id,
+  799,
+  'an exact evidence-bound incident origin may use its narrower proven predicate cutoff',
+);
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    { ...auditedPriorIncidentFailure, id: 706 },
+    [currentIncidentMonitorRun],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'an unlisted incident origin must retain full sliding-window containment and fail closed',
+);
 assert.equal(
   findTrustedMonitorWorkflowRecovery(
     manualIncidentMonitorFailure,
     [manualIncidentMonitorFailure, completedIncidentMonitorRun],
     monitorSearch,
-  )?.id,
-  800,
-  'a completed incident scan may recover a prior same-SHA incident failure',
+  ),
+  null,
+  'a shifted 168-hour window must not generically claim full coverage of an earlier incident window',
 );
 assert.equal(
   findTrustedMonitorWorkflowRecovery(
@@ -742,6 +906,46 @@ const currentIncidentMonitorCheck = {
   conclusion: null,
   started_at: '2026-07-18T09:10:00Z',
 };
+const auditedLegacyMonitorFailedCheck = {
+  ...scheduledMonitorFailedCheck,
+  id: 812,
+  source_run_id: 704,
+  source_run_attempt: 1,
+  event: 'workflow_dispatch',
+  head_sha: monitorOldSha,
+  source_run_display_title: 'Scale Small AI Release Health Monitor',
+  started_at: '2026-07-18T09:01:00Z',
+};
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecovery(
+    auditedLegacyMonitorFailedCheck,
+    [auditedLegacyMonitorFailedCheck, currentIncidentMonitorCheck],
+    799,
+    2,
+    monitorSearch,
+  )?.id,
+  899,
+  'the exact audited legacy check may self-latch only through the exhaustive current incident job',
+);
+for (const mutation of [
+  { id: 814 },
+  { source_run_id: 706 },
+  { source_run_attempt: 2 },
+  { name: 'untrusted-job' },
+  { app: { slug: 'external-provider' } },
+]) {
+  assert.equal(
+    findProvisionalTrustedMonitorCheckRecovery(
+      { ...auditedLegacyMonitorFailedCheck, ...mutation },
+      [currentIncidentMonitorCheck],
+      799,
+      2,
+      monitorSearch,
+    ),
+    null,
+    'every immutable audited check identity field must match exactly',
+  );
+}
 assert.equal(
   findProvisionalTrustedMonitorCheckRecovery(
     scheduledMonitorFailedCheck,
@@ -856,9 +1060,9 @@ assert.equal(
     incidentMonitorFailedCheck,
     [incidentMonitorFailedCheck, completedIncidentMonitorCheck],
     monitorSearch,
-  )?.id,
-  900,
-  'a completed exact monitor job may recover a prior cross-trigger check',
+  ),
+  null,
+  'a completed shifted incident job must not generically suppress an earlier incident check',
 );
 assert.equal(
   findTrustedMonitorCheckRecovery(
