@@ -121,9 +121,12 @@ requireText(releaseHealthVerifier, 'auditedOriginSources', 'historical workflow/
 requireText(releaseHealthVerifier, '29638546298', 'first exact legacy monitor run identity');
 requireText(releaseHealthVerifier, '29704911896', 'source-verified incident failure identity');
 requireText(releaseHealthVerifier, '29705959736', 'rate-gated incident failure identity');
+requireText(releaseHealthVerifier, '29703046855', 'CI deployment incident failure identity');
+requireText(releaseHealthVerifier, '29703666102', 'second rate-gated incident failure identity');
+requireText(releaseHealthVerifier, '29706178612', 'transitive monitor incident failure identity');
 const auditedMonitorOriginCalls = releaseHealthVerifier.match(/auditedMonitorOrigin\(\d+/g) || [];
-if (auditedMonitorOriginCalls.length !== 26) {
-  throw new Error(`Expected exactly 26 immutable audited monitor origins; found ${auditedMonitorOriginCalls.length}`);
+if (auditedMonitorOriginCalls.length !== 29) {
+  throw new Error(`Expected exactly 29 immutable audited monitor origins; found ${auditedMonitorOriginCalls.length}`);
 }
 requireText(
   releaseHealthVerifier,
