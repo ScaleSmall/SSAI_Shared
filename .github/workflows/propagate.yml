@@ -23,54 +23,51 @@ concurrency:
 jobs:
   trigger-rebuilds:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
+      - name: Reject historical or non-authoritative producer runs
+        env:
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_EVENT: ${{ github.event_name }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "${SOURCE_REPOSITORY}" = 'ScaleSmall/SSAI_Shared' ]
+          [ "${SOURCE_REF}" = 'refs/heads/main' ]
+          [[ "${SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${SOURCE_EVENT}" =~ ^(push|workflow_dispatch)$ ]]
+          if [ "${RUN_ATTEMPT}" != '1' ]; then
+            echo '::error::Historical workflow reruns are prohibited; start a new workflow_dispatch run from current main.'
+            exit 1
+          fi
+
+      - name: Check out the exact authoritative Shared source
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24'
+
       - name: Skip protected Connect propagation
         if: ${{ github.event_name == 'push' || inputs.dispatch_connect != 'true' }}
         run: |
           echo "SSAI_Connect dispatch is intentionally skipped while connect.scalesmall.ai is reserved for TikTok OAuth review."
 
-      - name: Trigger SSAI_Dashboard rebuild
+      - name: Attest Dashboard consumer, dispatch v2, and witness a fresh run
         env:
-          GH_TOKEN: ${{ secrets.SSAI_DASHBOARD_DISPATCH_TOKEN }}
-          SOURCE_REPOSITORY: ${{ github.repository }}
-          SOURCE_REF: ${{ github.ref }}
-          SOURCE_SHA: ${{ github.sha }}
+          SSAI_DASHBOARD_DISPATCH_TOKEN: ${{ secrets.SSAI_DASHBOARD_DISPATCH_TOKEN }}
         run: |
-          set -euo pipefail
-
-          readonly expected_repository='ScaleSmall/SSAI_Shared'
-          readonly expected_ref='refs/heads/main'
-
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::Dashboard propagation token is not configured."
-            exit 1
-          fi
-
-          if [ "$SOURCE_REPOSITORY" != "$expected_repository" ]; then
-            echo "::error::Refusing Dashboard propagation from an unexpected repository."
-            exit 1
-          fi
-
-          if [ "$SOURCE_REF" != "$expected_ref" ]; then
-            echo "::error::Refusing Dashboard propagation from a non-main source ref."
-            exit 1
-          fi
-
-          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::Refusing Dashboard propagation with an invalid source commit."
-            exit 1
-          fi
-
-          jq -cn \
-            --arg repository "$SOURCE_REPOSITORY" \
-            --arg source_ref "$SOURCE_REF" \
-            --arg sha "$SOURCE_SHA" \
-            '{event_type:"shared-updated",client_payload:{schema_version:2,repository:$repository,source_ref:$source_ref,sha:$sha,ref:$sha}}' \
-            | gh api repos/ScaleSmall/SSAI_Dashboard/dispatches \
-                --method POST \
-                --input - \
-                --silent
+          node scripts/dispatch-dashboard-update.mjs
 
       - name: Trigger SSAI_Connect rebuild
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_connect == 'true' }}

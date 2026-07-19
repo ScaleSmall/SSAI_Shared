@@ -37,6 +37,8 @@ const validate = await readWorkflow('validate.yml');
 const propagate = await readWorkflow('propagate.yml');
 const releaseHealth = await readWorkflow('release-health-monitor.yml');
 const releaseHealthVerifier = await readFile(path.join(repoRoot, 'scripts', 'verify-org-release-health.mjs'), 'utf8');
+const dashboardDispatch = await readFile(path.join(repoRoot, 'scripts', 'dispatch-dashboard-update.mjs'), 'utf8');
+const dashboardDispatchTests = await readFile(path.join(repoRoot, 'scripts', 'dispatch-dashboard-update.test.mjs'), 'utf8');
 const combined = `${validate}\n${propagate}\n${releaseHealth}`;
 const releaseCredentials = await readFile(path.join(repoRoot, 'RELEASE_CREDENTIALS.md'), 'utf8');
 
@@ -52,16 +54,25 @@ requireText(propagate, 'permissions: {}', 'zero-scope propagation workflow permi
 requireText(propagate, "group: propagate-consumers-${{ github.repository }}-${{ github.sha }}-${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_connect == 'true' && github.run_id || 'dashboard-only' }}", 'exact-source Dashboard propagation concurrency key with protected Connect isolation');
 requireText(propagate, 'cancel-in-progress: false', 'non-cancelling propagation serialization');
 requireText(propagate, 'runs-on: ubuntu-24.04', 'pinned propagation runner');
-requireText(propagate, 'timeout-minutes: 5', 'bounded propagation timeout');
+requireText(propagate, 'timeout-minutes: 10', 'bounded propagation timeout');
+requireText(propagate, '    permissions:\n      contents: read', 'job-local read-only checkout permission');
+requireText(propagate, 'uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3', 'immutable checkout action');
+requireText(propagate, 'ref: ${{ github.sha }}', 'exact authoritative Shared checkout');
+requireText(propagate, 'persist-credentials: false', 'checkout credential isolation');
+requireText(propagate, 'uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e', 'immutable Node setup action');
+requireText(propagate, "node-version: '24'", 'current Node runtime');
+requireText(propagate, 'Reject historical or non-authoritative producer runs', 'fresh producer guard');
+requireText(propagate, "[ \"${RUN_ATTEMPT}\" != '1' ]", 'historical producer rerun rejection');
+requireText(propagate, 'start a new workflow_dispatch run from current main', 'fresh-run recovery instruction');
 requireText(propagate, 'SSAI_Connect dispatch is intentionally skipped', 'protected Connect skip');
 requireText(propagate, "repos/ScaleSmall/SSAI_Connect/dispatches", 'manual Connect dispatch target');
 requireText(propagate, "github.event_name == 'workflow_dispatch' && inputs.dispatch_connect == 'true'", 'manual Connect dispatch guard');
-requireText(propagate, "repos/ScaleSmall/SSAI_Dashboard/dispatches", 'Dashboard dispatch target');
 requireText(propagate, 'GH_TOKEN: ${{ secrets.SSAI_CONNECT_DISPATCH_TOKEN }}', 'dedicated Connect dispatch token source');
-requireText(propagate, 'GH_TOKEN: ${{ secrets.SSAI_DASHBOARD_DISPATCH_TOKEN }}', 'dedicated Dashboard dispatch token source');
+requireText(propagate, 'SSAI_DASHBOARD_DISPATCH_TOKEN: ${{ secrets.SSAI_DASHBOARD_DISPATCH_TOKEN }}', 'dedicated Dashboard dispatch token source');
+requireText(propagate, 'node scripts/dispatch-dashboard-update.mjs', 'attested Dashboard dispatch implementation');
 
 const connectStepStart = propagate.indexOf('      - name: Trigger SSAI_Connect rebuild');
-const dashboardStepStart = propagate.indexOf('      - name: Trigger SSAI_Dashboard rebuild');
+const dashboardStepStart = propagate.indexOf('      - name: Attest Dashboard consumer, dispatch v2, and witness a fresh run');
 if (connectStepStart < 0 || dashboardStepStart < 0 || dashboardStepStart >= connectStepStart) {
   throw new Error('Missing or misordered protected consumer propagation steps');
 }
@@ -80,32 +91,56 @@ rejectPattern(connectStep, /client_payload\[[^\]]+\]/, 'Connect dispatch must no
 rejectPattern(connectStep, /run:\s*\|[\s\S]*\$\{\{\s*github\.(repository|ref|sha)\s*\}\}/, 'GitHub context must enter the Connect shell only through env');
 rejectPattern(connectStep, /\bset\s+-[^\n]*x/, 'Connect propagation must not enable shell tracing');
 
-requireText(dashboardStep, 'SOURCE_REPOSITORY: ${{ github.repository }}', 'expression-safe source repository binding');
-requireText(dashboardStep, 'SOURCE_REF: ${{ github.ref }}', 'expression-safe source ref binding');
-requireText(dashboardStep, 'SOURCE_SHA: ${{ github.sha }}', 'expression-safe source SHA binding');
-requireText(dashboardStep, 'set -euo pipefail', 'fail-closed Dashboard propagation shell');
-requireText(dashboardStep, "readonly expected_repository='ScaleSmall/SSAI_Shared'", 'canonical Shared repository guard');
-requireText(dashboardStep, "readonly expected_ref='refs/heads/main'", 'canonical Shared main-ref guard');
-requireText(dashboardStep, '[ -z "${GH_TOKEN:-}" ]', 'required dispatch token guard');
-requireText(dashboardStep, '[ "$SOURCE_REPOSITORY" != "$expected_repository" ]', 'source repository equality guard');
-requireText(dashboardStep, '[ "$SOURCE_REF" != "$expected_ref" ]', 'source ref equality guard');
-requireText(dashboardStep, '[[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]', 'lowercase full-SHA validation');
-requireText(dashboardStep, 'jq -cn', 'injection-safe Dashboard dispatch JSON construction');
-requireText(dashboardStep, '--arg repository "$SOURCE_REPOSITORY"', 'validated source repository serialization');
-requireText(dashboardStep, '--arg source_ref "$SOURCE_REF"', 'validated source ref serialization');
-requireText(dashboardStep, '--arg sha "$SOURCE_SHA"', 'validated source SHA serialization');
-requireText(dashboardStep, 'event_type:"shared-updated"', 'Dashboard dispatch event type');
-requireText(dashboardStep, 'schema_version:2', 'numeric v2 Dashboard propagation contract');
-requireText(dashboardStep, 'repository:$repository', 'v2 source repository payload');
-requireText(dashboardStep, 'source_ref:$source_ref', 'v2 source ref payload');
-requireText(dashboardStep, 'sha:$sha', 'v2 immutable source SHA payload');
-requireText(dashboardStep, 'ref:$sha', 'legacy immutable source SHA payload');
-requireText(dashboardStep, '--input -', 'stdin-bound Dashboard dispatch request body');
-requireText(dashboardStep, '--silent', 'non-verbose Dashboard dispatch response');
+requireText(dashboardStep, 'SSAI_DASHBOARD_DISPATCH_TOKEN: ${{ secrets.SSAI_DASHBOARD_DISPATCH_TOKEN }}', 'bounded Dashboard token injection');
+requireText(dashboardStep, 'node scripts/dispatch-dashboard-update.mjs', 'single reviewed Dashboard dispatcher');
+rejectPattern(dashboardStep, /\bGH_TOKEN\b/, 'Dashboard step must not expose its credential through GH_TOKEN');
+rejectPattern(dashboardStep, /\bSCALESMALL_PAT\b/, 'Dashboard step must not reference the legacy broad PAT');
 
-rejectPattern(dashboardStep, /client_payload\[[^\]]+\]/, 'Dashboard dispatch must not use form-encoded payload fields');
-rejectPattern(dashboardStep, /run:\s*\|[\s\S]*\$\{\{\s*github\.(repository|ref|sha)\s*\}\}/, 'GitHub context must enter the Dashboard shell only through env');
-rejectPattern(dashboardStep, /\bset\s+-[^\n]*x/, 'Dashboard propagation must not enable shell tracing');
+for (const [expected, description] of [
+  ["export const DASHBOARD_REPOSITORY = 'ScaleSmall/SSAI_Dashboard'", 'exact Dashboard repository pin'],
+  ["export const DASHBOARD_DEFAULT_BRANCH = 'main'", 'exact Dashboard default-branch pin'],
+  ["export const DASHBOARD_MAIN_SHA = 'ca31240527c5a60d3041f8efa41cb8767654db1a'", 'final unified Dashboard SHA pin'],
+  ["export const DASHBOARD_WORKFLOW_PATH = '.github/workflows/update-shared.yml'", 'consumer workflow path pin'],
+  ["export const DASHBOARD_WORKFLOW_SHA256 = '221bcc96c02dc1f272f8aee663b0d20e71f4cc345b414bbbb835a674a72b3af1'", 'consumer workflow digest pin'],
+  ["export const DISPATCH_SCHEMA_VERSION = 2", 'numeric v2 schema pin'],
+  ["const ACTIVE_RUN_STATUSES = Object.freeze(['queued', 'in_progress', 'waiting', 'requested', 'pending'])", 'complete nonterminal drain set'],
+  ["requireEqual(context.runAttempt, '1'", 'fresh producer attempt guard'],
+  ['requireEqual(repository.default_branch, DASHBOARD_DEFAULT_BRANCH', 'default-main attestation'],
+  ['requireEqual(object.sha, DASHBOARD_MAIN_SHA', 'Dashboard main SHA attestation'],
+  ['requireEqual(sha256(bytes), expectedSha256', 'consumer workflow byte-digest attestation'],
+  ["requireEqual(workflow.state, 'active'", 'active consumer state attestation'],
+  ['await assertDashboardDrained(api, workflowId)', 'consumer drain attestation'],
+  ["event_type: DISPATCH_EVENT_TYPE", 'Dashboard dispatch event'],
+  ['schema_version: DISPATCH_SCHEMA_VERSION', 'Dashboard dispatch v2 schema'],
+  ['repository: source.repository', 'Dashboard payload repository'],
+  ['source_ref: source.ref', 'Dashboard payload source ref'],
+  ['sha: source.sha', 'Dashboard payload immutable SHA'],
+  ['ref: source.sha', 'Dashboard payload compatibility ref'],
+  ['expectedStatus: 204', 'dispatch acceptance contract'],
+  ['run_attempt, 1', 'fresh consumer attempt witness'],
+  ['Dashboard dispatch produced multiple new consumer runs', 'unique consumer witness'],
+  ['no fresh consumer run was witnessed', 'missing consumer witness failure'],
+  ['settledWitness.id !== witness.id', 'stable post-dispatch witness'],
+]) {
+  requireText(dashboardDispatch, expected, description);
+}
+rejectPattern(dashboardDispatch, /SCALESMALL_PAT/, 'Dashboard dispatcher must never reference the legacy broad PAT');
+rejectPattern(dashboardDispatch, /client_payload\s*:\s*\{[^}]*digest/s, 'Dashboard v2 payload must not add an unrecognized digest key');
+rejectPattern(dashboardDispatch, /method:\s*'POST'[\s\S]{0,300}\bretr(?:y|ies)\b/i, 'uncertain Dashboard POSTs must never be retried');
+
+for (const expected of [
+  'exact five-key numeric-v2 Dashboard dispatch contract',
+  'rejects historical producer reruns',
+  'exact reviewed Dashboard main commit',
+  'exact consumer path, bytes, and SHA-256',
+  'exact active consumer workflow marker',
+  'nonterminal historical consumer run',
+  'exactly one fresh attempt-one run',
+  'multiple new runs and stale or rerun witnesses',
+  'unreviewed Dashboard commit',
+]) {
+  requireText(dashboardDispatchTests, expected, `Dashboard dispatcher adversarial test: ${expected}`);
+}
 
 requireText(releaseHealth, 'workflow_dispatch:', 'manual release-health control');
 requireText(releaseHealth, "cron: '*/15 * * * *'", '15-minute release-health schedule');
@@ -176,5 +211,19 @@ for (const credential of [
 }
 requireText(releaseCredentials, 'Never restore `SCALESMALL_PAT` as a fallback', 'legacy broad PAT prohibition');
 requireText(releaseCredentials, '`ScaleSmall/SSAI_Shared` is public', 'credentialless public Shared dependency rule');
+requireText(releaseCredentials, '`Contents: write` (which includes the required read access) and `Actions: read`', 'least-privilege Dashboard producer token permissions');
+requireText(releaseCredentials, '`ca31240527c5a60d3041f8efa41cb8767654db1a`', 'final Dashboard consumer commit interlock');
+requireText(releaseCredentials, '`08c6cde1ec084db3e7fc747ee086708965d7e33fd2b667513b14702dd8679993`', 'final Dashboard deterministic build evidence');
+requireText(releaseCredentials, '`221bcc96c02dc1f272f8aee663b0d20e71f4cc345b414bbbb835a674a72b3af1`', 'final Dashboard consumer workflow digest interlock');
+requireText(releaseCredentials, 'Do not rerun any historical', 'historical producer and consumer rerun prohibition');
+requireText(releaseCredentials, '`queued`, `in_progress`, `waiting`', 'complete pre-release workflow drain');
+requireText(releaseCredentials, 'delete the Dashboard repository secret named `SCALESMALL_PAT`', 'Dashboard legacy PAT deletion sequence');
+requireText(releaseCredentials, "delete Shared's `SCALESMALL_PAT`", 'Shared legacy PAT deletion sequence');
+requireText(releaseCredentials, 'post-deletion zero-count drain and secret-name-absence receipt', 'post-deletion credential/drain evidence');
+requireText(releaseCredentials, 'The intentionally dropped push event is not replayed', 'disabled-producer release behavior');
+requireText(releaseCredentials, 'Never use GitHub\'s rerun button', 'fresh manual producer dispatch requirement');
+requireText(releaseCredentials, 'observed twice across the settling', 'stable fresh consumer witness');
+requireText(releaseCredentials, 'An uncertain dispatch\nPOST is never retried', 'uncertain dispatch idempotency rule');
+requireText(releaseCredentials, 'Never roll back to the legacy direct-', 'safe rollback boundary');
 
 console.log('Shared workflow hardening contract verified.');

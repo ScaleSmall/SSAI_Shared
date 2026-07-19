@@ -2,6 +2,9 @@
   "name": "ssai-shared",
   "version": "1.0.0",
   "private": true,
+  "files": [
+    "src"
+  ],
   "main": "src/index.js",
   "type": "module",
   "engines": {
@@ -30,14 +33,14 @@
   "scripts": {
     "check": "npm run check:production-readiness",
     "check:production-readiness": "npm run check:contracts && npm run check:secrets && npm run check:audit && npm run check:signatures && git diff --check && npm run check:hygiene",
-    "check:contracts": "node scripts/verify-connect-panel-contract.mjs && node scripts/verify-shared-api-contract.mjs && node scripts/verify-workflow-contracts.mjs && node scripts/verify-release-health-monitor-selection.mjs",
+    "check:contracts": "node scripts/verify-connect-panel-contract.mjs && node scripts/verify-shared-api-contract.mjs && node --test scripts/dispatch-dashboard-update.test.mjs && node scripts/verify-workflow-contracts.mjs && node scripts/verify-release-health-monitor-selection.mjs",
     "check:audit": "npm audit",
     "check:signatures": "node scripts/check-npm-signatures.mjs",
     "check:connect-panel": "node scripts/verify-connect-panel-contract.mjs",
     "check:api-exports": "node scripts/verify-shared-api-contract.mjs",
     "check:hygiene": "node scripts/check-hygiene.mjs",
     "check:secrets": "node scripts/check-no-secrets.mjs",
-    "check:workflows": "node scripts/verify-workflow-contracts.mjs"
+    "check:workflows": "node --test scripts/dispatch-dashboard-update.test.mjs && node scripts/verify-workflow-contracts.mjs"
   },
   "peerDependencies": {
     "react": ">=18.0.0",

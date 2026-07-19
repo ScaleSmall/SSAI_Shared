@@ -29,6 +29,7 @@ assert.equal(packageJson.exports['./api'].default, './src/api.js');
 assert.equal(packageJson.exports['./entity-api'].default, './src/entity-api.js');
 assert.equal(packageJson.exports['./ldp-api'].default, './src/ldp-api.js');
 assert.equal(packageJson.engines?.node, '>=24.0.0', 'Shared package must require Node 24');
+assert.deepEqual(packageJson.files, ['src'], 'Shared install package must expose runtime source only');
 assert.equal(scripts.check, 'npm run check:production-readiness', 'Shared check must delegate to production readiness');
 assert.ok(scripts['check:signatures']?.includes('check-npm-signatures.mjs'), 'Shared signatures check must use peer-aware guard');
 
@@ -44,6 +45,7 @@ includesAll(scripts['check:production-readiness'] ?? '', [
 includesAll(scripts['check:contracts'] ?? '', [
   'verify-connect-panel-contract.mjs',
   'verify-shared-api-contract.mjs',
+  'dispatch-dashboard-update.test.mjs',
   'verify-workflow-contracts.mjs',
 ], 'shared contract gate');
 
