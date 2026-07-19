@@ -115,6 +115,15 @@ requireText(releaseHealthVerifier, 'findPolicyBoundCheckRecovery(', 'coverage-aw
 requireText(releaseHealthVerifier, 'const directRecovery = trustedMonitorPolicy ? null : policyBoundRecovery;', 'trusted monitor generic-recovery bypass prevention');
 requireText(releaseHealthVerifier, "monitorSelfRecoveryContract: 'release-health-monitor-v1'", 'trusted monitor recovery contract');
 requireText(releaseHealthVerifier, 'source_run_attempt:', 'exact current run-attempt binding');
+requireText(releaseHealthVerifier, 'auditedMonitorOrigins:', 'immutable audited monitor-origin policy');
+requireText(releaseHealthVerifier, 'collectMonitorImplementationSource(', 'historical monitor implementation source verification');
+requireText(releaseHealthVerifier, 'auditedOriginSources', 'historical workflow/script/utils digest handoff');
+requireText(releaseHealthVerifier, '29638546298', 'first exact legacy monitor run identity');
+requireText(releaseHealthVerifier, '29704911896', 'source-verified incident failure identity');
+const auditedMonitorOriginCalls = releaseHealthVerifier.match(/auditedMonitorOrigin\(\d+/g) || [];
+if (auditedMonitorOriginCalls.length !== 25) {
+  throw new Error(`Expected exactly 25 immutable audited monitor origins; found ${auditedMonitorOriginCalls.length}`);
+}
 requireText(
   releaseHealthVerifier,
   `sourceSha256: '${createHash('sha256').update(releaseHealth).digest('hex')}'`,

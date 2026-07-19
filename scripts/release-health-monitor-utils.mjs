@@ -282,7 +282,7 @@ export function findSupersedingWorkflowRun(failedRun, runs) {
   return later || null;
 }
 
-export function verifyForwardFixRecoveryPolicy({ workflow, policy, workflowSource }) {
+export function verifyForwardFixRecoveryPolicy({ workflow, policy, workflowSource, auditedOriginSources }) {
   if (!workflow || typeof workflow !== 'object') throw new TypeError('workflow must be an object');
   if (!policy || typeof policy !== 'object' || Array.isArray(policy)) return null;
   const expectedWorkflowId = Number(policy.workflowId);
@@ -298,6 +298,7 @@ export function verifyForwardFixRecoveryPolicy({ workflow, policy, workflowSourc
   const monitorSelfRecoveryEvents = monitorSelfRecoveryConfigured
     ? exactNonEmptyStringSet(policy.monitorSelfRecoveryEvents)
     : null;
+  const auditedMonitorOrigins = verifyAuditedMonitorOrigins(policy.auditedMonitorOrigins);
   const expectedSourceSha256 = String(policy.sourceSha256 || '').trim().toLowerCase();
   const sourceBytes = typeof workflowSource === 'string' ? Buffer.from(workflowSource, 'utf8') : workflowSource;
   if (!Number.isSafeInteger(expectedWorkflowId) || expectedWorkflowId < 1
@@ -305,13 +306,27 @@ export function verifyForwardFixRecoveryPolicy({ workflow, policy, workflowSourc
     || workflow.state !== 'active'
     || String(workflow.path || '') !== expectedPath
     || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(expectedRepository)
-    || !failedEvents || !recoveryEvents || !jobNames || !recoveryDisplayTitles
+    || !failedEvents || !recoveryEvents || !jobNames || !recoveryDisplayTitles || !auditedMonitorOrigins
     || (monitorSelfRecoveryConfigured
       && (monitorSelfRecoveryContract !== 'release-health-monitor-v1' || !monitorSelfRecoveryEvents))
+    || (!monitorSelfRecoveryConfigured && auditedMonitorOrigins.length > 0)
+    || (monitorSelfRecoveryEvents
+      && auditedMonitorOrigins.some((origin) => !monitorSelfRecoveryEvents.has(origin.event)))
     || !/^[a-f0-9]{64}$/.test(expectedSourceSha256)
     || !Buffer.isBuffer(sourceBytes)) return null;
   const actualSourceSha256 = createHash('sha256').update(sourceBytes).digest('hex');
   if (actualSourceSha256 !== expectedSourceSha256) return null;
+  if (auditedMonitorOrigins.length > 0) {
+    if (!(auditedOriginSources instanceof Map)) return null;
+    for (const origin of auditedMonitorOrigins) {
+      const sources = auditedOriginSources.get(origin.headSha);
+      if (!sources || !sourceDigestMatches(sources.workflowSource, origin.workflowSourceSha256)
+        || !sourceDigestMatches(sources.scriptSource, origin.scriptSourceSha256)
+        || (origin.utilsSourceSha256 === null
+          ? sources.utilsSource !== null
+          : !sourceDigestMatches(sources.utilsSource, origin.utilsSourceSha256))) return null;
+    }
+  }
   return Object.freeze({
     verified: true,
     workflowId: expectedWorkflowId,
@@ -323,6 +338,7 @@ export function verifyForwardFixRecoveryPolicy({ workflow, policy, workflowSourc
     recoveryDisplayTitles,
     monitorSelfRecoveryContract,
     monitorSelfRecoveryEvents,
+    auditedMonitorOrigins,
     sourceSha256: actualSourceSha256,
   });
 }
@@ -331,7 +347,8 @@ export function isTrustedMonitorRecoveryPolicy(policy) {
   return policy?.verified === true
     && policy.monitorSelfRecoveryContract === 'release-health-monitor-v1'
     && policy.monitorSelfRecoveryEvents instanceof Set
-    && policy.monitorSelfRecoveryEvents.size > 0;
+    && policy.monitorSelfRecoveryEvents.size > 0
+    && Array.isArray(policy.auditedMonitorOrigins);
 }
 
 export function findPolicyBoundWorkflowRecovery(failedRun, runs, policy, options) {
@@ -782,7 +799,7 @@ function isEligibleTrustedMonitorOrigin(record, policy, currentHeadSha, defaultB
     && record?.head_branch === defaultBranch
     && headRepository === policy.headRepository
     && policy.monitorSelfRecoveryEvents.has(String(record?.event || ''))
-    && isTrustedReleaseHealthMonitorTitle(record?.display_title || record?.source_run_display_title)
+    && trustedMonitorOriginCoverage(record, policy) !== null
     && /^[a-f0-9]{40}$/i.test(failedSha)
     && defaultCommitShas.has(failedSha)
     && defaultCommitShas.has(currentHeadSha);
@@ -807,8 +824,8 @@ function isTrustedMonitorWorkflowCandidate(candidate, failedRun, policy, current
     && candidate?.head_repository?.full_name === policy.headRepository
     && policy.monitorSelfRecoveryEvents.has(String(candidate?.event || ''))
     && trustedMonitorCoverageDominates(
-      candidate?.display_title,
-      failedRun?.display_title || failedRun?.source_run_display_title,
+      candidate,
+      trustedMonitorOriginCoverage(failedRun, policy),
     )
     && occurrenceTime(candidate) > occurrenceTime(failedRun);
 }
@@ -822,21 +839,55 @@ function isTrustedMonitorCheckCandidate(candidate, failedCheck, policy, currentH
     && candidate?.head_repository === policy.headRepository
     && policy.monitorSelfRecoveryEvents.has(String(candidate?.event || ''))
     && trustedMonitorCoverageDominates(
-      candidate?.source_run_display_title,
-      failedCheck?.source_run_display_title || failedCheck?.display_title,
+      candidate,
+      trustedMonitorOriginCoverage(failedCheck, policy),
     )
     && occurrenceTime(candidate) > occurrenceTime(failedCheck);
 }
 
-function isTrustedReleaseHealthMonitorTitle(value) {
-  return parseTrustedReleaseHealthMonitorTitle(value) !== null;
+function trustedMonitorCoverageDominates(candidateRecord, failedCoverage) {
+  const candidate = parseTrustedReleaseHealthMonitorTitle(
+    candidateRecord?.source_run_display_title || candidateRecord?.display_title,
+  );
+  const failed = failedCoverage && typeof failedCoverage === 'object'
+    ? failedCoverage
+    : parseTrustedReleaseHealthMonitorTitle(failedCoverage);
+  const candidateTime = occurrenceTime(candidateRecord);
+  const candidateStartedAt = candidateTime - (candidate?.hours * 60 * 60_000);
+  if (!candidate || !failed || !Number.isFinite(failed.startedAtMs)
+    || candidateStartedAt > failed.startedAtMs) return false;
+  return failed.mode !== 'incident' || candidate.mode === 'incident';
 }
 
-function trustedMonitorCoverageDominates(candidateTitle, failedTitle) {
-  const candidate = parseTrustedReleaseHealthMonitorTitle(candidateTitle);
-  const failed = parseTrustedReleaseHealthMonitorTitle(failedTitle);
-  if (!candidate || !failed || candidate.hours < failed.hours) return false;
-  return failed.mode !== 'incident' || candidate.mode === 'incident';
+function trustedMonitorOriginCoverage(record, policy) {
+  const runId = Number(record?.source_run_id ?? record?.id);
+  const runAttempt = Number(record?.source_run_attempt ?? record?.run_attempt ?? 1);
+  const headSha = String(record?.head_sha || '').toLowerCase();
+  const event = String(record?.event || '');
+  const displayTitle = String(record?.source_run_display_title || record?.display_title || '');
+  const isCheckRun = record?.source_run_id !== undefined;
+  const audited = policy.auditedMonitorOrigins.find((candidate) => candidate.runId === runId
+    && candidate.runAttempt === runAttempt
+    && (!isCheckRun || candidate.checkRunId === Number(record?.id))
+    && candidate.headSha === headSha
+    && candidate.event === event
+    && candidate.displayTitle === displayTitle);
+  if (audited) {
+    return {
+      mode: audited.coverageMode,
+      hours: audited.coverageHours,
+      startedAtMs: audited.coverageStartedAtMs
+        ?? occurrenceTime(record) - (audited.coverageHours * 60 * 60_000),
+    };
+  }
+  const modern = parseTrustedReleaseHealthMonitorTitle(
+    record?.source_run_display_title || record?.display_title,
+  );
+  if (!modern) return null;
+  return {
+    ...modern,
+    startedAtMs: occurrenceTime(record) - (modern.hours * 60 * 60_000),
+  };
 }
 
 function parseTrustedReleaseHealthMonitorTitle(value) {
@@ -865,6 +916,72 @@ function exactNonEmptyStringSet(value) {
   const normalized = value.map((item) => String(item || '').trim());
   if (normalized.some((item) => !item) || new Set(normalized).size !== normalized.length) return null;
   return new Set(normalized);
+}
+
+function verifyAuditedMonitorOrigins(value) {
+  if (value === undefined) return Object.freeze([]);
+  if (!Array.isArray(value) || value.length > 100) return null;
+  const seen = new Set();
+  const verified = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    const runId = Number(item.runId);
+    const runAttempt = Number(item.runAttempt);
+    const checkRunId = Number(item.checkRunId);
+    const headSha = String(item.headSha || '').trim().toLowerCase();
+    const event = String(item.event || '').trim();
+    const displayTitle = String(item.displayTitle || '').trim();
+    const coverageMode = String(item.coverageMode || '').trim();
+    const coverageHours = Number(item.coverageHours);
+    const coverageStartedAt = item.coverageStartedAt === undefined
+      ? ''
+      : String(item.coverageStartedAt || '').trim();
+    const coverageStartedAtMs = coverageStartedAt ? Date.parse(coverageStartedAt) : null;
+    const workflowSourceSha256 = String(item.workflowSourceSha256 || '').trim().toLowerCase();
+    const scriptSourceSha256 = String(item.scriptSourceSha256 || '').trim().toLowerCase();
+    const utilsSourceSha256 = item.utilsSourceSha256 === null
+      ? null
+      : String(item.utilsSourceSha256 || '').trim().toLowerCase();
+    const identity = runId + ':' + runAttempt;
+    if (!Number.isSafeInteger(runId) || runId < 1
+      || !Number.isSafeInteger(runAttempt) || runAttempt < 1 || runAttempt > 100
+      || !Number.isSafeInteger(checkRunId) || checkRunId < 1
+      || !/^[a-f0-9]{40}$/.test(headSha)
+      || !event
+      || (displayTitle !== 'Scale Small AI Release Health Monitor'
+        && parseTrustedReleaseHealthMonitorTitle(displayTitle) === null)
+      || !['continuous', 'incident'].includes(coverageMode)
+      || !Number.isSafeInteger(coverageHours) || coverageHours < 1
+      || (coverageMode === 'continuous' ? coverageHours > 6 : coverageHours > 168)
+      || (coverageStartedAt && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(coverageStartedAt)
+        || !Number.isFinite(coverageStartedAtMs)))
+      || !/^[a-f0-9]{64}$/.test(workflowSourceSha256)
+      || !/^[a-f0-9]{64}$/.test(scriptSourceSha256)
+      || (utilsSourceSha256 !== null && !/^[a-f0-9]{64}$/.test(utilsSourceSha256))
+      || seen.has(identity)) return null;
+    seen.add(identity);
+    verified.push(Object.freeze({
+      runId,
+      runAttempt,
+      checkRunId,
+      headSha,
+      event,
+      displayTitle,
+      coverageMode,
+      coverageHours,
+      coverageStartedAt,
+      coverageStartedAtMs,
+      workflowSourceSha256,
+      scriptSourceSha256,
+      utilsSourceSha256,
+    }));
+  }
+  return Object.freeze(verified);
+}
+
+function sourceDigestMatches(source, expectedSha256) {
+  return Buffer.isBuffer(source)
+    && createHash('sha256').update(source).digest('hex') === expectedSha256;
 }
 
 function compareNewestFirst(left, right) {
