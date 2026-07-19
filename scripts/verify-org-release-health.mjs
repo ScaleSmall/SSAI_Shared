@@ -127,6 +127,11 @@ const auditedMonitorSourceEvidence = new Map([
     scriptSourceSha256: '81fa74492549661e9af45220471ba9392bcc3e44c2cbbd43ea415fa53a3861ae',
     utilsSourceSha256: 'c44b19a4849593680c992dad8ae85a37bc87b899e7a66312045ff17b09d1cfd6',
   }],
+  ['5a4ece6019c44c585f4f67b2bc3a7c50bc55f61d', {
+    workflowSourceSha256: currentMonitorWorkflowSourceSha256,
+    scriptSourceSha256: '7a783131a8eaac171b4f4e70ecbe84945db44d16217e08976c0f4f5af8906b6d',
+    utilsSourceSha256: 'ad0b6b22c6b19cbfa8752130928b982f0bf8bbfe35c70430c2a739f5256ac4b6',
+  }],
 ]);
 const auditedMonitorOrigin = (
   runId,
@@ -212,6 +217,10 @@ const forwardFixRecoveryPolicies = new Map([
       // records were the exact 24 attempts above, so the next incident scan may
       // recover it only if its window still includes their earliest predicate.
       auditedMonitorOrigin(29704911896, 1, 88240157445, '256eddb68de8c5f4d52e1b424631e3beef1387ae', 'workflow_dispatch', 'Release health monitor [incident:168h]', 'incident', 168, currentMonitorWorkflowSourceSha256, '2026-07-18T09:04:30Z'),
+      // This exact incident stopped at the fail-closed API headroom gate before
+      // inventory: 2474 remained, 3750 was required, reset 22:27:02Z. A later
+      // incident may recover it only by completing the exhaustive scan.
+      auditedMonitorOrigin(29705959736, 1, 88242895212, '5a4ece6019c44c585f4f67b2bc3a7c50bc55f61d', 'workflow_dispatch', 'Release health monitor [incident:168h]', 'incident', 168, currentMonitorWorkflowSourceSha256, '2026-07-19T22:20:08Z'),
     ],
   }],
 ]);

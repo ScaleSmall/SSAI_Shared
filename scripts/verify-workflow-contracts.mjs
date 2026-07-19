@@ -120,9 +120,10 @@ requireText(releaseHealthVerifier, 'collectMonitorImplementationSource(', 'histo
 requireText(releaseHealthVerifier, 'auditedOriginSources', 'historical workflow/script/utils digest handoff');
 requireText(releaseHealthVerifier, '29638546298', 'first exact legacy monitor run identity');
 requireText(releaseHealthVerifier, '29704911896', 'source-verified incident failure identity');
+requireText(releaseHealthVerifier, '29705959736', 'rate-gated incident failure identity');
 const auditedMonitorOriginCalls = releaseHealthVerifier.match(/auditedMonitorOrigin\(\d+/g) || [];
-if (auditedMonitorOriginCalls.length !== 25) {
-  throw new Error(`Expected exactly 25 immutable audited monitor origins; found ${auditedMonitorOriginCalls.length}`);
+if (auditedMonitorOriginCalls.length !== 26) {
+  throw new Error(`Expected exactly 26 immutable audited monitor origins; found ${auditedMonitorOriginCalls.length}`);
 }
 requireText(
   releaseHealthVerifier,
