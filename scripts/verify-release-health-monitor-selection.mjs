@@ -28,6 +28,7 @@ import {
   findSupersedingWorkflowRun,
   findTrustedMonitorCheckRecovery,
   findTrustedMonitorWorkflowRecovery,
+  githubRetryDelayMs,
   isTrustedMonitorRecoveryPolicy,
   latestByIdentity,
   partitionWorkflowHealth,
@@ -58,6 +59,127 @@ assert.equal(rateHeadroomDecision('continuous', 1599, 1000, 600), 'defer', 'cont
 assert.equal(rateHeadroomDecision('incident', 3749, 250, 3500), 'fail', 'an explicit incident sweep must fail closed when exhaustive coverage is impossible');
 assert.equal(rateHeadroomDecision('incident', 3750, 250, 3500), 'run');
 assert.throws(() => rateHeadroomDecision('continuous', -1, 1000, 600), /remaining must be a non-negative integer/);
+
+const retryNowMs = Date.parse('2026-07-20T00:00:00Z');
+const ordinaryRateReset = String(Math.floor(retryNowMs / 1000) + 3600);
+assert.equal(
+  githubRetryDelayMs({
+    status: 503,
+    retryAfter: null,
+    rateLimitRemaining: '4999',
+    rateLimitReset: ordinaryRateReset,
+    attempt: 1,
+    nowMs: retryNowMs,
+    jitterMs: 17,
+  }),
+  767,
+  'a 503 without Retry-After must use bounded backoff and ignore the ordinary rate-reset window',
+);
+assert.equal(
+  githubRetryDelayMs({
+    status: 503,
+    retryAfter: '2',
+    rateLimitRemaining: '4999',
+    rateLimitReset: ordinaryRateReset,
+    attempt: 1,
+    nowMs: retryNowMs,
+    jitterMs: 17,
+  }),
+  2017,
+  'a numeric Retry-After delay must be honored',
+);
+assert.equal(
+  githubRetryDelayMs({
+    status: 503,
+    retryAfter: new Date(retryNowMs + 5_000).toUTCString(),
+    rateLimitRemaining: '4999',
+    rateLimitReset: ordinaryRateReset,
+    attempt: 1,
+    nowMs: retryNowMs,
+    jitterMs: 17,
+  }),
+  5017,
+  'an IMF-fixdate Retry-After delay must be honored',
+);
+assert.equal(
+  githubRetryDelayMs({
+    status: 503,
+    retryAfter: 'not-a-number',
+    rateLimitRemaining: '4999',
+    rateLimitReset: ordinaryRateReset,
+    attempt: 2,
+    nowMs: retryNowMs,
+    jitterMs: 17,
+  }),
+  1517,
+  'a malformed Retry-After value on a 503 must fall back to bounded exponential backoff',
+);
+assert.equal(
+  githubRetryDelayMs({
+    status: 503,
+    retryAfter: '   ',
+    rateLimitRemaining: '4999',
+    rateLimitReset: ordinaryRateReset,
+    attempt: 1,
+    nowMs: retryNowMs,
+    jitterMs: 17,
+  }),
+  767,
+  'a blank Retry-After header must not be coerced to zero',
+);
+assert.equal(
+  githubRetryDelayMs({
+    status: 429,
+    retryAfter: null,
+    rateLimitRemaining: '42',
+    rateLimitReset: String(Math.floor(retryNowMs / 1000) + 5),
+    attempt: 1,
+    nowMs: retryNowMs,
+    jitterMs: 17,
+  }),
+  5017,
+  'a 429 may use the authoritative rate-limit reset timestamp',
+);
+assert.equal(
+  githubRetryDelayMs({
+    status: 403,
+    retryAfter: null,
+    rateLimitRemaining: '0',
+    rateLimitReset: String(Math.floor(retryNowMs / 1000) + 5),
+    attempt: 1,
+    nowMs: retryNowMs,
+    jitterMs: 17,
+  }),
+  5017,
+  'a rate-limited 403 may use the authoritative rate-limit reset timestamp',
+);
+assert.equal(
+  githubRetryDelayMs({
+    status: 403,
+    retryAfter: null,
+    rateLimitRemaining: '1',
+    rateLimitReset: String(Math.floor(retryNowMs / 1000) + 5),
+    attempt: 1,
+    nowMs: retryNowMs,
+    jitterMs: 17,
+  }),
+  767,
+  'a non-rate-limited 403 must not inherit a rate-reset delay',
+);
+assert.equal(
+  githubRetryDelayMs({
+    status: 503,
+    retryAfter: null,
+    rateLimitRemaining: '4999',
+    rateLimitReset: ordinaryRateReset,
+    attempt: 3,
+    maxAttempts: 3,
+    nowMs: retryNowMs,
+    jitterMs: 17,
+  }),
+  null,
+  'the final attempt must not calculate a retry delay',
+);
 
 const workflowPartitions = partitionWorkflowHealth([
   { status: 'completed', conclusion: 'success' },
