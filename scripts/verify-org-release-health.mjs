@@ -21,6 +21,7 @@ import {
   findSupersedingCommitStatus,
   findSupersedingDeployment,
   findTrustedMonitorCheckRecovery,
+  githubRetryDelayMs,
   isTrustedMonitorRecoveryPolicy,
   latestByIdentity,
   partitionWorkflowHealth,
@@ -1343,7 +1344,8 @@ async function graphql(query, variables, label) {
 
 async function apiRequest({ label, url, method, body = undefined, allowNotFound = false }) {
   let lastError;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     enforceRequestBudget(label);
     requestStats.requests += 1;
     if (attempt > 1) requestStats.retries += 1;
@@ -1368,9 +1370,10 @@ async function apiRequest({ label, url, method, body = undefined, allowNotFound 
       const message = (await response.text()).slice(0, 500).replace(/\s+/g, ' ');
       lastError = new Error('GitHub API ' + label + ' returned HTTP ' + response.status + ': ' + message);
       if (!isRetryableResponse(response)) break;
+      if (attempt >= maxAttempts) break;
       const delayMs = retryDelayMs(response, attempt);
       if (delayMs > 30_000) throw new Error('GitHub API requested a retry delay longer than the monitor safety limit for ' + label + '.');
-      if (attempt < 3) await sleep(delayMs);
+      await sleep(delayMs);
       continue;
     } catch (error) {
       lastError = error;
@@ -1414,18 +1417,21 @@ function updateRateBudget(response) {
 
 function isRetryableResponse(response) {
   if ([429, 500, 502, 503, 504].includes(response.status)) return true;
+  const retryAfter = response.headers.get('retry-after');
   return response.status === 403
-    && (response.headers.get('retry-after') !== null || response.headers.get('x-ratelimit-remaining') === '0');
+    && ((retryAfter !== null && retryAfter.trim() !== '') || response.headers.get('x-ratelimit-remaining') === '0');
 }
 
 function retryDelayMs(response, attempt) {
-  const retryAfter = Number(response.headers.get('retry-after'));
-  if (Number.isFinite(retryAfter) && retryAfter >= 0) return Math.max(250, retryAfter * 1000) + jitterMs();
-  const resetSeconds = Number(response.headers.get('x-ratelimit-reset'));
-  if (Number.isFinite(resetSeconds) && resetSeconds > 0) {
-    return Math.max(250, (resetSeconds * 1000) - Date.now()) + jitterMs();
-  }
-  return backoffWithJitter(attempt);
+  return githubRetryDelayMs({
+    status: response.status,
+    retryAfter: response.headers.get('retry-after'),
+    rateLimitRemaining: response.headers.get('x-ratelimit-remaining'),
+    rateLimitReset: response.headers.get('x-ratelimit-reset'),
+    attempt,
+    nowMs: Date.now(),
+    jitterMs: jitterMs(),
+  });
 }
 
 function backoffWithJitter(attempt) {

@@ -158,6 +158,71 @@ export function rateHeadroomDecision(scanMode, remaining, reserve, requestBudget
   return scanMode === 'continuous' ? 'defer' : 'fail';
 }
 
+export function githubRetryDelayMs({
+  status,
+  retryAfter,
+  rateLimitRemaining,
+  rateLimitReset,
+  attempt,
+  maxAttempts = 3,
+  nowMs,
+  jitterMs = 0,
+}) {
+  for (const [name, value] of [
+    ['status', status],
+    ['attempt', attempt],
+    ['maxAttempts', maxAttempts],
+    ['nowMs', nowMs],
+    ['jitterMs', jitterMs],
+  ]) {
+    if (!Number.isFinite(value)) throw new TypeError(name + ' must be finite');
+  }
+  if (!Number.isInteger(status) || status < 100 || status > 599) throw new RangeError('status must be a valid HTTP status');
+  if (!Number.isSafeInteger(attempt) || attempt < 1) throw new RangeError('attempt must be a positive integer');
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) throw new RangeError('maxAttempts must be a positive integer');
+  if (nowMs < 0) throw new RangeError('nowMs must be non-negative');
+  if (!Number.isSafeInteger(jitterMs) || jitterMs < 0 || jitterMs > 250) {
+    throw new RangeError('jitterMs must be an integer between 0 and 250');
+  }
+
+  // A terminal attempt must surface the original HTTP failure. It must not
+  // calculate a delay that cannot be used or replace that failure with a
+  // retry-policy error.
+  if (attempt >= maxAttempts) return null;
+
+  const retryAfterValue = nonBlankHeaderValue(retryAfter);
+  if (retryAfterValue !== null) {
+    const retryAfterSeconds = Number(retryAfterValue);
+    if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0) {
+      return Math.max(250, retryAfterSeconds * 1000) + jitterMs;
+    }
+    if (/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(retryAfterValue)) {
+      const retryAfterAtMs = Date.parse(retryAfterValue);
+      if (Number.isFinite(retryAfterAtMs)) {
+        return Math.max(250, retryAfterAtMs - nowMs) + jitterMs;
+      }
+    }
+  }
+
+  const remainingValue = nonBlankHeaderValue(rateLimitRemaining);
+  const rateLimited = status === 429 || (status === 403 && remainingValue === '0');
+  const resetValue = rateLimited ? nonBlankHeaderValue(rateLimitReset) : null;
+  if (resetValue !== null) {
+    const resetSeconds = Number(resetValue);
+    if (Number.isFinite(resetSeconds) && resetSeconds > 0) {
+      return Math.max(250, (resetSeconds * 1000) - nowMs) + jitterMs;
+    }
+  }
+
+  return Math.min(10_000, (2 ** Math.max(0, attempt - 1)) * 750) + jitterMs;
+}
+
+function nonBlankHeaderValue(value) {
+  if (value === null || value === undefined) return null;
+  const normalized = String(value).trim();
+  return normalized || null;
+}
+
 export function workflowStreamIdentity(run) {
   if (!run || typeof run !== 'object') throw new TypeError('run must be an object');
   const branch = String(run.head_branch || '').trim()
