@@ -2,6 +2,7 @@ import { appendFile } from 'node:fs/promises';
 import {
   attestTrustedMonitorImplementation,
   associateChecksWithPulls,
+  associateWorkflowRunsWithPulls,
   checkStreamIdentity,
   commitStatusStreamIdentity,
   deploymentJobStreamIdentity,
@@ -19,6 +20,7 @@ import {
   findProvisionalTrustedMonitorCheckRecoveryFromRun,
   findDeploymentCheckRecovery,
   findMergedPullCheckRecovery,
+  findMergedPullWorkflowRecovery,
   findSupersedingCommitStatus,
   findSupersedingDeployment,
   findTrustedMonitorCheckRecovery,
@@ -77,18 +79,6 @@ const pageLimits = scanMode === 'incident'
   : { workflows: 10, runs: 10, commits: 5, pulls: 3, branches: 3, checks: 5, statuses: 5, deployments: 10, repositories: 10 };
 
 const noHistoryPolicies = new Map([
-  ['SSAI_CI_Engine:Retire Production CI Test Token Broker', {
-    path: '.github/workflows/retire-production-ci-test-tokens.yml',
-    sourceSha256: '3cd089034a5b52f8ddd0297f1d82d8fc4422bccb7a1aac00e9c7750875f023a5',
-    reason: 'One-shot manual broker-retirement control remains dormant until permanent production test-token retirement is authorized.',
-    witness: {
-      name: 'Production Customer Intelligence Worker',
-      path: '.github/workflows/production-ci-worker.yml',
-      headRepository: 'ScaleSmall/SSAI_CI_Engine',
-      allowedEvents: ['schedule', 'workflow_dispatch'],
-      maxAgeHours: 4,
-    },
-  }],
   ['SSAI_Analytics_Reporting:Deploy Production Analytics Pages', {
     path: '.github/workflows/deploy-production-pages.yml',
     sourceSha256: '1ffee267b32c9a5579455fc8b4684ab28c7be0d187a7f0a50257ce6ad1299cc6',
@@ -402,7 +392,7 @@ await writeStepSummary(summary);
 
 async function inspectRepository(repo) {
   const defaultBranch = String(repo.default_branch || 'main');
-  const [allWorkflows, commit, recentRuns, recentCommits, recentPulls, branches, deploymentCollection] = await Promise.all([
+  const [allWorkflows, commit, rawRecentRuns, recentCommits, recentPulls, branches, deploymentCollection] = await Promise.all([
     collectWorkflows(repo.name),
     api('/repos/' + owner + '/' + repo.name + '/commits/' + encodeURIComponent(defaultBranch)),
     collectRecentWorkflowRuns(repo.name),
@@ -424,6 +414,7 @@ async function inspectRepository(repo) {
   const pullCommitGroups = await mapLimit(recentPulls, 3, async (pull) => collectRecentPullCommits(repo.name, pull));
   const recentBranchCommits = branchCommitGroups.flat();
   const recentPullCommits = pullCommitGroups.flat();
+  const recentRuns = associateWorkflowRunsWithPulls(rawRecentRuns, recentPullCommits);
 
   const workflows = allWorkflows.filter((workflow) => workflow.state === 'active');
   const verifiedForwardFixPolicies = await resolveForwardFixRecoveryPolicies(
@@ -508,6 +499,7 @@ async function inspectRepository(repo) {
     defaultBranch,
     defaultCommitShas,
     policies: verifiedForwardFixPolicies,
+    pullByNumber,
   });
 
   const shaMetadata = new Map();
@@ -1154,6 +1146,7 @@ function reconcileWorkflowFailures(repoName, runs, {
   defaultBranch,
   defaultCommitShas,
   policies,
+  pullByNumber,
 }) {
   for (const run of runs.filter((candidate) => candidate.status === 'completed'
     && failedConclusions.has(String(candidate.conclusion || ''))
@@ -1173,7 +1166,10 @@ function reconcileWorkflowFailures(repoName, runs, {
       defaultBranch,
       defaultCommitShas,
     });
-    const recovery = directRecovery || trustedMonitorRecovery || forwardFixRecovery;
+    const mergedPullRecovery = policyBoundRecovery || trustedMonitorPolicy || forwardFixRecovery
+      ? null
+      : findMergedPullWorkflowRecovery(run, runs, pullByNumber, defaultBranch, defaultCommitShas);
+    const recovery = directRecovery || trustedMonitorRecovery || forwardFixRecovery || mergedPullRecovery?.run;
     const policyBoundCurrent = repoName === currentRepoName && currentRunId
       ? findPolicyBoundProvisionalWorkflowRecovery(
         run,
@@ -1213,6 +1209,8 @@ function reconcileWorkflowFailures(repoName, runs, {
           ? 'trusted-monitor-recheck'
           : forwardFixRecovery
             ? 'verified-current-main-forward-fix'
+            : mergedPullRecovery
+              ? 'merged-pull-default-branch'
             : '',
     };
     if (recovery) {

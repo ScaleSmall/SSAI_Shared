@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import {
   attestTrustedMonitorImplementation,
   associateChecksWithPulls,
+  associateWorkflowRunsWithPulls,
   checkStreamIdentity,
   commitStatusStreamIdentity,
   deploymentJobStreamIdentity,
@@ -23,6 +24,7 @@ import {
   findProvisionalWorkflowRecovery,
   findDeploymentCheckRecovery,
   findMergedPullCheckRecovery,
+  findMergedPullWorkflowRecovery,
   findSupersedingCheck,
   findSupersedingCommitStatus,
   findSupersedingDeployment,
@@ -1885,6 +1887,119 @@ const pullByNumber = new Map([[15, {
   merged_at: '2026-07-18T09:05:00Z',
   merge_commit_sha: 'd'.repeat(40),
 }]]);
+
+const failedWorkflowStartup = {
+  id: 697,
+  workflow_id: 303959338,
+  name: '.github/workflows/ci.yml',
+  event: 'push',
+  head_branch: 'codex/harden-synthetic-dispatch-admission-20260720',
+  head_repository: { full_name: 'ScaleSmall/SSAI_Database' },
+  head_sha: 'a'.repeat(40),
+  status: 'completed',
+  conclusion: 'failure',
+  run_started_at: '2026-07-18T09:00:00Z',
+  pull_requests: [],
+};
+const mergedWorkflowSuccess = {
+  ...failedWorkflowStartup,
+  id: 698,
+  name: 'CI',
+  head_branch: 'main',
+  head_repository: { full_name: 'ScaleSmall/SSAI_Database' },
+  head_sha: 'd'.repeat(40),
+  conclusion: 'success',
+  run_started_at: '2026-07-18T09:06:00Z',
+};
+const workflowPullByNumber = new Map([[15, {
+  number: 15,
+  merged_at: '2026-07-18T09:05:00Z',
+  merge_commit_sha: 'd'.repeat(40),
+  head: {
+    ref: 'codex/harden-synthetic-dispatch-admission-20260720',
+    repo: { full_name: 'ScaleSmall/SSAI_Database' },
+  },
+  base: { repo: { full_name: 'ScaleSmall/SSAI_Database' } },
+}]]);
+const associatedWorkflowRuns = associateWorkflowRunsWithPulls(
+  [failedWorkflowStartup, mergedWorkflowSuccess],
+  [{
+    sha: 'a'.repeat(40),
+    _pull_number: 15,
+    _branch: 'codex/harden-synthetic-dispatch-admission-20260720',
+    _head_repository: 'ScaleSmall/SSAI_Database',
+  }],
+);
+assert.deepEqual(associatedWorkflowRuns[0].pull_numbers, [15], 'an exact pull commit may restore a startup-failed run\'s missing pull association');
+assert.deepEqual(
+  associateWorkflowRunsWithPulls([failedWorkflowStartup], [{
+    sha: 'a'.repeat(40),
+    _pull_number: 16,
+    _branch: 'another-branch',
+    _head_repository: 'ScaleSmall/SSAI_Database',
+  }, {
+    sha: 'a'.repeat(40),
+    _pull_number: 17,
+    _branch: failedWorkflowStartup.head_branch,
+    _head_repository: 'untrusted/fork',
+  }])[0].pull_numbers,
+  [],
+  'a same-SHA branch or repository mismatch must not create a pull association',
+);
+assert.equal(
+  findMergedPullWorkflowRecovery(
+    associatedWorkflowRuns[0],
+    associatedWorkflowRuns,
+    workflowPullByNumber,
+    'main',
+    new Set(['d'.repeat(40)]),
+  )?.run.id,
+  698,
+  'a failed branch workflow may recover only through the exact merged pull and exact successful merge-commit push',
+);
+for (const [label, failedMutation, successMutation, pullMutation] of [
+  ['ambiguous pull identity', { pull_numbers: [15, 16] }, {}, {}],
+  ['missing workflow identity', { workflow_id: null }, {}, {}],
+  ['manual failed origin', { event: 'workflow_dispatch' }, {}, {}],
+  ['default-branch failed origin', { head_branch: 'main' }, {}, {}],
+  ['wrong workflow', {}, { workflow_id: 999 }, {}],
+  ['manual merge-commit run', {}, { event: 'workflow_dispatch' }, {}],
+  ['wrong recovery branch', {}, { head_branch: 'release' }, {}],
+  ['wrong recovery repository', {}, { head_repository: { full_name: 'another/repo' } }, {}],
+  ['recovery predates merge', {}, { run_started_at: '2026-07-18T09:04:00Z' }, {}],
+  ['wrong merge SHA', {}, {}, { merge_commit_sha: 'e'.repeat(40) }],
+  ['wrong pull branch', {}, {}, { head: { ref: 'another-branch', repo: { full_name: 'ScaleSmall/SSAI_Database' } } }],
+  ['wrong pull repository', {}, {}, { head: { ref: failedWorkflowStartup.head_branch, repo: { full_name: 'untrusted/fork' } } }],
+  ['wrong base repository', {}, {}, { base: { repo: { full_name: 'another/repo' } } }],
+  ['merge predates failure', {}, {}, { merged_at: '2026-07-18T08:59:00Z' }],
+  ['unsuccessful merge run', {}, { conclusion: 'failure' }, {}],
+]) {
+  const failedCandidate = { ...associatedWorkflowRuns[0], ...failedMutation };
+  const successCandidate = { ...associatedWorkflowRuns[1], ...successMutation };
+  const pullCandidate = { ...workflowPullByNumber.get(15), ...pullMutation };
+  assert.equal(
+    findMergedPullWorkflowRecovery(
+      failedCandidate,
+      [failedCandidate, successCandidate],
+      new Map([[15, pullCandidate]]),
+      'main',
+      new Set(['d'.repeat(40)]),
+    ),
+    null,
+    label + ' must fail closed',
+  );
+}
+assert.equal(
+  findMergedPullWorkflowRecovery(
+    associatedWorkflowRuns[0],
+    associatedWorkflowRuns,
+    workflowPullByNumber,
+    'main',
+    new Set(),
+  ),
+  null,
+  'a merge commit removed from current default-branch history must not recover a branch failure',
+);
 assert.equal(
   findMergedPullCheckRecovery(cloudflareFailure, [cloudflareFailure, mergedPullCheck], pullByNumber, 'main')?.check.id,
   701,

@@ -867,6 +867,88 @@ export function findMergedPullCheckRecovery(failedCheck, checks, pullByNumber, d
   return recoveryCheck ? { pull, check: recoveryCheck } : null;
 }
 
+export function associateWorkflowRunsWithPulls(runs, pullCommits) {
+  if (!Array.isArray(runs)) throw new TypeError('runs must be an array');
+  if (!Array.isArray(pullCommits)) throw new TypeError('pullCommits must be an array');
+
+  const associationsBySha = new Map();
+  for (const commit of pullCommits) {
+    const sha = String(commit?.sha || '').toLowerCase();
+    const pullNumber = Number(commit?._pull_number);
+    const branch = String(commit?._branch || '');
+    const headRepository = String(commit?._head_repository || '');
+    if (!/^[a-f0-9]{40}$/.test(sha)
+      || !Number.isSafeInteger(pullNumber)
+      || pullNumber <= 0
+      || !branch
+      || !headRepository) continue;
+    const associations = associationsBySha.get(sha) || [];
+    associations.push({ pullNumber, branch, headRepository });
+    associationsBySha.set(sha, associations);
+  }
+
+  return runs.map((run) => {
+    const sha = String(run?.head_sha || '').toLowerCase();
+    const branch = String(run?.head_branch || '');
+    const headRepository = String(run?.head_repository?.full_name || run?.head_repository || '');
+    const pullNumbers = new Set((run?.pull_requests || [])
+      .map((pull) => Number(pull?.number))
+      .filter((number) => Number.isSafeInteger(number) && number > 0));
+    for (const association of associationsBySha.get(sha) || []) {
+      if (association.branch === branch && association.headRepository === headRepository) {
+        pullNumbers.add(association.pullNumber);
+      }
+    }
+    return { ...run, pull_numbers: [...pullNumbers].sort((left, right) => left - right) };
+  });
+}
+
+export function findMergedPullWorkflowRecovery(failedRun, runs, pullByNumber, defaultBranch, defaultCommitShas) {
+  if (!failedRun || typeof failedRun !== 'object') throw new TypeError('failedRun must be an object');
+  if (!Array.isArray(runs)) throw new TypeError('runs must be an array');
+  if (!(pullByNumber instanceof Map)) throw new TypeError('pullByNumber must be a Map');
+  if (!(defaultCommitShas instanceof Set)) throw new TypeError('defaultCommitShas must be a Set');
+  const branch = String(defaultBranch || '').trim();
+  if (!branch) throw new Error('defaultBranch must not be empty');
+  const workflowId = Number(failedRun.workflow_id);
+  const failedEvent = String(failedRun.event || '');
+  if (!Number.isSafeInteger(workflowId)
+    || workflowId <= 0
+    || !['push', 'pull_request'].includes(failedEvent)
+    || String(failedRun.head_branch || '') === branch) return null;
+
+  const pullNumbers = [...new Set((failedRun.pull_numbers || [])
+    .map(Number)
+    .filter((number) => Number.isSafeInteger(number) && number > 0))];
+  if (pullNumbers.length !== 1) return null;
+  const pull = pullByNumber.get(pullNumbers[0]);
+  const mergedAt = Date.parse(String(pull?.merged_at || ''));
+  const mergeCommitSha = String(pull?.merge_commit_sha || '').toLowerCase();
+  const failedRepository = String(failedRun.head_repository?.full_name || failedRun.head_repository || '');
+  const pullHeadRepository = String(pull?.head?.repo?.full_name || '');
+  const pullHeadBranch = String(pull?.head?.ref || '');
+  const baseRepository = String(pull?.base?.repo?.full_name || '');
+  if (!Number.isFinite(mergedAt)
+    || !/^[a-f0-9]{40}$/.test(mergeCommitSha)
+    || !defaultCommitShas.has(mergeCommitSha)
+    || mergedAt <= occurrenceTime(failedRun)
+    || pullHeadRepository !== failedRepository
+    || pullHeadBranch !== String(failedRun.head_branch || '')
+    || !baseRepository) return null;
+
+  const recoveryRun = runs
+    .filter((candidate) => Number(candidate?.workflow_id) === workflowId
+      && String(candidate?.head_repository?.full_name || candidate?.head_repository || '') === baseRepository
+      && String(candidate?.head_sha || '').toLowerCase() === mergeCommitSha
+      && candidate?.head_branch === branch
+      && candidate?.event === 'push'
+      && candidate?.status === 'completed'
+      && candidate?.conclusion === 'success'
+      && occurrenceTime(candidate) >= mergedAt)
+    .sort(compareNewestFirst)[0];
+  return recoveryRun ? { pull, run: recoveryRun } : null;
+}
+
 export function associateChecksWithPulls(checks, pulls) {
   if (!Array.isArray(checks)) throw new TypeError('checks must be an array');
   if (!Array.isArray(pulls)) throw new TypeError('pulls must be an array');
