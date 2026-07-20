@@ -1,5 +1,6 @@
 import { appendFile } from 'node:fs/promises';
 import {
+  attestTrustedMonitorImplementation,
   associateChecksWithPulls,
   checkStreamIdentity,
   commitStatusStreamIdentity,
@@ -23,6 +24,7 @@ import {
   findTrustedMonitorCheckRecovery,
   githubRetryDelayMs,
   isTrustedMonitorRecoveryPolicy,
+  isEligibleTrustedMonitorImplementationCandidate,
   latestByIdentity,
   partitionWorkflowHealth,
   rateHeadroomDecision,
@@ -56,6 +58,8 @@ const rateReserve = boundedInteger(
   2000,
 );
 const apiConcurrency = boundedInteger(process.env.SSAI_RELEASE_MONITOR_API_CONCURRENCY, 6, 1, 10);
+const maxMonitorImplementationAttestations = 32;
+const maxRecoveryAncestorComparisons = 64;
 const nowMs = Date.now();
 const stuckMs = stuckMinutes * 60_000;
 const cutoffMs = nowMs - (lookbackHours * 60 * 60_000);
@@ -411,6 +415,14 @@ async function inspectRepository(repo) {
     defaultCommitShas,
     policies: verifiedForwardFixPolicies,
   });
+  await attestTrustedMonitorRecoverySuccesses({
+    repoName: repo.name,
+    runs: recentRuns,
+    currentHeadSha: headSha,
+    defaultBranch,
+    defaultCommitShas,
+    policies: verifiedForwardFixPolicies,
+  });
   const pullByNumber = new Map(recentPulls.map((pull) => [Number(pull.number), pull]));
   const workflowHealth = await mapLimit(workflows, 5, async (workflow) => {
     const recentCandidates = recentRuns
@@ -667,12 +679,12 @@ async function collectWorkflows(repoName) {
   throw truncationError(repoName, 'workflows', pageLimits.workflows);
 }
 
-async function collectWorkflowSource(repoName, workflowPath, ref) {
+async function collectWorkflowSource(repoName, workflowPath, ref, allowMissing = false) {
   const path = String(workflowPath || '').trim();
   if (!/^\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml$/.test(path)) {
     throw new Error(repoName + ' no-history policy references an unsafe workflow path.');
   }
-  return collectRepositorySource(repoName, path, ref, false);
+  return collectRepositorySource(repoName, path, ref, allowMissing);
 }
 
 async function collectMonitorImplementationSource(repoName, sourcePath, ref, allowMissing = false) {
@@ -710,7 +722,16 @@ async function resolveForwardFixRecoveryPolicies(repoName, workflows, headSha) {
       failures.push(issue(repoName, policy.path, 'configured recovery policy workflow is missing or inactive'));
       return;
     }
-    const workflowSource = await collectWorkflowSource(repoName, policy.path, headSha);
+    const trustedMonitorConfigured = policy.monitorSelfRecoveryContract === 'release-health-monitor-v1';
+    const [workflowSource, currentMonitorScriptSource, currentMonitorUtilsSource] = await Promise.all([
+      collectWorkflowSource(repoName, policy.path, headSha),
+      trustedMonitorConfigured
+        ? collectMonitorImplementationSource(repoName, 'scripts/verify-org-release-health.mjs', headSha)
+        : Promise.resolve(null),
+      trustedMonitorConfigured
+        ? collectMonitorImplementationSource(repoName, 'scripts/release-health-monitor-utils.mjs', headSha)
+        : Promise.resolve(null),
+    ]);
     const auditedOriginSources = new Map();
     const auditedHeads = [...new Set((policy.auditedMonitorOrigins || []).map((origin) => origin.headSha))];
     await mapLimit(auditedHeads, 2, async (originHeadSha) => {
@@ -736,6 +757,11 @@ async function resolveForwardFixRecoveryPolicies(repoName, workflows, headSha) {
       policy,
       workflowSource,
       auditedOriginSources,
+      currentHeadSha: headSha,
+      monitorImplementationSource: trustedMonitorConfigured ? {
+        scriptSource: currentMonitorScriptSource,
+        utilsSource: currentMonitorUtilsSource,
+      } : undefined,
     });
     if (!resolved) {
       failures.push(issue(repoName, policy.path, 'configured recovery policy failed its exact workflow identity or source-digest verification'));
@@ -760,17 +786,25 @@ async function addVerifiedForwardFixOriginShas({
       const eligibleOriginEvents = policy
         ? new Set([...policy.failedEvents, ...(policy.monitorSelfRecoveryEvents || [])])
         : null;
+      const conclusion = String(run.conclusion || '');
+      const recoveryRelevantConclusion = failedConclusions.has(conclusion)
+        || (isTrustedMonitorRecoveryPolicy(policy) && conclusion === 'success');
       return policy
         && run.head_branch === defaultBranch
         && run.head_repository?.full_name === policy.headRepository
         && eligibleOriginEvents.has(String(run.event || ''))
         && run.status === 'completed'
-        && failedConclusions.has(String(run.conclusion || ''))
+        && recoveryRelevantConclusion
         && /^[a-f0-9]{40}$/i.test(String(run.head_sha || ''))
         && run.head_sha !== currentHeadSha
         && !defaultCommitShas.has(run.head_sha);
     })
-    .map((run) => String(run.head_sha)))];
+    .map((run) => String(run.head_sha).toLowerCase()))];
+  if (candidates.length > maxRecoveryAncestorComparisons) {
+    throw new Error(repoName + ' has ' + candidates.length + ' recovery ancestor SHAs, exceeding the bounded limit of '
+      + maxRecoveryAncestorComparisons + '. The scan is incomplete and is failing closed.');
+  }
+  ensureAdditionalRequestBudget(candidates.length, repoName + ' recovery ancestor verification');
   await mapLimit(candidates, 2, async (originSha) => {
     const comparison = await api('/repos/' + owner + '/' + repoName + '/compare/'
       + encodeURIComponent(originSha) + '...' + encodeURIComponent(currentHeadSha));
@@ -780,6 +814,57 @@ async function addVerifiedForwardFixOriginShas({
       defaultCommitShas.add(originSha);
     }
   });
+}
+
+async function attestTrustedMonitorRecoverySuccesses({
+  repoName,
+  runs,
+  currentHeadSha,
+  defaultBranch,
+  defaultCommitShas,
+  policies,
+}) {
+  const candidates = new Map();
+  for (const run of runs) {
+    const policy = policies.get(Number(run.workflow_id));
+    const headSha = String(run.head_sha || '').toLowerCase();
+    if (headSha === String(currentHeadSha || '').toLowerCase()
+      || !isEligibleTrustedMonitorImplementationCandidate(run, policy, {
+        defaultBranch,
+        defaultCommitShas,
+      })) continue;
+    candidates.set(String(policy.workflowId) + ':' + headSha, { policy, headSha, run });
+  }
+  if (candidates.size > maxMonitorImplementationAttestations) {
+    throw new Error(repoName + ' has ' + candidates.size + ' trusted monitor implementation SHAs, exceeding the bounded limit of '
+      + maxMonitorImplementationAttestations + '. The scan is incomplete and is failing closed.');
+  }
+  ensureAdditionalRequestBudget(candidates.size * 3, repoName + ' trusted monitor source attestation');
+  const attestations = await mapLimit([...candidates.values()], 2, async ({ policy, headSha, run }) => {
+    const [workflowSource, scriptSource, utilsSource] = await Promise.all([
+      collectWorkflowSource(repoName, policy.path, headSha, true),
+      collectMonitorImplementationSource(repoName, 'scripts/verify-org-release-health.mjs', headSha, true),
+      collectMonitorImplementationSource(repoName, 'scripts/release-health-monitor-utils.mjs', headSha, true),
+    ]);
+    return { policy, headSha, run, workflowSource, scriptSource, utilsSource };
+  });
+  for (const attestation of attestations) {
+    const complete = Buffer.isBuffer(attestation.workflowSource)
+      && Buffer.isBuffer(attestation.scriptSource)
+      && Buffer.isBuffer(attestation.utilsSource);
+    const accepted = complete && attestTrustedMonitorImplementation(attestation.policy, {
+      run: attestation.run,
+      defaultBranch,
+      defaultCommitShas,
+      workflowSource: attestation.workflowSource,
+      scriptSource: attestation.scriptSource,
+      utilsSource: attestation.utilsSource,
+    });
+    if (!accepted) {
+      warnings.push(repoName + ' trusted monitor success at ' + attestation.headSha
+        + ' cannot recover across current main because its exact three-file implementation is missing or changed.');
+    }
+  }
 }
 
 async function collectRecentCommits(repoName, defaultBranch) {
@@ -1395,6 +1480,21 @@ function enforceRequestBudget(label) {
   }
   if (requestStats.rate_remaining !== null && requestStats.rate_remaining <= rateReserve) {
     throw new Error('GitHub API rate-limit reserve reached before ' + label + '. The scan is incomplete and is failing closed.');
+  }
+}
+
+function ensureAdditionalRequestBudget(requestCount, label) {
+  if (!Number.isSafeInteger(requestCount) || requestCount < 0) {
+    throw new TypeError('additional request count must be a non-negative integer');
+  }
+  if (requestStats.requests + requestCount > maxRequests) {
+    throw new Error('GitHub API request budget cannot reserve ' + requestCount + ' requests for ' + label
+      + ' at ' + requestStats.requests + '/' + maxRequests + '. The scan is incomplete and is failing closed.');
+  }
+  if (requestStats.rate_remaining !== null
+    && requestStats.rate_remaining - requestCount < rateReserve) {
+    throw new Error('GitHub API rate-limit reserve cannot cover ' + requestCount + ' requests for ' + label
+      + '. The scan is incomplete and is failing closed.');
   }
 }
 

@@ -118,6 +118,10 @@ requireText(releaseHealthVerifier, 'source_run_attempt:', 'exact current run-att
 requireText(releaseHealthVerifier, 'auditedMonitorOrigins:', 'immutable audited monitor-origin policy');
 requireText(releaseHealthVerifier, 'collectMonitorImplementationSource(', 'historical monitor implementation source verification');
 requireText(releaseHealthVerifier, 'auditedOriginSources', 'historical workflow/script/utils digest handoff');
+requireText(releaseHealthVerifier, 'attestTrustedMonitorRecoverySuccesses(', 'durable cross-SHA monitor recovery attestation');
+requireText(releaseHealthVerifier, 'maxMonitorImplementationAttestations = 32', 'bounded monitor implementation attestation inventory');
+requireText(releaseHealthVerifier, 'maxRecoveryAncestorComparisons = 64', 'bounded recovery ancestor verification inventory');
+requireText(releaseHealthVerifier, 'ensureAdditionalRequestBudget(', 'source-attestation request-budget reservation');
 requireText(releaseHealthVerifier, '29638546298', 'first exact legacy monitor run identity');
 requireText(releaseHealthVerifier, '29704911896', 'source-verified incident failure identity');
 requireText(releaseHealthVerifier, '29705959736', 'rate-gated incident failure identity');
