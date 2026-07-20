@@ -105,6 +105,36 @@ requireText(releaseHealthVerifier, 'allowed_no_history_evidence', 'auditable no-
 requireText(releaseHealthVerifier, 'verifyForwardFixRecoveryPolicy(', 'source-hashed current-main forward-fix policy');
 requireText(releaseHealthVerifier, 'findForwardFixWorkflowRun(', 'bounded cross-trigger workflow forward-fix recovery');
 requireText(releaseHealthVerifier, 'findForwardFixCheck(', 'bounded cross-trigger check forward-fix recovery');
+requireText(
+  releaseHealthVerifier,
+  "['SSAI_Production_QA:299211649', {",
+  'Production QA scheduled-to-manual forward-fix policy',
+);
+requireText(
+  releaseHealthVerifier,
+  "sourceSha256: '3df3ef39cc333fe5c3858ebf5352b9d5810324b187d41db599f826005f864c5a'",
+  'Production QA exact current-main canary source digest',
+);
+requireText(
+  releaseHealthVerifier,
+  "jobNames: ['End-to-end service delivery canary']",
+  'Production QA failed production job boundary',
+);
+requireText(
+  releaseHealthVerifier,
+  "['SSAI_RR:289080389', {",
+  'R&R push-to-manual forward-fix policy',
+);
+requireText(
+  releaseHealthVerifier,
+  "sourceSha256: '203a0ca93974b02a3b97b0ce52f642c991050d8051391f795712e5f0a6d22faa'",
+  'R&R exact current-main deployment source digest',
+);
+requireText(
+  releaseHealthVerifier,
+  "jobNames: ['production-schema-preflight']",
+  'R&R failed production job boundary',
+);
 requireText(releaseHealthVerifier, 'findProvisionalForwardFixWorkflowRecovery(', 'bounded forward-fix workflow self-latch');
 requireText(releaseHealthVerifier, 'findProvisionalForwardFixCheckRecovery(', 'bounded forward-fix check self-latch');
 requireText(releaseHealthVerifier, 'findTrustedMonitorCheckRecovery(', 'source-verified monitor check recovery');
