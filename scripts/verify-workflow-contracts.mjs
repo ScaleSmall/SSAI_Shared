@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
+import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -13,6 +14,23 @@ const requireText = (source, expected, description) => {
   if (!source.includes(expected)) {
     throw new Error(`Missing ${description}: ${expected}`);
   }
+};
+
+const assertRecoveryPolicyFields = (block, key, expectedFields) => {
+  for (const [expected, description] of expectedFields) {
+    requireText(block, expected, `${key} ${description}`);
+  }
+};
+
+const requireRecoveryPolicyBlock = (source, key, expectedFields) => {
+  const marker = `['${key}', {`;
+  const start = source.indexOf(marker);
+  if (start < 0) throw new Error(`Missing recovery policy: ${key}`);
+  const end = source.indexOf('\n  }],', start);
+  if (end < 0) throw new Error(`Unterminated recovery policy: ${key}`);
+  const block = source.slice(start, end + '\n  }],'.length);
+  assertRecoveryPolicyFields(block, key, expectedFields);
+  return block;
 };
 
 const rejectPattern = (source, pattern, description) => {
@@ -105,6 +123,41 @@ requireText(releaseHealthVerifier, 'allowed_no_history_evidence', 'auditable no-
 requireText(releaseHealthVerifier, 'verifyForwardFixRecoveryPolicy(', 'source-hashed current-main forward-fix policy');
 requireText(releaseHealthVerifier, 'findForwardFixWorkflowRun(', 'bounded cross-trigger workflow forward-fix recovery');
 requireText(releaseHealthVerifier, 'findForwardFixCheck(', 'bounded cross-trigger check forward-fix recovery');
+const productionQaPolicyFields = [
+  ['workflowId: 299211649', 'workflow identity'],
+  ["path: '.github/workflows/production-service-canaries.yml'", 'workflow path'],
+  ["sourceSha256: '3df3ef39cc333fe5c3858ebf5352b9d5810324b187d41db599f826005f864c5a'", 'current-main source digest'],
+  ["headRepository: 'ScaleSmall/SSAI_Production_QA'", 'repository boundary'],
+  ["failedEvents: ['schedule']", 'failed trigger boundary'],
+  ["recoveryEvents: ['workflow_dispatch']", 'recovery trigger boundary'],
+  ["jobNames: ['End-to-end service delivery canary']", 'failed production job boundary'],
+  ["recoveryDisplayTitles: ['Production Service Delivery Canaries']", 'recovery run identity'],
+];
+const productionQaPolicyBlock = requireRecoveryPolicyBlock(
+  releaseHealthVerifier,
+  'SSAI_Production_QA:299211649',
+  productionQaPolicyFields,
+);
+const rrPolicyFields = [
+  ['workflowId: 289080389', 'workflow identity'],
+  ["path: '.github/workflows/deploy-supabase-functions.yml'", 'workflow path'],
+  ["sourceSha256: '203a0ca93974b02a3b97b0ce52f642c991050d8051391f795712e5f0a6d22faa'", 'current-main source digest'],
+  ["headRepository: 'ScaleSmall/SSAI_RR'", 'repository boundary'],
+  ["failedEvents: ['push']", 'failed trigger boundary'],
+  ["recoveryEvents: ['workflow_dispatch']", 'recovery trigger boundary'],
+  ["jobNames: ['production-schema-preflight']", 'failed production job boundary'],
+  ["recoveryDisplayTitles: ['Deploy R&R Supabase Functions']", 'recovery run identity'],
+];
+requireRecoveryPolicyBlock(releaseHealthVerifier, 'SSAI_RR:289080389', rrPolicyFields);
+assert.throws(
+  () => assertRecoveryPolicyFields(
+    productionQaPolicyBlock.replace("recoveryEvents: ['workflow_dispatch']", "recoveryEvents: ['push']"),
+    'SSAI_Production_QA:299211649',
+    productionQaPolicyFields,
+  ),
+  /recovery trigger boundary/,
+  'a mutated recovery event must fail the policy contract',
+);
 requireText(releaseHealthVerifier, 'findProvisionalForwardFixWorkflowRecovery(', 'bounded forward-fix workflow self-latch');
 requireText(releaseHealthVerifier, 'findProvisionalForwardFixCheckRecovery(', 'bounded forward-fix check self-latch');
 requireText(releaseHealthVerifier, 'findTrustedMonitorCheckRecovery(', 'source-verified monitor check recovery');

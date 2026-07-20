@@ -178,6 +178,30 @@ const auditedMonitorOrigin = (
   };
 };
 const forwardFixRecoveryPolicies = new Map([
+  // The scheduled service canary failed on the pre-fix main commit. The exact
+  // current-main manual run exercised both production jobs successfully.
+  ['SSAI_Production_QA:299211649', {
+    workflowId: 299211649,
+    path: '.github/workflows/production-service-canaries.yml',
+    sourceSha256: '3df3ef39cc333fe5c3858ebf5352b9d5810324b187d41db599f826005f864c5a',
+    headRepository: 'ScaleSmall/SSAI_Production_QA',
+    failedEvents: ['schedule'],
+    recoveryEvents: ['workflow_dispatch'],
+    jobNames: ['End-to-end service delivery canary'],
+    recoveryDisplayTitles: ['Production Service Delivery Canaries'],
+  }],
+  // The automatic R&R deployment failed before deployment on the pre-fix main
+  // commit. The exact current-main manual run completed the same release path.
+  ['SSAI_RR:289080389', {
+    workflowId: 289080389,
+    path: '.github/workflows/deploy-supabase-functions.yml',
+    sourceSha256: '203a0ca93974b02a3b97b0ce52f642c991050d8051391f795712e5f0a6d22faa',
+    headRepository: 'ScaleSmall/SSAI_RR',
+    failedEvents: ['push'],
+    recoveryEvents: ['workflow_dispatch'],
+    jobNames: ['production-schema-preflight'],
+    recoveryDisplayTitles: ['Deploy R&R Supabase Functions'],
+  }],
   ['SSAI_PoW:315750527', {
     workflowId: 315750527,
     path: '.github/workflows/n8n-production-exactness.yml',
