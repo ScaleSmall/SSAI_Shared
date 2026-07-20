@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
+  attestTrustedMonitorImplementation,
   associateChecksWithPulls,
   checkStreamIdentity,
   commitStatusStreamIdentity,
@@ -30,6 +31,7 @@ import {
   findTrustedMonitorWorkflowRecovery,
   githubRetryDelayMs,
   isTrustedMonitorRecoveryPolicy,
+  isEligibleTrustedMonitorImplementationCandidate,
   latestByIdentity,
   partitionWorkflowHealth,
   recordActivityTime,
@@ -509,6 +511,15 @@ const monitorWorkflow = {
 };
 const monitorOldSha = '3'.repeat(40);
 const monitorCurrentSha = '4'.repeat(40);
+const monitorCurrentScriptSource = Buffer.from('console.log("current monitor");\n', 'utf8');
+const monitorCurrentUtilsSource = Buffer.from('export const currentMonitor = true;\n', 'utf8');
+const monitorVerificationContext = {
+  currentHeadSha: monitorCurrentSha,
+  monitorImplementationSource: {
+    scriptSource: monitorCurrentScriptSource,
+    utilsSource: monitorCurrentUtilsSource,
+  },
+};
 const auditedHistoricalWorkflowSource = Buffer.from('name: legacy monitor\non:\n  workflow_dispatch:\n', 'utf8');
 const auditedHistoricalScriptSource = Buffer.from('console.log("legacy monitor");\n', 'utf8');
 const auditedHistoricalUtilsSource = Buffer.from('export const legacy = true;\n', 'utf8');
@@ -556,6 +567,7 @@ const auditedOriginSources = new Map([[monitorOldSha, {
   utilsSource: auditedHistoricalUtilsSource,
 }]]);
 const monitorPolicy = verifyForwardFixRecoveryPolicy({
+  ...monitorVerificationContext,
   workflow: monitorWorkflow,
   workflowSource: monitorSource,
   policy: monitorPolicyInput,
@@ -563,18 +575,109 @@ const monitorPolicy = verifyForwardFixRecoveryPolicy({
 });
 assert.ok(monitorPolicy, 'trusted monitor recovery requires an exact source-hashed policy');
 assert.equal(isTrustedMonitorRecoveryPolicy(monitorPolicy), true, 'the exact monitor policy must enter trusted monitor recovery');
+assert.deepEqual(
+  [...monitorPolicy.attestedMonitorHeadShas],
+  [monitorCurrentSha],
+  'a verified policy must initially trust only the exact current implementation SHA',
+);
+const monitorEquivalentAncestorSha = '6'.repeat(40);
+const monitorChangedAncestorSha = '7'.repeat(40);
+const monitorDefaultCommitShas = new Set([
+  monitorOldSha,
+  monitorEquivalentAncestorSha,
+  monitorChangedAncestorSha,
+  monitorCurrentSha,
+]);
+const monitorEquivalentAncestorRun = {
+  id: 802,
+  run_attempt: 1,
+  workflow_id: monitorWorkflow.id,
+  head_branch: 'main',
+  head_sha: monitorEquivalentAncestorSha,
+  head_repository: { full_name: 'ScaleSmall/SSAI_Shared' },
+  event: 'workflow_dispatch',
+  display_title: 'Release health monitor [incident:168h]',
+  status: 'completed',
+  conclusion: 'success',
+  created_at: '2026-07-18T09:20:00Z',
+};
+assert.equal(attestTrustedMonitorImplementation(monitorPolicy, {
+  run: monitorEquivalentAncestorRun,
+  defaultBranch: 'main',
+  defaultCommitShas: monitorDefaultCommitShas,
+  workflowSource: monitorSource,
+  scriptSource: monitorCurrentScriptSource,
+  utilsSource: monitorCurrentUtilsSource,
+}), true, 'an exact three-file implementation match may attest a default-main ancestor');
+assert.equal(monitorPolicy.attestedMonitorHeadShas.has(monitorEquivalentAncestorSha), true);
+for (const [label, candidateSha, runMutation, defaultCommitShas] of [
+  ['fork', '8'.repeat(40), { head_repository: { full_name: 'untrusted/fork' } }, new Set(['8'.repeat(40)])],
+  ['non-default branch', '9'.repeat(40), { head_branch: 'feature' }, new Set(['9'.repeat(40)])],
+  ['arbitrary workflow', 'a'.repeat(40), { workflow_id: 123 }, new Set(['a'.repeat(40)])],
+  ['non-ancestor commit', 'b'.repeat(40), {}, new Set([monitorCurrentSha])],
+]) {
+  assert.equal(attestTrustedMonitorImplementation(monitorPolicy, {
+    run: { ...monitorEquivalentAncestorRun, ...runMutation, id: 805, head_sha: candidateSha },
+    defaultBranch: 'main',
+    defaultCommitShas,
+    workflowSource: monitorSource,
+    scriptSource: monitorCurrentScriptSource,
+    utilsSource: monitorCurrentUtilsSource,
+  }), false, label + ' success must not receive source attestation even when its three files match');
+  assert.equal(monitorPolicy.attestedMonitorHeadShas.has(candidateSha), false);
+}
+assert.equal(attestTrustedMonitorImplementation(monitorPolicy, {
+  run: { ...monitorEquivalentAncestorRun, id: 803, head_sha: monitorChangedAncestorSha },
+  defaultBranch: 'main',
+  defaultCommitShas: monitorDefaultCommitShas,
+  workflowSource: monitorSource,
+  scriptSource: Buffer.from('console.log("changed ancestor");\n', 'utf8'),
+  utilsSource: monitorCurrentUtilsSource,
+}), false, 'a changed default-main implementation must not be attested');
+for (const [label, mutation] of [
+  ['workflow', { workflowSource: monitorSource + '# changed\n' }],
+  ['script', { scriptSource: Buffer.from('console.log("changed");\n', 'utf8') }],
+  ['utils', { utilsSource: Buffer.from('export const changed = true;\n', 'utf8') }],
+  ['missing workflow', { workflowSource: null }],
+  ['missing script', { scriptSource: null }],
+  ['missing utils', { utilsSource: null }],
+]) {
+  const rejectedSha = createHash('sha1').update(label).digest('hex');
+  const rejectedDefaultCommitShas = new Set([...monitorDefaultCommitShas, rejectedSha]);
+  assert.equal(attestTrustedMonitorImplementation(monitorPolicy, {
+    run: { ...monitorEquivalentAncestorRun, id: 804, head_sha: rejectedSha },
+    defaultBranch: 'main',
+    defaultCommitShas: rejectedDefaultCommitShas,
+    workflowSource: monitorSource,
+    scriptSource: monitorCurrentScriptSource,
+    utilsSource: monitorCurrentUtilsSource,
+    ...mutation,
+  }), false, label + ' mismatch or absence must fail closed');
+  assert.equal(monitorPolicy.attestedMonitorHeadShas.has(rejectedSha), false);
+}
 assert.equal(verifyForwardFixRecoveryPolicy({
+  workflow: monitorWorkflow,
+  workflowSource: monitorSource,
+  policy: monitorPolicyInput,
+  auditedOriginSources,
+  currentHeadSha: monitorCurrentSha,
+  monitorImplementationSource: { scriptSource: monitorCurrentScriptSource, utilsSource: null },
+}), null, 'a trusted current policy must fail closed when any implementation source is missing');
+assert.equal(verifyForwardFixRecoveryPolicy({
+  ...monitorVerificationContext,
   workflow: monitorWorkflow,
   workflowSource: monitorSource,
   policy: { ...monitorPolicyInput, monitorSelfRecoveryEvents: [] },
   auditedOriginSources,
 }), null, 'an empty trusted monitor event set must fail closed');
 assert.equal(verifyForwardFixRecoveryPolicy({
+  ...monitorVerificationContext,
   workflow: monitorWorkflow,
   workflowSource: monitorSource,
   policy: monitorPolicyInput,
 }), null, 'audited monitor origins must fail closed when historical source evidence is unavailable');
 assert.equal(verifyForwardFixRecoveryPolicy({
+  ...monitorVerificationContext,
   workflow: monitorWorkflow,
   workflowSource: monitorSource,
   policy: monitorPolicyInput,
@@ -592,6 +695,7 @@ const absentUtilsPolicyInput = {
   }],
 };
 assert.ok(verifyForwardFixRecoveryPolicy({
+  ...monitorVerificationContext,
   workflow: monitorWorkflow,
   workflowSource: monitorSource,
   policy: absentUtilsPolicyInput,
@@ -602,12 +706,14 @@ assert.ok(verifyForwardFixRecoveryPolicy({
   }]]),
 }), 'an audited historical absence must be verified as an exact null source');
 assert.equal(verifyForwardFixRecoveryPolicy({
+  ...monitorVerificationContext,
   workflow: monitorWorkflow,
   workflowSource: monitorSource,
   policy: absentUtilsPolicyInput,
   auditedOriginSources,
 }), null, 'a file appearing where historical absence was asserted must invalidate the policy');
 assert.equal(verifyForwardFixRecoveryPolicy({
+  ...monitorVerificationContext,
   workflow: monitorWorkflow,
   workflowSource: monitorSource,
   policy: {
@@ -622,7 +728,7 @@ const monitorSearch = {
   policy: monitorPolicy,
   currentHeadSha: monitorCurrentSha,
   defaultBranch: 'main',
-  defaultCommitShas: new Set([monitorOldSha, monitorCurrentSha]),
+  defaultCommitShas: monitorDefaultCommitShas,
 };
 const scheduledMonitorFailure = {
   ...failedRun,
@@ -682,9 +788,9 @@ assert.equal(
     798,
     1,
     monitorSearch,
-  ),
-  null,
-  'a later six-hour scan must not suppress the leading edge of an earlier six-hour window',
+  )?.id,
+  798,
+  'the exact current in-progress six-hour scan may provisionally supersede an earlier equal-width scan',
 );
 assert.equal(
   findProvisionalTrustedMonitorWorkflowRecovery(
@@ -773,6 +879,130 @@ assert.equal(
   null,
   'an out-of-contract scan title must fail closed',
 );
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    manualIncidentMonitorFailure,
+    [manualIncidentMonitorFailure, currentIncidentMonitorRun],
+    799,
+    2,
+    monitorSearch,
+  )?.id,
+  799,
+  'a lone shifted incident failure may be provisionally recovered by the exact current equal-width incident rescan',
+);
+const repeatedIncidentMonitorFailure = {
+  ...manualIncidentMonitorFailure,
+  id: 721,
+  created_at: '2026-07-18T09:05:00Z',
+};
+for (const origin of [manualIncidentMonitorFailure, repeatedIncidentMonitorFailure]) {
+  assert.equal(
+    findProvisionalTrustedMonitorWorkflowRecovery(
+      origin,
+      [manualIncidentMonitorFailure, repeatedIncidentMonitorFailure, currentIncidentMonitorRun],
+      799,
+      2,
+      monitorSearch,
+    )?.id,
+    799,
+    'repeated equal-width incident failures must not form a permanent self-recovery deadlock',
+  );
+}
+const chainedContinuousMonitorFailure = {
+  ...manualContinuousMonitorFailure,
+  id: 722,
+  created_at: '2026-07-18T09:06:00Z',
+};
+for (const origin of [manualIncidentMonitorFailure, chainedContinuousMonitorFailure]) {
+  assert.equal(
+    findProvisionalTrustedMonitorWorkflowRecovery(
+      origin,
+      [manualIncidentMonitorFailure, chainedContinuousMonitorFailure, currentIncidentMonitorRun],
+      799,
+      2,
+      monitorSearch,
+    )?.id,
+    799,
+    'an incident failure followed by a continuous failure must be recoverable by the exact current incident rescan',
+  );
+}
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    manualIncidentMonitorFailure,
+    [manualIncidentMonitorFailure, { ...currentIncidentMonitorRun, status: 'completed', conclusion: 'failure' }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a completed current run must never receive provisional self-recovery authority',
+);
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    manualIncidentMonitorFailure,
+    [manualIncidentMonitorFailure, { ...currentIncidentMonitorRun, status: 'queued' }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a queued run has not begun the independent rescan and must not receive provisional recovery authority',
+);
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    manualIncidentMonitorFailure,
+    [manualIncidentMonitorFailure, { ...currentIncidentMonitorRun, head_sha: monitorOldSha }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a run that is not executing the exact verified current-main source must fail closed',
+);
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    manualIncidentMonitorFailure,
+    [manualIncidentMonitorFailure, { ...currentIncidentMonitorRun, head_sha: monitorEquivalentAncestorSha }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'an attested ancestor may provide terminal recovery but must never impersonate the current provisional run',
+);
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    manualIncidentMonitorFailure,
+    [manualIncidentMonitorFailure, { ...currentIncidentMonitorRun, display_title: 'Release health monitor [incident:167h]' }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a narrower incident window must not provisionally recover a broader incident failure',
+);
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    { ...manualIncidentMonitorFailure, workflow_id: 123 },
+    [currentIncidentMonitorRun],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'an arbitrary workflow failure must remain outside provisional trusted monitor recovery',
+);
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    { ...manualIncidentMonitorFailure, head_sha: '5'.repeat(40) },
+    [currentIncidentMonitorRun],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a failure whose source commit is not verified on the default branch must fail closed',
+);
 const completedIncidentMonitorRun = {
   ...currentIncidentMonitorRun,
   id: 800,
@@ -781,6 +1011,36 @@ const completedIncidentMonitorRun = {
   conclusion: 'success',
   created_at: '2026-07-18T09:20:00Z',
 };
+const ancestorIncidentMonitorSuccess = {
+  ...completedIncidentMonitorRun,
+  id: 802,
+  head_sha: monitorEquivalentAncestorSha,
+};
+assert.equal(isEligibleTrustedMonitorImplementationCandidate(
+  ancestorIncidentMonitorSuccess,
+  monitorPolicy,
+  { defaultBranch: 'main', defaultCommitShas: monitorSearch.defaultCommitShas },
+), true, 'an exact successful monitor run on an attested default-main ancestor is an eligible source candidate');
+for (const mutation of [
+  { workflow_id: 123 },
+  { head_repository: { full_name: 'untrusted/fork' } },
+  { head_branch: 'feature' },
+  { event: 'push' },
+  { display_title: 'unverified monitor title' },
+  { status: 'in_progress', conclusion: null },
+  { conclusion: 'failure' },
+]) {
+  assert.equal(isEligibleTrustedMonitorImplementationCandidate(
+    { ...ancestorIncidentMonitorSuccess, ...mutation },
+    monitorPolicy,
+    { defaultBranch: 'main', defaultCommitShas: monitorSearch.defaultCommitShas },
+  ), false, 'arbitrary, forked, non-default, or unsuccessful monitor candidates must fail closed');
+}
+assert.equal(isEligibleTrustedMonitorImplementationCandidate(
+  ancestorIncidentMonitorSuccess,
+  monitorPolicy,
+  { defaultBranch: 'main', defaultCommitShas: new Set([monitorCurrentSha]) },
+), false, 'matching source bytes on a non-default commit must not authorize ancestor recovery');
 const auditedLegacyMonitorFailure = {
   ...manualContinuousMonitorFailure,
   id: 704,
@@ -829,9 +1089,9 @@ assert.equal(
     798,
     1,
     monitorSearch,
-  ),
-  null,
-  'a narrow continuous run must not cover the audited legacy six-hour window',
+  )?.id,
+  798,
+  'an exact audited six-hour origin may be provisionally recovered by the current equal-width scan',
 );
 const auditedPriorIncidentFailure = {
   ...manualIncidentMonitorFailure,
@@ -857,18 +1117,75 @@ assert.equal(
     799,
     2,
     monitorSearch,
-  ),
-  null,
-  'an unlisted incident origin must retain full sliding-window containment and fail closed',
+  )?.id,
+  799,
+  'a modern source-verified incident origin may use nominal coverage during the exact current rescan',
 );
 assert.equal(
   findTrustedMonitorWorkflowRecovery(
     manualIncidentMonitorFailure,
     [manualIncidentMonitorFailure, completedIncidentMonitorRun],
     monitorSearch,
+  )?.id,
+  800,
+  'a successful exact source-verified incident must durably recover an earlier equal-width incident failure',
+);
+const ancestorIncidentMonitorFailure = {
+  ...manualIncidentMonitorFailure,
+  id: 723,
+  head_sha: monitorEquivalentAncestorSha,
+};
+assert.equal(
+  findTrustedMonitorWorkflowRecovery(
+    ancestorIncidentMonitorFailure,
+    [ancestorIncidentMonitorFailure, ancestorIncidentMonitorSuccess],
+    monitorSearch,
+  )?.id,
+  802,
+  'a successful equivalent implementation at SHA A must durably recover after default main advances to SHA B',
+);
+const laterCurrentContinuousMonitorRun = {
+  ...currentManualContinuousMonitorRun,
+  id: 794,
+  event: 'schedule',
+  created_at: '2026-07-18T09:30:00Z',
+};
+assert.equal(
+  findPolicyBoundWorkflowRecovery(
+    ancestorIncidentMonitorFailure,
+    [ancestorIncidentMonitorFailure, ancestorIncidentMonitorSuccess, laterCurrentContinuousMonitorRun],
+    monitorPolicy,
+    monitorSearch,
+  )?.id,
+  802,
+  'a scheduled six-hour scan at SHA B must inherit the attested SHA A success instead of reopening the old failure',
+);
+assert.equal(
+  findTrustedMonitorWorkflowRecovery(
+    ancestorIncidentMonitorFailure,
+    [ancestorIncidentMonitorFailure, {
+      ...ancestorIncidentMonitorSuccess,
+      id: 803,
+      head_sha: monitorChangedAncestorSha,
+    }],
+    monitorSearch,
   ),
   null,
-  'a shifted 168-hour window must not generically claim full coverage of an earlier incident window',
+  'a default-main ancestor success with changed implementation bytes must not recover across SHAs',
+);
+assert.equal(
+  findTrustedMonitorWorkflowRecovery(
+    manualIncidentMonitorFailure,
+    [manualIncidentMonitorFailure, {
+      ...completedIncidentMonitorRun,
+      id: 801,
+      display_title: 'Release health monitor [incident:167h]',
+      created_at: '2026-07-18T09:21:00Z',
+    }],
+    monitorSearch,
+  ),
+  null,
+  'a successful but narrower incident must not durably recover a broader incident failure',
 );
 assert.equal(
   findTrustedMonitorWorkflowRecovery(
@@ -1028,6 +1345,134 @@ const currentIncidentMonitorCheck = {
   conclusion: null,
   started_at: '2026-07-18T09:10:00Z',
 };
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecovery(
+    incidentMonitorFailedCheck,
+    [incidentMonitorFailedCheck, currentIncidentMonitorCheck],
+    799,
+    2,
+    monitorSearch,
+  )?.id,
+  899,
+  'a lone shifted incident check may be provisionally recovered by the exact current equal-width incident job',
+);
+const repeatedIncidentMonitorFailedCheck = {
+  ...incidentMonitorFailedCheck,
+  id: 820,
+  source_run_id: 721,
+  started_at: '2026-07-18T09:05:00Z',
+};
+for (const origin of [incidentMonitorFailedCheck, repeatedIncidentMonitorFailedCheck]) {
+  assert.equal(
+    findProvisionalTrustedMonitorCheckRecovery(
+      origin,
+      [incidentMonitorFailedCheck, repeatedIncidentMonitorFailedCheck, currentIncidentMonitorCheck],
+      799,
+      2,
+      monitorSearch,
+    )?.id,
+    899,
+    'repeated equal-width incident check failures must not form a permanent self-recovery deadlock',
+  );
+}
+const chainedContinuousMonitorFailedCheck = {
+  ...scheduledMonitorFailedCheck,
+  id: 821,
+  source_run_id: 722,
+  event: 'workflow_dispatch',
+  head_sha: monitorCurrentSha,
+  started_at: '2026-07-18T09:06:00Z',
+};
+for (const origin of [incidentMonitorFailedCheck, chainedContinuousMonitorFailedCheck]) {
+  assert.equal(
+    findProvisionalTrustedMonitorCheckRecovery(
+      origin,
+      [incidentMonitorFailedCheck, chainedContinuousMonitorFailedCheck, currentIncidentMonitorCheck],
+      799,
+      2,
+      monitorSearch,
+    )?.id,
+    899,
+    'incident and continuous monitor checks must both be recoverable by the exact current incident job',
+  );
+}
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecovery(
+    incidentMonitorFailedCheck,
+    [incidentMonitorFailedCheck, { ...currentIncidentMonitorCheck, status: 'completed', conclusion: 'failure' }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a completed current check must never receive provisional self-recovery authority',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecovery(
+    incidentMonitorFailedCheck,
+    [incidentMonitorFailedCheck, { ...currentIncidentMonitorCheck, status: 'queued' }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a queued check has not begun the independent rescan and must not receive provisional recovery authority',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecovery(
+    incidentMonitorFailedCheck,
+    [incidentMonitorFailedCheck, { ...currentIncidentMonitorCheck, head_sha: monitorOldSha }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a current check that is not bound to the verified current-main source must fail closed',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecovery(
+    incidentMonitorFailedCheck,
+    [incidentMonitorFailedCheck, { ...currentIncidentMonitorCheck, head_sha: monitorEquivalentAncestorSha }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'an attested ancestor check must never impersonate the exact current provisional check',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecovery(
+    incidentMonitorFailedCheck,
+    [incidentMonitorFailedCheck, { ...currentIncidentMonitorCheck, head_repository: 'untrusted/fork' }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a current check from an unrelated repository stream must fail closed',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecovery(
+    incidentMonitorFailedCheck,
+    [incidentMonitorFailedCheck, { ...currentIncidentMonitorCheck, source_run_display_title: 'Release health monitor [incident:167h]' }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a narrower incident check window must not recover a broader incident check failure',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecovery(
+    { ...incidentMonitorFailedCheck, app: { slug: 'external-provider' } },
+    [currentIncidentMonitorCheck],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'an external-provider check must remain outside provisional trusted monitor recovery',
+);
 const auditedLegacyMonitorFailedCheck = {
   ...scheduledMonitorFailedCheck,
   id: 812,
@@ -1115,6 +1560,98 @@ assert.equal(
 assert.equal(
   findProvisionalTrustedMonitorCheckRecoveryFromRun(
     incidentMonitorFailedCheck,
+    [manualIncidentMonitorFailure, currentIncidentMonitorRun],
+    799,
+    2,
+    monitorSearch,
+  )?.id,
+  799,
+  'the exact current incident run may recover a shifted equal-width check before GitHub indexes its current job',
+);
+for (const origin of [incidentMonitorFailedCheck, repeatedIncidentMonitorFailedCheck]) {
+  assert.equal(
+    findProvisionalTrustedMonitorCheckRecoveryFromRun(
+      origin,
+      [manualIncidentMonitorFailure, repeatedIncidentMonitorFailure, currentIncidentMonitorRun],
+      799,
+      2,
+      monitorSearch,
+    )?.id,
+    799,
+    'repeated equal-width failed checks must not deadlock when only the current run is indexed',
+  );
+}
+for (const origin of [incidentMonitorFailedCheck, chainedContinuousMonitorFailedCheck]) {
+  assert.equal(
+    findProvisionalTrustedMonitorCheckRecoveryFromRun(
+      origin,
+      [manualIncidentMonitorFailure, chainedContinuousMonitorFailure, currentIncidentMonitorRun],
+      799,
+      2,
+      monitorSearch,
+    )?.id,
+    799,
+    'the live incident-to-continuous failure chain must recover even before current check indexing',
+  );
+}
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecoveryFromRun(
+    incidentMonitorFailedCheck,
+    [manualIncidentMonitorFailure, { ...currentIncidentMonitorRun, status: 'completed', conclusion: 'failure' }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a completed current run must not provisionally recover a failed check',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecoveryFromRun(
+    incidentMonitorFailedCheck,
+    [manualIncidentMonitorFailure, currentIncidentMonitorRun],
+    799,
+    1,
+    monitorSearch,
+  ),
+  null,
+  'a prior current-run attempt must not provisionally recover a failed check',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecoveryFromRun(
+    incidentMonitorFailedCheck,
+    [manualIncidentMonitorFailure, { ...currentIncidentMonitorRun, head_sha: monitorOldSha }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a non-current-main workflow run must not provisionally recover a failed check',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecoveryFromRun(
+    incidentMonitorFailedCheck,
+    [manualIncidentMonitorFailure, { ...currentIncidentMonitorRun, head_sha: monitorEquivalentAncestorSha }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'an attested ancestor workflow must never impersonate the exact current provisional run',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecoveryFromRun(
+    incidentMonitorFailedCheck,
+    [manualIncidentMonitorFailure, { ...currentIncidentMonitorRun, head_repository: { full_name: 'untrusted/fork' } }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a workflow run from an unrelated repository stream must not provisionally recover a failed check',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecoveryFromRun(
+    incidentMonitorFailedCheck,
     [manualIncidentMonitorFailure, currentScheduledMonitorRun],
     798,
     1,
@@ -1182,9 +1719,74 @@ assert.equal(
     incidentMonitorFailedCheck,
     [incidentMonitorFailedCheck, completedIncidentMonitorCheck],
     monitorSearch,
+  )?.id,
+  900,
+  'a successful exact source-verified incident job must durably recover an earlier equal-width incident check',
+);
+const ancestorIncidentMonitorFailedCheck = {
+  ...incidentMonitorFailedCheck,
+  id: 822,
+  head_sha: monitorEquivalentAncestorSha,
+};
+const ancestorIncidentMonitorSuccessCheck = {
+  ...completedIncidentMonitorCheck,
+  id: 902,
+  source_run_id: 802,
+  head_sha: monitorEquivalentAncestorSha,
+};
+assert.equal(
+  findTrustedMonitorCheckRecovery(
+    ancestorIncidentMonitorFailedCheck,
+    [ancestorIncidentMonitorFailedCheck, ancestorIncidentMonitorSuccessCheck],
+    monitorSearch,
+  )?.id,
+  902,
+  'an equivalent successful check at SHA A must durably recover after default main advances to SHA B',
+);
+const laterCurrentContinuousMonitorCheck = {
+  ...currentManualContinuousMonitorCheck,
+  id: 896,
+  source_run_id: 794,
+  event: 'schedule',
+  started_at: '2026-07-18T09:30:00Z',
+};
+assert.equal(
+  findPolicyBoundCheckRecovery(
+    ancestorIncidentMonitorFailedCheck,
+    [ancestorIncidentMonitorFailedCheck, ancestorIncidentMonitorSuccessCheck, laterCurrentContinuousMonitorCheck],
+    monitorPolicy,
+    monitorSearch,
+  )?.id,
+  902,
+  'a scheduled six-hour check at SHA B must inherit the attested SHA A success instead of reopening the old check failure',
+);
+assert.equal(
+  findTrustedMonitorCheckRecovery(
+    ancestorIncidentMonitorFailedCheck,
+    [ancestorIncidentMonitorFailedCheck, {
+      ...ancestorIncidentMonitorSuccessCheck,
+      id: 903,
+      head_sha: monitorChangedAncestorSha,
+    }],
+    monitorSearch,
   ),
   null,
-  'a completed shifted incident job must not generically suppress an earlier incident check',
+  'a changed-implementation ancestor check must not recover across SHAs',
+);
+assert.equal(
+  findTrustedMonitorCheckRecovery(
+    incidentMonitorFailedCheck,
+    [incidentMonitorFailedCheck, {
+      ...completedIncidentMonitorCheck,
+      id: 901,
+      source_run_id: 801,
+      source_run_display_title: 'Release health monitor [incident:167h]',
+      started_at: '2026-07-18T09:21:00Z',
+    }],
+    monitorSearch,
+  ),
+  null,
+  'a successful but narrower incident job must not durably recover a broader incident check failure',
 );
 assert.equal(
   findTrustedMonitorCheckRecovery(
