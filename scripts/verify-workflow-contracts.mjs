@@ -98,20 +98,63 @@ requireText(releaseHealth, 'cancel-in-progress: false', 'non-cancelling release-
 requireText(releaseHealth, 'runs-on: ubuntu-24.04', 'pinned release-health runner');
 requireText(releaseHealth, 'persist-credentials: false', 'release-health checkout credential isolation');
 requireText(releaseHealth, "node-version: '24'", 'release-health Node runtime');
-requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SCALESMALL_PAT }}', 'release-health organization token source');
+requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SSAI_RELEASE_MONITOR_READ_TOKEN }}', 'dedicated release-health read token source');
+rejectPattern(releaseHealth, /SSAI_RELEASE_MONITOR_GITHUB_TOKEN:\s*\$\{\{\s*secrets\.SCALESMALL_PAT\s*\}\}/, 'legacy shared PAT as the release-health token');
+requireText(releaseHealth, 'environment:\n      name: release-health-monitor', 'protected release-health environment binding');
+requireText(
+  releaseHealth,
+  "if: ${{ github.event_name != 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}",
+  'server-side default-branch manual dispatch gate',
+);
+requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256: ${{ secrets.SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256 }}', 'protected expected-inventory attestation');
+requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_STATE_HMAC_KEY: ${{ secrets.SSAI_RELEASE_MONITOR_STATE_HMAC_KEY }}', 'dedicated protected state HMAC key');
+requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_STATE_HMAC_EPOCH: v1', 'explicit state HMAC epoch');
+const verifyJobHeader = releaseHealth.slice(
+  releaseHealth.indexOf('  verify:\n'),
+  releaseHealth.indexOf('    steps:\n', releaseHealth.indexOf('  verify:\n')),
+);
+rejectPattern(verifyJobHeader, /secrets\./, 'fleet secrets exposed to job-level actions');
+for (const secretName of [
+  'SSAI_RELEASE_MONITOR_READ_TOKEN',
+  'SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256',
+  'SSAI_RELEASE_MONITOR_STATE_HMAC_KEY',
+]) {
+  const references = releaseHealth.match(new RegExp(`secrets\\.${secretName}`, 'g')) || [];
+  assert.equal(references.length, 2, `${secretName} must be scoped only to preflight and reconcile steps`);
+}
 requireText(releaseHealth, 'scan_mode:', 'explicit continuous/incident release-health mode');
 requireText(releaseHealth, 'type: choice', 'validated release-health mode choice');
 requireText(releaseHealth, '          - continuous\n          - incident', 'release-health mode options');
-requireText(releaseHealth, "run-name: Release health monitor [${{ inputs.scan_mode || 'continuous' }}:${{ inputs.lookback_hours || '6' }}h]", 'input-bound release-health run identity');
+requireText(releaseHealth, "run-name: Release health monitor [${{ inputs.scan_mode == 'incident' && 'incident:168h' || format('continuous:{0}h', inputs.lookback_hours || '6') }}]", 'incident-exhaustive release-health run identity');
 requireText(releaseHealth, 'lookback_hours:', 'manual release-health lookback control');
 requireText(releaseHealth, "default: '6'", 'bounded scheduled release-health lookback default');
 requireText(releaseHealth, "timeout-minutes: ${{ inputs.scan_mode == 'incident' && 45 || 12 }}", 'mode-bounded release-health timeout');
 requireText(releaseHealth, "SSAI_RELEASE_MONITOR_MODE: ${{ inputs.scan_mode || 'continuous' }}", 'release-health scan mode');
-requireText(releaseHealth, "SSAI_RELEASE_MONITOR_LOOKBACK_HOURS: ${{ inputs.lookback_hours || '6' }}", 'release-health failure lookback');
+requireText(releaseHealth, "SSAI_RELEASE_MONITOR_LOOKBACK_HOURS: ${{ inputs.scan_mode == 'incident' && '168' || inputs.lookback_hours || '6' }}", 'forced exhaustive incident lookback');
 requireText(releaseHealth, "SSAI_RELEASE_MONITOR_MAX_REQUESTS: ${{ inputs.scan_mode == 'incident' && '3500' || '600' }}", 'release-health API request budget');
 requireText(releaseHealth, "SSAI_RELEASE_MONITOR_RATE_RESERVE: ${{ inputs.scan_mode == 'incident' && '250' || '1000' }}", 'release-health API reserve');
 requireText(releaseHealth, "SSAI_RELEASE_MONITOR_API_CONCURRENCY: '6'", 'release-health global API concurrency');
-requireText(releaseHealth, 'node scripts/verify-org-release-health.mjs', 'organization release-health verifier');
+requireText(releaseHealth, 'actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830', 'pinned scheduled-incident state restore');
+requireText(releaseHealth, 'actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830', 'pinned scheduled-incident state save');
+requireText(releaseHealth, 'ssai-release-health-state-v2-v1-lookup', 'non-sensitive fixed cache lookup key');
+requireText(releaseHealth, 'ssai-release-health-state-v2-v1-', 'epoch-bound non-sensitive cache prefix');
+rejectPattern(releaseHealth, /state-v\d+[^\n]*github\.run_id/, 'source run ID in public cache action key');
+requireText(releaseHealth, "if: ${{ github.event_name == 'schedule' }}", 'schedule-only state restore');
+requireText(releaseHealth, "always() && github.event_name == 'schedule' && steps.reconcile.outputs.incident_state_changed == 'true'", 'fail-closed changed-state save');
+requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}', 'default-branch state provenance');
+requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_STATE_CACHE_MATCHED_KEY:', 'immutable restored cache identity handoff');
+requireText(releaseHealth, 'key: ${{ steps.reconcile.outputs.incident_state_cache_key }}', 'content-digested cache save key');
+requireText(releaseHealth, 'id: verify_release_health_state', 'post-save cache visibility verification');
+requireText(releaseHealth, 'lookup-only: true', 'side-effect-free cache visibility verification');
+requireText(releaseHealth, 'fail-on-cache-miss: true', 'fail-closed missing changed-state cache');
+requireText(releaseHealth, 'STATE_CACHE_HIT: ${{ steps.verify_release_health_state.outputs.cache-hit }}', 'cache feature-availability output gate');
+requireText(releaseHealth, 'MATCHED_STATE_KEY: ${{ steps.verify_release_health_state.outputs.cache-matched-key }}', 'exact persisted cache identity gate');
+requireText(releaseHealth, '::error::Release-health monitor failed closed', 'generic fail-closed state-persistence error');
+rejectPattern(releaseHealth, /Changed release-health incident state was not durably persisted/, 'detailed public state-persistence error');
+rejectPattern(releaseHealth, /continue-on-error:\s*true/, 'state restore/save failure suppression');
+requireText(releaseHealth, "await import('./scripts/verify-org-release-health.mjs')", 'workflow-attested dynamic monitor bootstrap');
+requireText(releaseHealth, 'executeReleaseHealthMonitorEntryPoint(monitor.runReleaseHealthMonitor)', 'redacted organization release-health entry point');
+rejectPattern(releaseHealth, /run:\s*node scripts\/verify-org-release-health\.mjs/, 'unwrapped hosted monitor execution');
 requireText(releaseHealthVerifier, 'latestByIdentity(', 'latest current-check selection');
 requireText(releaseHealthVerifier, 'evaluateNoHistoryAllowance(', 'evidence-gated manual workflow allowance');
 requireText(releaseHealthVerifier, 'collectWorkflowSource(', 'exact no-history workflow source verification');
@@ -187,8 +230,14 @@ if (auditedMonitorOriginCalls.length !== 29) {
 }
 requireText(
   releaseHealthVerifier,
-  `sourceSha256: '${createHash('sha256').update(releaseHealth).digest('hex')}'`,
+  `export const currentMonitorWorkflowSourceSha256 = '${createHash('sha256').update(releaseHealth).digest('hex')}'`,
   'release-health recovery policy exact normalized workflow digest',
+);
+requireText(releaseHealthVerifier, 'sourceSha256: currentMonitorWorkflowSourceSha256', 'current monitor policy digest reference');
+requireText(
+  releaseHealthVerifier,
+  "export const auditedPriorMonitorWorkflowSourceSha256 = '3672ed17290279e20d75336e810d9327a59786c16a77332aa5be2f4adb0238a1'",
+  'immutable historical monitor workflow digest',
 );
 requireText(releaseHealthVerifier, "const excludedRepositories = new Set(['SSAI_Connect'])", 'protected Connect exclusion');
 requireText(releaseHealthVerifier, 'findDeploymentCheckRecovery(', 'cross-trigger deployment recovery proof');
@@ -209,6 +258,33 @@ requireText(releaseHealthVerifier, "await api('/user')", 'representative core ra
 requireText(releaseHealthVerifier, "rateDecision === 'defer'", 'continuous rate-limit backpressure');
 requireText(releaseHealthVerifier, "rateDecision === 'fail'", 'incident rate-limit fail-closed gate');
 requireText(releaseHealthVerifier, 'throw truncationError(', 'fail-closed pagination');
+requireText(releaseHealthVerifier, 'fingerprintReleaseHealthIncident(', 'typed immutable incident fingerprinting');
+requireText(releaseHealthVerifier, 'decodeScheduledIncidentState(', 'cache-key/content integrity validation');
+requireText(releaseHealthVerifier, 'evaluateIncidentNotification(', 'scheduled-only incident notification policy');
+requireText(releaseHealthVerifier, 'validateIncidentClusterKey(', 'stable notification cluster validation');
+requireText(releaseHealthVerifier, 'failureEpisodeAnchor(', 'success-bounded failure episode identity');
+requireText(releaseHealthVerifier, 'evidenceDigestByCluster', 'set-deduplicated stable cluster counting');
+requireText(releaseHealthVerifier, 'verifyExpectedInventoryAttestation(', 'protected complete repository inventory attestation');
+requireText(releaseHealthVerifier, 'timingSafeEqual(', 'constant-time inventory/state attestation comparison');
+requireText(releaseHealthVerifier, 'SSAI_RELEASE_MONITOR_STATE_HMAC_KEY', 'dedicated state HMAC key consumption');
+requireText(releaseHealthVerifier, 'decodeScheduledIncidentStateOrNull(', 'safe corrupt-state reinitialization');
+requireText(releaseHealthVerifier, 'isExactSelfMonitorEnvironmentDeployment(', 'exact monitor-environment deployment loop exclusion');
+requireText(releaseHealthVerifier, 'durableTrustedMonitorRecoveryRuns(', 'manual-only durable workflow recovery filter');
+requireText(releaseHealthVerifier, 'durableTrustedMonitorRecoveryChecks(', 'manual-only durable check recovery filter');
+requireText(releaseHealthVerifier, 'trustedMonitorPolicy ? durableTrustedMonitorRecoveryRuns(runs, trustedMonitorPolicy, defaultBranch) : runs', 'trusted workflow recovery candidate filtering');
+requireText(releaseHealthVerifier, 'trustedMonitorPolicy ? durableTrustedMonitorRecoveryChecks(checks, trustedMonitorPolicy, defaultBranch) : checks', 'trusted check recovery candidate filtering');
+requireText(releaseHealthVerifier, '|| !isExactManualIncidentRecoveryRun(run, policy, defaultBranch)', 'manual-only cross-SHA recovery attestation');
+requireText(releaseHealthVerifier, "run?.display_title === 'Release health monitor [incident:168h]'", 'exact manual incident durable run identity');
+requireText(releaseHealthVerifier, "check?.source_run_display_title === 'Release health monitor [incident:168h]'", 'exact manual incident durable check identity');
+requireText(releaseHealthVerifier, "recoveryDisplayTitles: ['Release health monitor [incident:168h]']", 'manual exhaustive trusted-monitor recovery title');
+requireText(releaseHealthVerifier, 'isHostedPublicReleaseHealthOutput(environment = process.env)', 'exact hosted-public output boundary');
+requireText(releaseHealthVerifier, "String(environment?.GITHUB_ACTIONS || '').toLowerCase() === 'true'", 'all-hosted-Actions redaction boundary');
+requireText(releaseHealthVerifier, 'releaseHealthLogPayload(deferredSummary)', 'aggregate-only deferred stdout');
+requireText(releaseHealthVerifier, 'releaseHealthLogPayload(summary)', 'aggregate-only completed stdout');
+requireText(releaseHealthVerifier, 'renderReleaseHealthStepSummary(result)', 'hosted-public step-summary renderer');
+requireText(releaseHealthVerifier, 'executeReleaseHealthMonitorEntryPoint(runReleaseHealthMonitor)', 'redacted direct monitor entry point');
+requireText(releaseHealthVerifier, 'Release-health monitor failed closed before aggregate reporting.', 'generic hosted-public fail-closed error');
+rejectPattern(releaseHealthVerifier, /console\.log\(JSON\.stringify\((?:deferredSummary|summary),/, 'unredacted release-health JSON stdout');
 
 requireBalancedExpressions(releaseHealth, 'release-health workflow');
 requireSpaceIndentation(releaseHealth, 'release-health workflow');

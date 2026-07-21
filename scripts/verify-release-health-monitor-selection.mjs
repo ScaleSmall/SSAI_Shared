@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import {
   attestTrustedMonitorImplementation,
   associateChecksWithPulls,
@@ -41,6 +44,684 @@ import {
   verifyForwardFixRecoveryPolicy,
   workflowStreamIdentity,
 } from './release-health-monitor-utils.mjs';
+import {
+  decodeScheduledIncidentState,
+  decodeScheduledIncidentStateOrNull,
+  createScheduledIncidentStateRecord,
+  durableTrustedMonitorRecoveryChecks,
+  durableTrustedMonitorRecoveryRuns,
+  evaluateIncidentNotification,
+  expectedInventoryDigest,
+  executeReleaseHealthMonitorEntryPoint,
+  fingerprintReleaseHealthIncident,
+  isExactManualIncidentRecoveryCheck,
+  isExactManualIncidentRecoveryRun,
+  isExactSelfMonitorEnvironmentDeployment,
+  notificationStateHmac,
+  releaseHealthLogPayload,
+  renderReleaseHealthStepSummary,
+  scheduledIncidentStateEnabled,
+  verifyExpectedInventoryAttestation,
+  auditedPriorMonitorWorkflowSourceSha256,
+  currentMonitorWorkflowSourceSha256,
+} from './verify-org-release-health.mjs';
+
+const currentWorkflowSource = (await readFile(
+  new URL('../.github/workflows/release-health-monitor.yml', import.meta.url),
+  'utf8',
+)).replace(/\r\n/g, '\n');
+assert.equal(
+  auditedPriorMonitorWorkflowSourceSha256,
+  '3672ed17290279e20d75336e810d9327a59786c16a77332aa5be2f4adb0238a1',
+  'historical audited monitor origins must preserve the exact prior workflow-byte digest',
+);
+assert.equal(
+  currentMonitorWorkflowSourceSha256,
+  createHash('sha256').update(currentWorkflowSource).digest('hex'),
+  'current default-main monitor policy must bind the exact modified workflow bytes',
+);
+assert.notEqual(
+  currentMonitorWorkflowSourceSha256,
+  auditedPriorMonitorWorkflowSourceSha256,
+  'current source attestation must not overwrite the historical audited workflow digest',
+);
+
+const incidentFailureA = {
+  repo: 'SSAI_Dashboard',
+  owner: 'Deploy Dashboard',
+  problem: 'wording A',
+  url: 'https://github.com/ScaleSmall/SSAI_Dashboard/actions/runs/100',
+  incident_key: {
+    repo: 'SSAI_Dashboard',
+    type: 'workflow-run',
+    workflow_id: 10,
+    run_id: 100,
+    run_attempt: 1,
+    conclusion: 'failure',
+  },
+  notification_key: {
+    repo: 'SSAI_Dashboard',
+    type: 'workflow-run',
+    stream_sha256: '1'.repeat(64),
+    failure_class: 'failure',
+    episode_anchor: 'no-prior-success',
+  },
+};
+const incidentFailureB = {
+  repo: 'SSAI_NAP_Entity',
+  owner: 'Production lifecycle',
+  problem: 'wording B',
+  url: 'https://github.com/ScaleSmall/SSAI_NAP_Entity/actions/runs/200',
+  incident_key: {
+    repo: 'SSAI_NAP_Entity',
+    type: 'check-run',
+    check_run_id: 200,
+    conclusion: 'failure',
+  },
+  notification_key: {
+    repo: 'SSAI_NAP_Entity',
+    type: 'check-run',
+    stream_sha256: '2'.repeat(64),
+    failure_class: 'failure',
+    episode_anchor: 'no-prior-success',
+  },
+};
+const fingerprintA = fingerprintReleaseHealthIncident([incidentFailureA]);
+const fingerprintAB = fingerprintReleaseHealthIncident([incidentFailureA, incidentFailureB]);
+assert.equal(
+  fingerprintReleaseHealthIncident([{ ...incidentFailureA, problem: 'rewritten prose', url: 'https://example.invalid/changed' }]).incidentFingerprint,
+  fingerprintA.incidentFingerprint,
+  'incident fingerprints must ignore mutable prose and URLs',
+);
+assert.equal(
+  fingerprintReleaseHealthIncident([incidentFailureB, incidentFailureA]).incidentFingerprint,
+  fingerprintAB.incidentFingerprint,
+  'incident fingerprints must be order-independent',
+);
+assert.equal(
+  fingerprintReleaseHealthIncident([{ ...incidentFailureA, incident_key: { ...incidentFailureA.incident_key, run_id: 101 } }]).incidentFingerprint,
+  fingerprintA.incidentFingerprint,
+  'a new immutable run identity in the same incident stream must not change the notification fingerprint',
+);
+assert.equal(
+  fingerprintReleaseHealthIncident([
+    incidentFailureA,
+    { ...incidentFailureA, incident_key: { ...incidentFailureA.incident_key, run_id: 101 } },
+  ]).failureCount,
+  1,
+  'multiple immutable evidence rows for one stable incident cluster must count once',
+);
+assert.notEqual(
+  fingerprintReleaseHealthIncident([{
+    ...incidentFailureA,
+    notification_key: { ...incidentFailureA.notification_key, failure_class: 'timed_out' },
+  }]).incidentFingerprint,
+  fingerprintA.incidentFingerprint,
+  'a changed failure class must worsen the incident fingerprint',
+);
+assert.notEqual(
+  fingerprintReleaseHealthIncident([{
+    ...incidentFailureA,
+    notification_key: { ...incidentFailureA.notification_key, stream_sha256: '3'.repeat(64) },
+  }]).incidentFingerprint,
+  fingerprintA.incidentFingerprint,
+  'a distinct failing stream must worsen the incident fingerprint',
+);
+const policyFailureAtHeadA = {
+  repo: 'SSAI_Shared',
+  owner: '.github/workflows/release-health-monitor.yml',
+  problem: 'configured recovery policy workflow is missing or inactive',
+  incident_key: {
+    repo: 'SSAI_Shared',
+    type: 'recovery-policy-workflow-missing',
+    workflow_id: 315630665,
+    workflow_path: '.github/workflows/release-health-monitor.yml',
+    head_sha: 'a'.repeat(40),
+  },
+  notification_key: {
+    repo: 'SSAI_Shared',
+    type: 'recovery-policy-workflow-missing',
+    stream_sha256: '4'.repeat(64),
+    failure_class: 'workflow-missing',
+    episode_anchor: 'policy-head:' + 'a'.repeat(40),
+    policy_head_sha: 'a'.repeat(40),
+  },
+};
+assert.notEqual(
+  fingerprintReleaseHealthIncident([{
+    ...policyFailureAtHeadA,
+    incident_key: { ...policyFailureAtHeadA.incident_key, head_sha: 'b'.repeat(40) },
+    notification_key: {
+      ...policyFailureAtHeadA.notification_key,
+      episode_anchor: 'policy-head:' + 'b'.repeat(40),
+      policy_head_sha: 'b'.repeat(40),
+    },
+  }]).incidentFingerprint,
+  fingerprintReleaseHealthIncident([policyFailureAtHeadA]).incidentFingerprint,
+  'the same recovery-policy failure on a different immutable head must change the incident fingerprint',
+);
+assert.throws(
+  () => fingerprintReleaseHealthIncident([{ ...incidentFailureA, incident_key: null }]),
+  /typed immutable incident key/,
+  'untyped incident evidence must fail closed',
+);
+assert.throws(
+  () => fingerprintReleaseHealthIncident([{ ...incidentFailureA, notification_key: null }]),
+  /stable notification cluster key/,
+  'untyped notification clusters must fail closed',
+);
+assert.throws(
+  () => fingerprintReleaseHealthIncident([{
+    ...incidentFailureA,
+    notification_key: {
+      repo: incidentFailureA.notification_key.repo,
+      type: incidentFailureA.notification_key.type,
+      failure_class: incidentFailureA.notification_key.failure_class,
+      episode_anchor: incidentFailureA.notification_key.episode_anchor,
+    },
+  }]),
+  /missing a stream/,
+  'a notification cluster without a stable stream digest must fail closed',
+);
+assert.throws(
+  () => fingerprintReleaseHealthIncident([{
+    ...incidentFailureA,
+    notification_key: { ...incidentFailureA.notification_key, stream_sha256: 'ABC' },
+  }]),
+  /missing a stream/,
+  'a malformed notification stream digest must fail closed',
+);
+
+const attestedInventory = [
+  { full_name: 'ScaleSmall/SSAI_Dashboard' },
+  { full_name: 'ScaleSmall/SSAI_Shared' },
+  { full_name: 'ScaleSmall/SSAI_NAP_Entity' },
+];
+const attestedInventorySha256 = expectedInventoryDigest(attestedInventory);
+assert.equal(
+  verifyExpectedInventoryAttestation([...attestedInventory].reverse(), attestedInventorySha256),
+  true,
+  'the exact repository set must pass independent of API order',
+);
+assert.throws(
+  () => verifyExpectedInventoryAttestation(attestedInventory.slice(1), attestedInventorySha256),
+  /completeness attestation/,
+  'an omitted private repository must fail inventory completeness',
+);
+assert.throws(
+  () => verifyExpectedInventoryAttestation(
+    [...attestedInventory, { full_name: 'ScaleSmall/SSAI_New_Private' }],
+    attestedInventorySha256,
+  ),
+  /completeness attestation/,
+  'an unreviewed extra repository must fail inventory completeness',
+);
+
+const hostedPublicEnvironment = {
+  GITHUB_ACTIONS: 'true',
+  GITHUB_REPOSITORY: 'ScaleSmall/SSAI_Shared',
+};
+const bootstrapProbeSource = `
+const hostedActions = String(process.env.GITHUB_ACTIONS || '').toLowerCase() === 'true';
+try {
+  const monitor = await import('./scripts/verify-org-release-health.mjs');
+  await monitor.executeReleaseHealthMonitorEntryPoint(monitor.runReleaseHealthMonitor);
+} catch (caught) {
+  if (hostedActions) console.error('::error::Release-health monitor failed closed before aggregate reporting.');
+  else console.error(caught instanceof Error ? caught.stack || caught.message : String(caught));
+  process.exitCode = 1;
+}`;
+const bootstrapProbe = spawnSync(process.execPath, ['--input-type=module', '--eval', bootstrapProbeSource], {
+  cwd: fileURLToPath(new URL('..', import.meta.url)),
+  encoding: 'utf8',
+  env: {
+    ...process.env,
+    GITHUB_ACTIONS: 'true',
+    GITHUB_REPOSITORY: 'TransferredOrg/RenamedPublicMonitor',
+    SSAI_RELEASE_MONITOR_OWNER: 'invalid/private/path',
+    SSAI_RELEASE_MONITOR_GITHUB_TOKEN: 'read-token-'.repeat(4),
+    SSAI_RELEASE_MONITOR_STATE_HMAC_KEY: 'state-key-'.repeat(4),
+    SSAI_RELEASE_MONITOR_STATE_HMAC_EPOCH: 'v1',
+    SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256: 'a'.repeat(64),
+  },
+});
+assert.equal(bootstrapProbe.status, 1, 'hosted bootstrap must fail nonzero on module-initialization errors');
+assert.equal(bootstrapProbe.stdout, '', 'hosted bootstrap module-initialization failures must not write stdout');
+assert.equal(
+  bootstrapProbe.stderr,
+  '::error::Release-health monitor failed closed before aggregate reporting.\n',
+  'hosted bootstrap must redact an invalid top-level configuration exception and stack',
+);
+const directHostedProbe = spawnSync(process.execPath, ['scripts/verify-org-release-health.mjs'], {
+  cwd: fileURLToPath(new URL('..', import.meta.url)),
+  encoding: 'utf8',
+  env: {
+    ...process.env,
+    GITHUB_ACTIONS: 'true',
+    GITHUB_REPOSITORY: 'TransferredOrg/RenamedPublicMonitor',
+    SSAI_RELEASE_MONITOR_OWNER: 'invalid/private/path',
+    SSAI_RELEASE_MONITOR_GITHUB_TOKEN: 'read-token-'.repeat(4),
+    SSAI_RELEASE_MONITOR_STATE_HMAC_KEY: 'state-key-'.repeat(4),
+    SSAI_RELEASE_MONITOR_STATE_HMAC_EPOCH: 'v1',
+    SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256: 'a'.repeat(64),
+  },
+});
+assert.equal(directHostedProbe.status, 1, 'direct hosted execution must fail nonzero on invalid configuration');
+assert.equal(directHostedProbe.stdout, '', 'direct hosted configuration failures must not write stdout');
+assert.equal(
+  directHostedProbe.stderr,
+  '::error::Release-health monitor failed closed before aggregate reporting.\n',
+  'direct hosted execution must also redact configuration errors and stacks',
+);
+const sensitiveMarkers = [
+  'SSAI_Private_Fleet',
+  'Private deploy workflow',
+  'Private check name',
+  'Private deployment environment',
+  'https://github.com/ScaleSmall/SSAI_Private_Fleet/actions/runs/987654321012345',
+  '987654321012345',
+  'fedcba9876543210fedcba9876543210fedcba98',
+  'private failure diagnostic text',
+  'private no-history witness detail',
+  '1111222233334444555566667777888899990000111122223333444455556666',
+  '876543210123456',
+];
+const adversarialHostedResult = {
+  ok: false,
+  deferred: false,
+  inventory_complete: true,
+  scan_mode: 'incident',
+  lookback_hours: 168,
+  repositories: 9,
+  active_workflows: 27,
+  green_workflows: 25,
+  pending_workflows: 0,
+  failed_workflows: 2,
+  allowed_no_history_workflows: 1,
+  unresolved_no_history_workflows: 1,
+  categorized_workflows: 27,
+  current_commit_checks: 42,
+  recovered_recent_workflow_attempts: 3,
+  provisional_self_recovering_workflow_attempts: 1,
+  unresolved_recent_workflow_attempts: 2,
+  recovered_recent_check_runs: 3,
+  provisional_self_recovering_check_runs: 1,
+  unresolved_recent_check_runs: 2,
+  recovered_recent_commit_statuses: 3,
+  unresolved_recent_commit_statuses: 2,
+  recovered_recent_deployment_statuses: 3,
+  unresolved_recent_deployment_statuses: 2,
+  github_api_requests: 777,
+  github_api_retries: 4,
+  notification_outcome: 'new-or-worsened-incident',
+  incident_failure_count: 2,
+  owner: 'ScaleSmall',
+  repository_prefix: 'SSAI_Private_Fleet',
+  allowed_no_history_evidence: [{
+    repo: sensitiveMarkers[0],
+    workflow: sensitiveMarkers[1],
+    reason: sensitiveMarkers[8],
+    workflow_source_sha256: sensitiveMarkers[9],
+    witness: {
+      workflow: sensitiveMarkers[2],
+      run_id: 987654321012345,
+      url: sensitiveMarkers[4],
+      head_sha: sensitiveMarkers[6],
+      event: 'push',
+      head_repository: sensitiveMarkers[0],
+    },
+  }],
+  recent_failure_recoveries: {
+    workflows: [{ id: 987654321012345, name: sensitiveMarkers[1], head_sha: sensitiveMarkers[6] }],
+    checks: [{ id: 987654321012345, name: sensitiveMarkers[2] }],
+    statuses: [{ id: 987654321012345, context: sensitiveMarkers[2] }],
+    deployments: [{ id: 987654321012345, environment: sensitiveMarkers[3] }],
+  },
+  failures: [{
+    repo: sensitiveMarkers[0],
+    owner: sensitiveMarkers[1],
+    problem: sensitiveMarkers[7],
+    url: sensitiveMarkers[4],
+    incident_key: { repo: sensitiveMarkers[0], type: 'workflow-run', run_id: 987654321012345 },
+  }],
+  warnings: ['private no-history witness detail'],
+  incident_fingerprint: sensitiveMarkers[9],
+  previous_incident_source_run_id: 876543210123456,
+};
+const hostedStdout = JSON.stringify(releaseHealthLogPayload(adversarialHostedResult, hostedPublicEnvironment));
+const hostedStepSummary = renderReleaseHealthStepSummary(adversarialHostedResult, hostedPublicEnvironment);
+for (const marker of sensitiveMarkers) {
+  assert.equal(hostedStdout.includes(marker), false, 'hosted stdout must redact sensitive marker: ' + marker);
+  assert.equal(hostedStepSummary.includes(marker), false, 'hosted step summary must redact sensitive marker: ' + marker);
+}
+assert.deepEqual(
+  releaseHealthLogPayload(adversarialHostedResult, hostedPublicEnvironment),
+  {
+    result: 'degraded',
+    inventory_complete: true,
+    notification_outcome: 'new-or-worsened-incident',
+  },
+  'hosted output must contain only the three coarse public fields',
+);
+assert.equal(
+  hostedStepSummary,
+  '# Scale Small AI release health\n\n- Result: degraded\n- Inventory complete: yes\n- Notification outcome: new-or-worsened-incident\n',
+  'hosted step summary must contain only coarse public health enums',
+);
+for (const forbiddenField of [
+  'repositories', 'active_workflows', 'green_workflows', 'pending_workflows', 'failed_workflows',
+  'allowed_no_history_workflows', 'unresolved_no_history_workflows', 'current_commit_checks',
+  'github_api_requests', 'github_api_retries', 'failure_count', 'warning_count', 'incident_failure_count',
+  'recent_failure_recoveries', 'failures', 'warnings', 'scan_mode', 'lookback_hours',
+]) {
+  assert.equal(hostedStdout.includes(forbiddenField), false, 'hosted stdout must omit count/detail field: ' + forbiddenField);
+  assert.equal(hostedStepSummary.includes(forbiddenField), false, 'hosted step summary must omit count/detail field: ' + forbiddenField);
+}
+assert.match(hostedStepSummary, /Notification outcome: new-or-worsened-incident/);
+
+const renamedHostedEnvironment = {
+  GITHUB_ACTIONS: 'TRUE',
+  GITHUB_REPOSITORY: 'TransferredOrg/RenamedPublicMonitor',
+  SSAI_RELEASE_MONITOR_FULL_OUTPUT: 'true',
+  DEBUG: '1',
+};
+assert.deepEqual(
+  releaseHealthLogPayload(adversarialHostedResult, renamedHostedEnvironment),
+  releaseHealthLogPayload(adversarialHostedResult, hostedPublicEnvironment),
+  'every hosted Actions repository must remain coarse-redacted across rename/transfer and debug flags',
+);
+for (const marker of sensitiveMarkers) {
+  assert.equal(
+    renderReleaseHealthStepSummary(adversarialHostedResult, renamedHostedEnvironment).includes(marker),
+    false,
+    'renamed hosted repository summary must redact sensitive marker: ' + marker,
+  );
+}
+
+const injectedExceptionMarker = 'SSAI_Private_Fleet injected source error at https://private.invalid/run/987654321012345';
+const hostedErrors = [];
+const hostedExitCodes = [];
+await executeReleaseHealthMonitorEntryPoint(
+  async () => { throw new Error(injectedExceptionMarker); },
+  {
+    environment: hostedPublicEnvironment,
+    error: (message) => hostedErrors.push(String(message)),
+    setExitCode: (code) => hostedExitCodes.push(code),
+  },
+);
+assert.deepEqual(hostedExitCodes, [1], 'hosted exceptions must fail closed');
+assert.equal(hostedErrors.join('\n').includes(injectedExceptionMarker), false, 'hosted exception output must redact the raw error and stack');
+assert.deepEqual(hostedErrors, ['::error::Release-health monitor failed closed before aggregate reporting.']);
+
+const renamedHostedErrors = [];
+await executeReleaseHealthMonitorEntryPoint(
+  async () => { throw new Error(injectedExceptionMarker); },
+  {
+    environment: renamedHostedEnvironment,
+    error: (message) => renamedHostedErrors.push(String(message)),
+    setExitCode: () => {},
+  },
+);
+assert.deepEqual(
+  renamedHostedErrors,
+  ['::error::Release-health monitor failed closed before aggregate reporting.'],
+  'renamed/transferred hosted repositories must retain generic fail-closed exception output',
+);
+
+const localErrors = [];
+await executeReleaseHealthMonitorEntryPoint(
+  async () => { throw new Error(injectedExceptionMarker); },
+  {
+    environment: {},
+    error: (message) => localErrors.push(String(message)),
+    setExitCode: () => {},
+  },
+);
+assert.equal(localErrors.join('\n').includes(injectedExceptionMarker), true, 'local diagnostics may retain the original exception');
+
+const firstA = evaluateIncidentNotification('continuous', 'schedule', null, [incidentFailureA]);
+assert.deepEqual(
+  { changed: firstA.changed, suppressed: firstA.suppressed },
+  { changed: true, suppressed: false },
+  'the first A incident must fail and save state',
+);
+const repeatedA = evaluateIncidentNotification('continuous', 'schedule', firstA.current, [incidentFailureA]);
+assert.deepEqual(
+  { changed: repeatedA.changed, suppressed: repeatedA.suppressed },
+  { changed: false, suppressed: true },
+  'an unchanged scheduled A incident must be suppressed',
+);
+const sameEpisodeNewAttemptA = evaluateIncidentNotification(
+  'continuous',
+  'schedule',
+  firstA.current,
+  [{ ...incidentFailureA, incident_key: { ...incidentFailureA.incident_key, run_id: 101 } }],
+);
+assert.deepEqual(
+  { changed: sameEpisodeNewAttemptA.changed, suppressed: sameEpisodeNewAttemptA.suppressed },
+  { changed: false, suppressed: true },
+  'new failing attempts in the same uninterrupted failure episode must remain suppressed',
+);
+const postSuccessRecurrenceA = evaluateIncidentNotification(
+  'continuous',
+  'schedule',
+  firstA.current,
+  [{
+    ...incidentFailureA,
+    incident_key: { ...incidentFailureA.incident_key, run_id: 102 },
+    notification_key: { ...incidentFailureA.notification_key, episode_anchor: 'workflow-run:99:attempt:1' },
+  }],
+);
+assert.deepEqual(
+  { changed: postSuccessRecurrenceA.changed, suppressed: postSuccessRecurrenceA.suppressed },
+  { changed: true, suppressed: false },
+  'fail-success-fail recurrence must surface as a new episode even when both snapshots are incidents',
+);
+const worsenedAB = evaluateIncidentNotification('continuous', 'schedule', firstA.current, [incidentFailureA, incidentFailureB]);
+assert.deepEqual(
+  { changed: worsenedAB.changed, suppressed: worsenedAB.suppressed },
+  { changed: true, suppressed: false },
+  'A+B must surface and save as a worsened incident',
+);
+const partialRecoveryA = evaluateIncidentNotification('continuous', 'schedule', worsenedAB.current, [incidentFailureA]);
+assert.deepEqual(
+  { changed: partialRecoveryA.changed, suppressed: partialRecoveryA.suppressed },
+  { changed: true, suppressed: false },
+  'partial recovery must surface the changed unresolved incident',
+);
+const cleanAfterA = evaluateIncidentNotification('continuous', 'schedule', partialRecoveryA.current, []);
+assert.deepEqual(
+  { changed: cleanAfterA.changed, suppressed: cleanAfterA.suppressed },
+  { changed: true, suppressed: false },
+  'clean health must save a recovery barrier',
+);
+const recurrenceA = evaluateIncidentNotification('continuous', 'schedule', cleanAfterA.current, [incidentFailureA]);
+assert.deepEqual(
+  { changed: recurrenceA.changed, suppressed: recurrenceA.suppressed },
+  { changed: true, suppressed: false },
+  'A recurring after a clean state must surface as a new incident',
+);
+for (const mode of ['continuous', 'incident']) {
+  const manual = evaluateIncidentNotification(mode, 'workflow_dispatch', firstA.current, [incidentFailureA]);
+  assert.equal(manual.enabled, false, 'manual ' + mode + ' scans must not enable deduplication');
+  assert.equal(manual.suppressed, false, 'manual ' + mode + ' scans must remain fail-closed');
+}
+assert.equal(scheduledIncidentStateEnabled('incident', 'schedule'), false, 'incident scans must never deduplicate');
+
+const selfMonitorDeployment = {
+  deployment_id: 7001,
+  id: 7002,
+  state: 'failure',
+  environment: 'release-health-monitor',
+  task: 'deploy',
+  identity_source: 'github-actions-job',
+  source_workflow_id: 315630665,
+  source_run_id: 29799900001,
+  source_check_run_id: 88999000001,
+  source_head_repository: 'ScaleSmall/SSAI_Shared',
+  source_head_branch: 'main',
+  source_event: 'schedule',
+  source_check_name: 'Verify current organization release health',
+  source_run_display_title: 'Release health monitor [continuous:6h]',
+};
+assert.equal(
+  isExactSelfMonitorEnvironmentDeployment('SSAI_Shared', selfMonitorDeployment, 'main'),
+  true,
+  'the first failed exact monitor-environment deployment must be recognized as self-generated',
+);
+assert.equal(
+  [selfMonitorDeployment, {
+    ...selfMonitorDeployment,
+    deployment_id: 7003,
+    id: 7004,
+    source_run_id: 29799900002,
+    source_check_run_id: 88999000002,
+  }].filter((status) => !isExactSelfMonitorEnvironmentDeployment('SSAI_Shared', status, 'main')).length,
+  0,
+  'the next scheduled scan must not turn exact self-generated environment deployments into a failure loop',
+);
+assert.equal(
+  isExactSelfMonitorEnvironmentDeployment(
+    'SSAI_Shared',
+    { ...selfMonitorDeployment, source_workflow_id: 999 },
+    'main',
+  ),
+  false,
+  'a lookalike deployment from another workflow must remain in health inventory',
+);
+
+const stateContext = {
+  repositoryId: 123,
+  repository: 'ScaleSmall/SSAI_Shared',
+  workflowRef: 'ScaleSmall/SSAI_Shared/.github/workflows/release-health-monitor.yml@refs/heads/main',
+  ref: 'refs/heads/main',
+  cachePrefix: 'ssai-release-health-state-v2-v1-',
+  hmacEpoch: 'v1',
+};
+const stateAuthenticationKey = 'state-hmac-key-'.repeat(4);
+const stateRecord = createScheduledIncidentStateRecord(
+  fingerprintA,
+  stateContext,
+  stateAuthenticationKey,
+  '2026-07-21T18:00:00.000Z',
+);
+const stateBytes = Buffer.from(JSON.stringify(stateRecord, null, 2) + '\n');
+const stateKey = stateContext.cachePrefix + 'at-2026-07-21T18-00-00-000Z';
+assert.equal(
+  decodeScheduledIncidentState(stateBytes, stateKey, stateContext, stateAuthenticationKey).notificationStateHmac,
+  notificationStateHmac(fingerprintA, stateAuthenticationKey),
+  'valid authenticated state must restore exactly',
+);
+assert.equal(
+  decodeScheduledIncidentState(stateBytes, stateKey, stateContext, stateAuthenticationKey).notificationStateHmac,
+  notificationStateHmac(fingerprintA, stateAuthenticationKey),
+  'rotating the independent read PAT cannot invalidate state authenticated by the dedicated HMAC key',
+);
+const opaqueRepeatedIncident = evaluateIncidentNotification(
+  'continuous',
+  'schedule',
+  decodeScheduledIncidentState(stateBytes, stateKey, stateContext, stateAuthenticationKey),
+  [incidentFailureA],
+  stateAuthenticationKey,
+);
+assert.deepEqual(
+  { changed: opaqueRepeatedIncident.changed, suppressed: opaqueRepeatedIncident.suppressed },
+  { changed: false, suppressed: true },
+  'an authenticated opaque state token must suppress only the exact unchanged incident',
+);
+const confidentialSnapshot = {
+  status: 'incident',
+  incidentFingerprint: '5'.repeat(64),
+  failureCount: 73,
+  failureDigestSample: Array.from({ length: 16 }, () => '6'.repeat(64)),
+};
+const confidentialStateBytes = Buffer.from(JSON.stringify(createScheduledIncidentStateRecord(
+  confidentialSnapshot,
+  stateContext,
+  stateAuthenticationKey,
+  '2026-07-21T18:15:00.000Z',
+)));
+const healthyStateBytes = Buffer.from(JSON.stringify(createScheduledIncidentStateRecord(
+  fingerprintReleaseHealthIncident([]),
+  stateContext,
+  stateAuthenticationKey,
+  '2026-07-21T18:15:00.000Z',
+)));
+assert.equal(
+  confidentialStateBytes.length,
+  healthyStateBytes.length,
+  'fork-visible cache state size must not reveal healthy versus incident state',
+);
+for (const privateStateMarker of [
+  'incident', 'healthy', confidentialSnapshot.incidentFingerprint, confidentialSnapshot.failureDigestSample[0],
+  'failure_count', 'failure_digest_sample', 'source_run_id', 'source_sha',
+]) {
+  assert.equal(
+    confidentialStateBytes.includes(Buffer.from(privateStateMarker)),
+    false,
+    'fork-visible cache state must not contain private-derived marker: ' + privateStateMarker,
+  );
+}
+assert.deepEqual(
+  Object.keys(stateRecord).sort(),
+  [
+    'created_at', 'notification_state_hmac_sha256', 'ref', 'repository', 'repository_id', 'scan_mode', 'schema',
+    'state_hmac_epoch', 'state_hmac_sha256', 'trigger_event', 'workflow_ref',
+  ],
+  'cache state must have a fixed public-provenance plus opaque-HMAC shape',
+);
+assert.throws(
+  () => decodeScheduledIncidentState(null, stateKey, stateContext, stateAuthenticationKey),
+  /bytes are missing/,
+  'a matched cache key without a state file remains a hard I/O failure',
+);
+assert.equal(
+  decodeScheduledIncidentStateOrNull(Buffer.from('{}\n'), stateKey, stateContext, stateAuthenticationKey),
+  null,
+  'corrupt restored state must safely reinitialize',
+);
+const malformedBytes = Buffer.from('{not-json}\n');
+assert.equal(
+  decodeScheduledIncidentStateOrNull(malformedBytes, stateKey, stateContext, stateAuthenticationKey),
+  null,
+  'malformed restored JSON must safely reinitialize',
+);
+assert.equal(
+  decodeScheduledIncidentStateOrNull(
+    Buffer.from(JSON.stringify({ ...stateRecord, schema: 999 }) + '\n'),
+    stateKey,
+    stateContext,
+    stateAuthenticationKey,
+  ),
+  null,
+  'wrong-schema restored state must safely reinitialize',
+);
+assert.equal(
+  decodeScheduledIncidentStateOrNull(
+    stateBytes,
+    stateContext.cachePrefix + 'at-2026-07-21T18-00-00-001Z',
+    stateContext,
+    stateAuthenticationKey,
+  ),
+  null,
+  'a cache-key timestamp mismatch must safely reinitialize',
+);
+assert.equal(
+  decodeScheduledIncidentStateOrNull(stateBytes, stateKey, stateContext, 'rotated-hmac-key-'.repeat(4)),
+  null,
+  'HMAC-key rotation must safely reinitialize instead of suppressing',
+);
+assert.equal(
+  decodeScheduledIncidentStateOrNull(stateBytes, stateKey, { ...stateContext, hmacEpoch: 'v2' }, stateAuthenticationKey),
+  null,
+  'HMAC epoch rotation must safely reinitialize instead of suppressing',
+);
+const reinitializedIncident = evaluateIncidentNotification('continuous', 'schedule', null, [incidentFailureA]);
+assert.deepEqual(
+  { changed: reinitializedIncident.changed, suppressed: reinitializedIncident.suppressed },
+  { changed: true, suppressed: false },
+  'reinitialized state must surface and persist the current incident once',
+);
 
 const checks = latestByIdentity([
   { id: 102, name: 'release-health', app: 'github-actions', status: 'in_progress', started_at: '2026-07-18T09:10:00Z' },
@@ -581,6 +1262,84 @@ assert.deepEqual(
   [...monitorPolicy.attestedMonitorHeadShas],
   [monitorCurrentSha],
   'a verified policy must initially trust only the exact current implementation SHA',
+);
+const exactManualIncidentRecoveryRun = {
+  id: 800,
+  run_attempt: 1,
+  workflow_id: monitorWorkflow.id,
+  head_branch: 'main',
+  head_sha: monitorCurrentSha,
+  head_repository: { full_name: 'ScaleSmall/SSAI_Shared' },
+  event: 'workflow_dispatch',
+  display_title: 'Release health monitor [incident:168h]',
+  status: 'completed',
+  conclusion: 'success',
+};
+assert.equal(
+  isExactManualIncidentRecoveryRun(exactManualIncidentRecoveryRun, monitorPolicy, 'main'),
+  true,
+  'only the exact clean manual incident:168h run may be durable recovery evidence',
+);
+for (const [label, mutation] of [
+  ['scheduled success', { event: 'schedule' }],
+  ['manual continuous success', { display_title: 'Release health monitor [continuous:6h]' }],
+  ['narrow incident success', { display_title: 'Release health monitor [incident:167h]' }],
+  ['non-default branch success', { head_branch: 'feature' }],
+  ['failed incident', { conclusion: 'failure' }],
+]) {
+  assert.equal(
+    isExactManualIncidentRecoveryRun({ ...exactManualIncidentRecoveryRun, ...mutation }, monitorPolicy, 'main'),
+    false,
+    label + ' must never become durable monitor recovery evidence',
+  );
+}
+const scheduledDeduplicatedSuccess = { ...exactManualIncidentRecoveryRun, id: 801, event: 'schedule', display_title: 'Release health monitor [continuous:6h]' };
+const failedMonitorOrigin = { ...exactManualIncidentRecoveryRun, id: 799, event: 'schedule', display_title: 'Release health monitor [continuous:6h]', conclusion: 'failure' };
+assert.deepEqual(
+  durableTrustedMonitorRecoveryRuns(
+    [failedMonitorOrigin, scheduledDeduplicatedSuccess, exactManualIncidentRecoveryRun],
+    monitorPolicy,
+    'main',
+  ).map((run) => run.id),
+  [799, 800],
+  'the durable selector must preserve failures and exclude green deduplicated scheduled runs',
+);
+const exactManualIncidentRecoveryCheck = {
+  id: 900,
+  workflow_id: monitorWorkflow.id,
+  head_branch: 'main',
+  head_sha: monitorCurrentSha,
+  head_repository: 'ScaleSmall/SSAI_Shared',
+  event: 'workflow_dispatch',
+  source_run_display_title: 'Release health monitor [incident:168h]',
+  name: 'Verify current organization release health',
+  status: 'completed',
+  conclusion: 'success',
+};
+assert.equal(
+  isExactManualIncidentRecoveryCheck(exactManualIncidentRecoveryCheck, monitorPolicy, 'main'),
+  true,
+  'the exact manual incident job may be durable recovery evidence',
+);
+const scheduledDeduplicatedCheck = {
+  ...exactManualIncidentRecoveryCheck,
+  id: 901,
+  event: 'schedule',
+  source_run_display_title: 'Release health monitor [continuous:6h]',
+};
+assert.equal(
+  isExactManualIncidentRecoveryCheck(scheduledDeduplicatedCheck, monitorPolicy, 'main'),
+  false,
+  'a successful scheduled monitor job must never become durable recovery evidence',
+);
+assert.deepEqual(
+  durableTrustedMonitorRecoveryChecks([
+    { ...scheduledDeduplicatedCheck, id: 899, conclusion: 'failure' },
+    scheduledDeduplicatedCheck,
+    exactManualIncidentRecoveryCheck,
+  ], monitorPolicy, 'main').map((check) => check.id),
+  [899, 900],
+  'the durable check selector must exclude successful scheduled monitor jobs',
 );
 const monitorEquivalentAncestorSha = '6'.repeat(40);
 const monitorChangedAncestorSha = '7'.repeat(40);
