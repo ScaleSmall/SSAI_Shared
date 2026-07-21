@@ -1,5 +1,5 @@
 name: Scale Small AI Release Health Monitor
-run-name: Release health monitor [${{ inputs.scan_mode || 'continuous' }}:${{ inputs.lookback_hours || '6' }}h]
+run-name: Release health monitor [${{ inputs.scan_mode == 'incident' && 'incident:168h' || format('continuous:{0}h', inputs.lookback_hours || '6') }}]
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ on:
           - continuous
           - incident
       lookback_hours:
-        description: Continuous supports 1-6 hours; incident supports 1-168 hours
+        description: Continuous supports 1-6 hours; incident mode always performs an exhaustive 168-hour scan
         required: false
         default: '6'
         type: string
@@ -33,13 +33,16 @@ env:
 jobs:
   verify:
     name: Verify current organization release health
+    if: ${{ github.event_name != 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    environment:
+      name: release-health-monitor
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ inputs.scan_mode == 'incident' && 45 || 12 }}
     env:
-      SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SCALESMALL_PAT }}
+      SSAI_RELEASE_MONITOR_STATE_HMAC_EPOCH: v1
       SSAI_RELEASE_MONITOR_STUCK_MINUTES: '45'
       SSAI_RELEASE_MONITOR_MODE: ${{ inputs.scan_mode || 'continuous' }}
-      SSAI_RELEASE_MONITOR_LOOKBACK_HOURS: ${{ inputs.lookback_hours || '6' }}
+      SSAI_RELEASE_MONITOR_LOOKBACK_HOURS: ${{ inputs.scan_mode == 'incident' && '168' || inputs.lookback_hours || '6' }}
       SSAI_RELEASE_MONITOR_MAX_REQUESTS: ${{ inputs.scan_mode == 'incident' && '3500' || '600' }}
       SSAI_RELEASE_MONITOR_RATE_RESERVE: ${{ inputs.scan_mode == 'incident' && '250' || '1000' }}
       SSAI_RELEASE_MONITOR_API_CONCURRENCY: '6'
@@ -52,14 +55,83 @@ jobs:
         with:
           node-version: '24'
 
+      - name: Restore bounded scheduled-incident state
+        id: restore_release_health_state
+        if: ${{ github.event_name == 'schedule' }}
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/ssai-release-health-monitor/state.json
+          key: ssai-release-health-state-v2-v1-lookup
+          restore-keys: |
+            ssai-release-health-state-v2-v1-
+
       - name: Verify monitor credential is available
         shell: bash
+        env:
+          SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SSAI_RELEASE_MONITOR_READ_TOKEN }}
+          SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256: ${{ secrets.SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256 }}
+          SSAI_RELEASE_MONITOR_STATE_HMAC_KEY: ${{ secrets.SSAI_RELEASE_MONITOR_STATE_HMAC_KEY }}
         run: |
           set -euo pipefail
-          if [ "${#SSAI_RELEASE_MONITOR_GITHUB_TOKEN}" -lt 20 ]; then
-            echo "::error::SCALESMALL_PAT must provide read access to the private SSAI repositories"
+          if [ "${#SSAI_RELEASE_MONITOR_GITHUB_TOKEN}" -lt 20 ] || [ "${#SSAI_RELEASE_MONITOR_STATE_HMAC_KEY}" -lt 32 ] || ! [[ "$SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256" =~ ^[a-f0-9]{64}$ ]]; then
+            echo "::error::The protected release-health-monitor environment credential is unavailable"
             exit 1
           fi
 
       - name: Reconcile current health and every recent failure
-        run: node scripts/verify-org-release-health.mjs
+        id: reconcile
+        env:
+          SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SSAI_RELEASE_MONITOR_READ_TOKEN }}
+          SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256: ${{ secrets.SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256 }}
+          SSAI_RELEASE_MONITOR_STATE_HMAC_KEY: ${{ secrets.SSAI_RELEASE_MONITOR_STATE_HMAC_KEY }}
+          SSAI_RELEASE_MONITOR_STATE_CACHE_MATCHED_KEY: ${{ steps.restore_release_health_state.outputs.cache-matched-key }}
+          SSAI_RELEASE_MONITOR_STATE_CACHE_PREFIX: ssai-release-health-state-v2-v1-
+          SSAI_RELEASE_MONITOR_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          SSAI_RELEASE_MONITOR_STATE_PATH: ${{ runner.temp }}/ssai-release-health-monitor/state.json
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          const hostedActions = String(process.env.GITHUB_ACTIONS || '').toLowerCase() === 'true';
+          try {
+            const monitor = await import('./scripts/verify-org-release-health.mjs');
+            await monitor.executeReleaseHealthMonitorEntryPoint(monitor.runReleaseHealthMonitor);
+          } catch (caught) {
+            if (hostedActions) {
+              console.error('::error::Release-health monitor failed closed before aggregate reporting.');
+            } else {
+              console.error(caught instanceof Error ? caught.stack || caught.message : String(caught));
+            }
+            process.exitCode = 1;
+          }
+          NODE
+
+      - name: Persist changed scheduled-incident state
+        if: ${{ always() && github.event_name == 'schedule' && steps.reconcile.outputs.incident_state_changed == 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/ssai-release-health-monitor/state.json
+          key: ${{ steps.reconcile.outputs.incident_state_cache_key }}
+
+      - name: Verify changed scheduled-incident state is visible
+        id: verify_release_health_state
+        if: ${{ always() && github.event_name == 'schedule' && steps.reconcile.outputs.incident_state_changed == 'true' }}
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ runner.temp }}/ssai-release-health-monitor/state.json
+          key: ${{ steps.reconcile.outputs.incident_state_cache_key }}
+          lookup-only: true
+          fail-on-cache-miss: true
+
+      - name: Require changed scheduled-incident state persistence
+        if: ${{ always() && github.event_name == 'schedule' && steps.reconcile.outputs.incident_state_changed == 'true' }}
+        shell: bash
+        env:
+          EXPECTED_STATE_KEY: ${{ steps.reconcile.outputs.incident_state_cache_key }}
+          MATCHED_STATE_KEY: ${{ steps.verify_release_health_state.outputs.cache-matched-key }}
+          STATE_CACHE_HIT: ${{ steps.verify_release_health_state.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [ "$STATE_CACHE_HIT" != 'true' ] || [ "$MATCHED_STATE_KEY" != "$EXPECTED_STATE_KEY" ]; then
+            echo "::error::Release-health monitor failed closed"
+            exit 1
+          fi
