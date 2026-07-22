@@ -221,6 +221,8 @@ requireText(releaseHealthVerifier, 'findProvisionalForwardFixCheckRecovery(', 'b
 requireText(releaseHealthVerifier, 'findTrustedMonitorCheckRecovery(', 'source-verified monitor check recovery');
 requireText(releaseHealthVerifier, 'findProvisionalTrustedMonitorCheckRecoveryFromRun(', 'check-index-independent monitor self-latch');
 requireText(releaseHealthVerifier, 'isTrustedMonitorRecoveryPolicy(', 'explicit trusted-monitor policy gate');
+requireText(releaseHealthVerifier, 'isControlledDisabledMonitorRecoveryWorkflow(', 'exact controlled runbook re-disable policy gate');
+requireText(releaseHealthVerifier, 'repo.name,\n    allWorkflows,\n    headSha,\n    { recentRuns, defaultBranch },', 'disabled monitor policy resolution without active-health inclusion');
 requireText(releaseHealthVerifier, 'findPolicyBoundWorkflowRecovery(', 'coverage-aware workflow recovery selection');
 requireText(releaseHealthVerifier, 'findPolicyBoundCheckRecovery(', 'coverage-aware check recovery selection');
 requireText(releaseHealthVerifier, 'const directRecovery = trustedMonitorPolicy ? null : policyBoundRecovery;', 'trusted monitor generic-recovery bypass prevention');

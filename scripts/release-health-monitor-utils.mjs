@@ -347,6 +347,48 @@ export function findSupersedingWorkflowRun(failedRun, runs) {
   return later || null;
 }
 
+export function isControlledDisabledMonitorRecoveryWorkflow({
+  workflow,
+  policy,
+  currentHeadSha,
+  context,
+}) {
+  if (!workflow || typeof workflow !== 'object'
+    || !policy || typeof policy !== 'object' || Array.isArray(policy)
+    || !context || typeof context !== 'object' || Array.isArray(context)) return false;
+  const currentRun = context.currentRun;
+  const expectedWorkflowId = Number(policy.workflowId);
+  const expectedPath = String(policy.path || '').trim();
+  const expectedRepository = String(policy.headRepository || '').trim();
+  const normalizedCurrentHeadSha = String(currentHeadSha || '').trim().toLowerCase();
+  const currentRunId = Number(context.currentRunId);
+  const currentRunAttempt = Number(context.currentRunAttempt);
+  const observedRunAttempt = Number(currentRun?.run_attempt);
+  return workflow.state === 'disabled_manually'
+    && policy.monitorSelfRecoveryContract === 'release-health-monitor-v1'
+    && expectedPath === '.github/workflows/release-health-monitor.yml'
+    && Number.isSafeInteger(expectedWorkflowId) && expectedWorkflowId > 0
+    && Number(workflow.id) === expectedWorkflowId
+    && String(workflow.path || '') === expectedPath
+    && String(context.currentRepository || '') === expectedRepository
+    && String(currentRun?.head_repository?.full_name || '') === expectedRepository
+    && /^[a-f0-9]{40}$/.test(normalizedCurrentHeadSha)
+    && String(currentRun?.head_sha || '').toLowerCase() === normalizedCurrentHeadSha
+    && String(currentRun?.head_branch || '') === String(context.defaultBranch || '')
+    && Number.isSafeInteger(currentRunId) && currentRunId > 0
+    && Number(currentRun?.id) === currentRunId
+    && Number(currentRun?.workflow_id) === expectedWorkflowId
+    && Number.isSafeInteger(currentRunAttempt) && currentRunAttempt > 0
+    && Number.isSafeInteger(observedRunAttempt) && observedRunAttempt > 0
+    && observedRunAttempt === currentRunAttempt
+    && currentRun?.event === 'workflow_dispatch'
+    && currentRun?.display_title === 'Release health monitor [incident:168h]'
+    && currentRun?.status === 'in_progress'
+    && currentRun?.conclusion === null
+    && context.scanMode === 'incident'
+    && Number(context.lookbackHours) === 168;
+}
+
 export function verifyForwardFixRecoveryPolicy({
   workflow,
   policy,
@@ -354,6 +396,7 @@ export function verifyForwardFixRecoveryPolicy({
   auditedOriginSources,
   monitorImplementationSource,
   currentHeadSha,
+  controlledRunContext,
 }) {
   if (!workflow || typeof workflow !== 'object') throw new TypeError('workflow must be an object');
   if (!policy || typeof policy !== 'object' || Array.isArray(policy)) return null;
@@ -381,9 +424,15 @@ export function verifyForwardFixRecoveryPolicy({
       monitorImplementationSource?.utilsSource,
     )
     : null;
+  const controlledDisabledMonitor = isControlledDisabledMonitorRecoveryWorkflow({
+    workflow,
+    policy,
+    currentHeadSha,
+    context: controlledRunContext,
+  });
   if (!Number.isSafeInteger(expectedWorkflowId) || expectedWorkflowId < 1
     || Number(workflow.id) !== expectedWorkflowId
-    || workflow.state !== 'active'
+    || (workflow.state !== 'active' && !controlledDisabledMonitor)
     || String(workflow.path || '') !== expectedPath
     || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(expectedRepository)
     || !failedEvents || !recoveryEvents || !jobNames || !recoveryDisplayTitles || !auditedMonitorOrigins
@@ -422,6 +471,7 @@ export function verifyForwardFixRecoveryPolicy({
     monitorSelfRecoveryEvents,
     auditedMonitorOrigins,
     monitorImplementationIdentity,
+    controlledDisabledMonitor,
     currentMonitorHeadSha: monitorSelfRecoveryConfigured ? normalizedCurrentHeadSha : null,
     attestedMonitorHeadShas: monitorSelfRecoveryConfigured
       ? new Set([normalizedCurrentHeadSha])
