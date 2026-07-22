@@ -61,7 +61,9 @@ import {
   releaseHealthLogPayload,
   renderReleaseHealthStepSummary,
   scheduledIncidentStateEnabled,
+  validateInstallationRepositoryPage,
   verifyExpectedInventoryAttestation,
+  verifyInstallationRepositoryScope,
   auditedPriorMonitorWorkflowSourceSha256,
   currentMonitorWorkflowSourceSha256,
 } from './verify-org-release-health.mjs';
@@ -233,9 +235,9 @@ assert.throws(
 );
 
 const attestedInventory = [
-  { full_name: 'ScaleSmall/SSAI_Dashboard' },
-  { full_name: 'ScaleSmall/SSAI_Shared' },
-  { full_name: 'ScaleSmall/SSAI_NAP_Entity' },
+  { name: 'SSAI_Dashboard', full_name: 'ScaleSmall/SSAI_Dashboard', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Shared', full_name: 'ScaleSmall/SSAI_Shared', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_NAP_Entity', full_name: 'ScaleSmall/SSAI_NAP_Entity', owner: { login: 'ScaleSmall' }, archived: false },
 ];
 const attestedInventorySha256 = expectedInventoryDigest(attestedInventory);
 assert.equal(
@@ -256,6 +258,92 @@ assert.throws(
   /completeness attestation/,
   'an unreviewed extra repository must fail inventory completeness',
 );
+
+const installationPage = validateInstallationRepositoryPage({
+  total_count: 2,
+  repositories: attestedInventory.slice(0, 1),
+}, null, 0);
+assert.deepEqual(
+  { totalCount: installationPage.totalCount, complete: installationPage.complete },
+  { totalCount: 2, complete: false },
+  'installation pagination must preserve the provider-declared total count',
+);
+assert.equal(
+  validateInstallationRepositoryPage({
+    total_count: 2,
+    repositories: attestedInventory.slice(1, 2),
+  }, installationPage.totalCount, 1).complete,
+  true,
+  'installation pagination must complete only at the exact declared total count',
+);
+assert.throws(
+  () => validateInstallationRepositoryPage({ total_count: 3, repositories: [] }, 2, 1),
+  /total changed/,
+  'a changing installation total must fail closed',
+);
+assert.throws(
+  () => validateInstallationRepositoryPage({ total_count: 1, repositories: attestedInventory }, null, 0),
+  /exceeded/,
+  'an oversized installation page must fail closed',
+);
+assert.equal(
+  verifyInstallationRepositoryScope(attestedInventory, 'ScaleSmall', 'SSAI_', new Set(['SSAI_Connect'])),
+  true,
+  'the exact selected-repository installation must pass scope validation',
+);
+assert.throws(
+  () => verifyInstallationRepositoryScope(
+    [...attestedInventory, {
+      name: 'SSAI_Connect',
+      full_name: 'ScaleSmall/SSAI_Connect',
+      owner: { login: 'ScaleSmall' },
+      archived: false,
+    }],
+    'ScaleSmall',
+    'SSAI_',
+    new Set(['SSAI_Connect']),
+  ),
+  /outside the approved release-health scope/,
+  'the protected Connect repository must never be included in the App installation',
+);
+
+for (const [label, repository] of [
+  ['wrong owner', {
+    name: 'SSAI_Dashboard',
+    full_name: 'Unrelated/SSAI_Dashboard',
+    owner: { login: 'Unrelated' },
+    archived: false,
+  }],
+  ['wrong prefix', {
+    name: 'hillcosite',
+    full_name: 'ScaleSmall/hillcosite',
+    owner: { login: 'ScaleSmall' },
+    archived: false,
+  }],
+  ['malformed full name', {
+    name: 'SSAI_Dashboard',
+    full_name: 'ScaleSmall/SSAI_Shared',
+    owner: { login: 'ScaleSmall' },
+    archived: false,
+  }],
+  ['archived repository', {
+    name: 'SSAI_Dashboard',
+    full_name: 'ScaleSmall/SSAI_Dashboard',
+    owner: { login: 'ScaleSmall' },
+    archived: true,
+  }],
+]) {
+  assert.throws(
+    () => verifyInstallationRepositoryScope(
+      [...attestedInventory, repository],
+      'ScaleSmall',
+      'SSAI_',
+      new Set(['SSAI_Connect']),
+    ),
+    /outside the approved release-health scope/,
+    `an installation repository with ${label} must fail closed`,
+  );
+}
 
 const hostedPublicEnvironment = {
   GITHUB_ACTIONS: 'true',

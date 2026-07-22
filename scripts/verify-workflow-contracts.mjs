@@ -98,8 +98,18 @@ requireText(releaseHealth, 'cancel-in-progress: false', 'non-cancelling release-
 requireText(releaseHealth, 'runs-on: ubuntu-24.04', 'pinned release-health runner');
 requireText(releaseHealth, 'persist-credentials: false', 'release-health checkout credential isolation');
 requireText(releaseHealth, "node-version: '24'", 'release-health Node runtime');
-requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SSAI_RELEASE_MONITOR_READ_TOKEN }}', 'dedicated release-health read token source');
+requireText(releaseHealth, 'actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1', 'immutable release-health GitHub App token action');
+requireText(releaseHealth, 'client-id: ${{ secrets.SSAI_RELEASE_MONITOR_APP_CLIENT_ID }}', 'dedicated release-health GitHub App client ID');
+requireText(releaseHealth, 'private-key: ${{ secrets.SSAI_RELEASE_MONITOR_APP_PRIVATE_KEY }}', 'dedicated release-health GitHub App private key');
+requireText(releaseHealth, 'owner: ScaleSmall', 'personal-account GitHub App installation owner');
+for (const permission of ['actions', 'checks', 'contents', 'deployments', 'metadata', 'pull-requests', 'statuses']) {
+  requireText(releaseHealth, `permission-${permission}: read`, `read-only GitHub App ${permission} permission`);
+}
+requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ steps.release_health_app_token.outputs.token }}', 'short-lived release-health installation token source');
+requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_GITHUB_INSTALLATION_ID: ${{ steps.release_health_app_token.outputs.installation-id }}', 'release-health installation identity gate');
+rejectPattern(releaseHealth, /SSAI_RELEASE_MONITOR_READ_TOKEN/, 'unsupported fine-grained PAT release-health source');
 rejectPattern(releaseHealth, /SSAI_RELEASE_MONITOR_GITHUB_TOKEN:\s*\$\{\{\s*secrets\.SCALESMALL_PAT\s*\}\}/, 'legacy shared PAT as the release-health token');
+rejectPattern(releaseHealth, /skip-token-revoke:\s*['"]?true/i, 'installation token revocation bypass');
 requireText(releaseHealth, 'environment:\n      name: release-health-monitor', 'protected release-health environment binding');
 requireText(
   releaseHealth,
@@ -114,14 +124,19 @@ const verifyJobHeader = releaseHealth.slice(
   releaseHealth.indexOf('    steps:\n', releaseHealth.indexOf('  verify:\n')),
 );
 rejectPattern(verifyJobHeader, /secrets\./, 'fleet secrets exposed to job-level actions');
-for (const secretName of [
-  'SSAI_RELEASE_MONITOR_READ_TOKEN',
-  'SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256',
-  'SSAI_RELEASE_MONITOR_STATE_HMAC_KEY',
-]) {
+for (const secretName of ['SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256', 'SSAI_RELEASE_MONITOR_STATE_HMAC_KEY']) {
   const references = releaseHealth.match(new RegExp(`secrets\\.${secretName}`, 'g')) || [];
   assert.equal(references.length, 2, `${secretName} must be scoped only to preflight and reconcile steps`);
 }
+for (const secretName of ['SSAI_RELEASE_MONITOR_APP_CLIENT_ID', 'SSAI_RELEASE_MONITOR_APP_PRIVATE_KEY']) {
+  const references = releaseHealth.match(new RegExp(`secrets\\.${secretName}`, 'g')) || [];
+  assert.equal(references.length, 1, `${secretName} must be scoped only to the installation-token mint step`);
+}
+assert.equal(
+  (releaseHealth.match(/steps\.release_health_app_token\.outputs\.token/g) || []).length,
+  2,
+  'the short-lived installation token must be scoped only to preflight and reconcile steps',
+);
 requireText(releaseHealth, 'scan_mode:', 'explicit continuous/incident release-health mode');
 requireText(releaseHealth, 'type: choice', 'validated release-health mode choice');
 requireText(releaseHealth, '          - continuous\n          - incident', 'release-health mode options');
@@ -254,9 +269,23 @@ requireText(releaseHealthVerifier, 'findPolicyBoundProvisionalWorkflowRecovery('
 requireText(releaseHealthVerifier, 'findPolicyBoundProvisionalCheckRecovery(', 'policy-bound check self-latch guard');
 requireText(releaseHealthVerifier, 'createConcurrencyGate(apiConcurrency)', 'global GitHub API concurrency gate');
 requireText(releaseHealthVerifier, 'GitHub API request budget exhausted', 'fail-closed API request budget');
-requireText(releaseHealthVerifier, "await api('/user')", 'representative core rate-limit preflight');
+requireText(releaseHealthVerifier, "await api('/installation/repositories?per_page=1&page=1')", 'installation-authenticated core rate-limit preflight');
+requireText(releaseHealthVerifier, "await api('/installation/repositories?per_page=100&page=' + page)", 'installation-scoped repository inventory');
+requireText(releaseHealthVerifier, 'validateInstallationRepositoryPage(', 'fail-closed installation pagination validation');
+requireText(releaseHealthVerifier, 'verifyInstallationRepositoryScope(', 'least-privilege installation repository scope validation');
+rejectPattern(releaseHealthVerifier, /api\('\/user(?:\/repos)?(?:\?|')/, 'PAT-only user repository inventory');
 requireText(releaseHealthVerifier, "rateDecision === 'defer'", 'continuous rate-limit backpressure');
 requireText(releaseHealthVerifier, "rateDecision === 'fail'", 'incident rate-limit fail-closed gate');
+assert.ok(
+  releaseHealthVerifier.indexOf('verifyInstallationRepositoryScope(installationRepositories);')
+    < releaseHealthVerifier.indexOf('const rateDecision = rateHeadroomDecision('),
+  'GitHub App installation scope must fail closed before any quota-deferred return',
+);
+assert.ok(
+  releaseHealthVerifier.indexOf('verifyExpectedInventoryAttestation(repositories, expectedInventorySha256);')
+    < releaseHealthVerifier.indexOf('const rateDecision = rateHeadroomDecision('),
+  'the exact expected repository inventory must be attested before any quota-deferred return',
+);
 requireText(releaseHealthVerifier, 'throw truncationError(', 'fail-closed pagination');
 requireText(releaseHealthVerifier, 'fingerprintReleaseHealthIncident(', 'typed immutable incident fingerprinting');
 requireText(releaseHealthVerifier, 'decodeScheduledIncidentState(', 'cache-key/content integrity validation');

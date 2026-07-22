@@ -111,7 +111,7 @@ const legacyMonitorTitle = 'Scale Small AI Release Health Monitor';
 const legacySnapshotWorkflowSourceSha256 = '0faccc93dd783cd0c76ecd837bcd5bb6cbb046b2670a0f7f41d039e433c49b04';
 const legacyBoundedWorkflowSourceSha256 = '1adbb7b1738f9562968a644b8854bf7fc04496eea976809cae83429204f14858';
 export const auditedPriorMonitorWorkflowSourceSha256 = '3672ed17290279e20d75336e810d9327a59786c16a77332aa5be2f4adb0238a1';
-export const currentMonitorWorkflowSourceSha256 = '85bcd1329756df394eee14985e3938ac8e840332a076e4e89f2d4612d23f8630';
+export const currentMonitorWorkflowSourceSha256 = '53b31cdbab29a462033b7bbdea327c8563f1976df003cca00e6c71d80ff7f55d';
 const auditedMonitorSourceEvidence = new Map([
   ['82fc98124d0b5412e3591c9357da76ba7f324737', {
     workflowSourceSha256: legacySnapshotWorkflowSourceSha256,
@@ -318,25 +318,14 @@ const scheduledStateEnabled = scheduledIncidentStateEnabled(scanMode, triggerEve
 const previousIncidentState = scheduledStateEnabled ? await loadScheduledIncidentState() : null;
 
 // GitHub's /rate_limit endpoint can be served from a different cache/rate
-// context than repository APIs. Probe an authenticated core endpoint so the
-// preflight uses the same quota bucket the inventory will actually consume.
-await api('/user');
-if (!Number.isSafeInteger(requestStats.rate_remaining)) {
-  throw new Error('GitHub API rate-limit headers were unavailable. The scan cannot prove sufficient request headroom and is failing closed.');
-}
-const rateDecision = rateHeadroomDecision(scanMode, requestStats.rate_remaining, rateReserve, maxRequests);
-if (rateDecision === 'fail') {
-  throw new Error('Incident scan requires at least ' + (rateReserve + maxRequests)
-    + ' GitHub API requests of starting headroom, but only ' + requestStats.rate_remaining
-    + ' remain. Retry after the rate limit resets at ' + (requestStats.rate_reset_at || 'the provider reset time') + '.');
-}
-if (rateDecision === 'defer') {
-  const deferredSummary = deferredRateSummary();
-  console.log(JSON.stringify(releaseHealthLogPayload(deferredSummary), null, 2));
-  console.error('::warning::Continuous release-health scan deferred until GitHub API quota resets; no inventory was sampled or reported as healthy.');
-  await writeStepSummary(deferredSummary);
-} else {
-  const repositories = (await listRepositories())
+// context than repository APIs. Probe the installation repository endpoint so
+// the preflight verifies both the App credential type and the quota bucket the
+// inventory will actually consume.
+const installationProbe = await api('/installation/repositories?per_page=1&page=1');
+validateInstallationRepositoryPage(installationProbe, null, 0);
+const installationRepositories = await listRepositories();
+verifyInstallationRepositoryScope(installationRepositories);
+const repositories = installationRepositories
   .filter((repo) => repo.owner?.login === owner
     && !repo.archived
     && String(repo.name).startsWith(repoPrefix)
@@ -348,6 +337,21 @@ if (repositories.length === 0) {
 }
 verifyExpectedInventoryAttestation(repositories, expectedInventorySha256);
 
+if (!Number.isSafeInteger(requestStats.rate_remaining)) {
+  throw new Error('GitHub API rate-limit headers were unavailable. The scan cannot prove sufficient request headroom and is failing closed.');
+}
+const rateDecision = rateHeadroomDecision(scanMode, requestStats.rate_remaining, rateReserve, maxRequests);
+if (rateDecision === 'fail') {
+  throw new Error('Incident scan requires at least ' + (rateReserve + maxRequests)
+    + ' GitHub API requests of starting headroom, but only ' + requestStats.rate_remaining
+    + ' remain. Retry after the rate limit resets at ' + (requestStats.rate_reset_at || 'the provider reset time') + '.');
+}
+if (rateDecision === 'defer') {
+  const deferredSummary = deferredRateSummary(repositories.length);
+  console.log(JSON.stringify(releaseHealthLogPayload(deferredSummary), null, 2));
+  console.error('::warning::Continuous release-health scan deferred until GitHub API quota resets; repository scope was attested, but no health was reported.');
+  await writeStepSummary(deferredSummary);
+} else {
 await mapLimit(repositories, 4, inspectRepository);
 
 if (requestStats.requests > Math.floor(maxRequests * 0.8)) {
@@ -1695,14 +1699,67 @@ function reconcileDeploymentFailures(repoName, statuses) {
 
 async function listRepositories() {
   const all = [];
+  let totalCount = null;
   for (let page = 1; page <= pageLimits.repositories; page += 1) {
-    const batch = await api('/user/repos?affiliation=owner,organization_member&visibility=all&per_page=100&page=' + page);
-    if (!Array.isArray(batch)) throw new Error('GitHub repository list returned an invalid response.');
-    all.push(...batch);
-    if (batch.length < 100) return all;
+    const payload = await api('/installation/repositories?per_page=100&page=' + page);
+    const validated = validateInstallationRepositoryPage(payload, totalCount, all.length);
+    totalCount = validated.totalCount;
+    all.push(...validated.repositories);
+    if (validated.complete) return all;
+    if (validated.repositories.length < 100) {
+      throw new Error('GitHub App installation repository inventory ended before its declared total count.');
+    }
     if (page === pageLimits.repositories) throw truncationError(owner, 'repository list', pageLimits.repositories);
   }
   return all;
+}
+
+export function validateInstallationRepositoryPage(payload, priorTotalCount, accumulatedCount) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('GitHub App installation repository list returned an invalid response.');
+  }
+  const totalCount = Number(payload.total_count);
+  const repositories = payload.repositories;
+  if (!Number.isSafeInteger(totalCount) || totalCount < 0 || !Array.isArray(repositories)) {
+    throw new Error('GitHub App installation repository list returned invalid pagination metadata.');
+  }
+  if (priorTotalCount !== null && totalCount !== priorTotalCount) {
+    throw new Error('GitHub App installation repository total changed during pagination.');
+  }
+  if (!Number.isSafeInteger(accumulatedCount) || accumulatedCount < 0
+    || accumulatedCount + repositories.length > totalCount) {
+    throw new Error('GitHub App installation repository pagination exceeded its declared total count.');
+  }
+  return {
+    repositories,
+    totalCount,
+    complete: accumulatedCount + repositories.length === totalCount,
+  };
+}
+
+export function verifyInstallationRepositoryScope(
+  repositories,
+  expectedOwner = owner,
+  expectedPrefix = repoPrefix,
+  exclusions = excludedRepositories,
+) {
+  if (!Array.isArray(repositories) || !(exclusions instanceof Set)) {
+    throw new TypeError('GitHub App installation scope inputs are invalid.');
+  }
+  const outOfScope = repositories.filter((repository) => {
+    const repositoryOwner = String(repository?.owner?.login || '').trim();
+    const repositoryName = String(repository?.name || '').trim();
+    const fullName = String(repository?.full_name || '').trim();
+    return repositoryOwner !== expectedOwner
+      || fullName !== repositoryOwner + '/' + repositoryName
+      || !repositoryName.startsWith(expectedPrefix)
+      || Boolean(repository?.archived)
+      || exclusions.has(repositoryName);
+  });
+  if (outOfScope.length) {
+    throw new Error('GitHub App installation includes repositories outside the approved release-health scope.');
+  }
+  return true;
 }
 
 async function api(pathname) {
@@ -2410,7 +2467,7 @@ export function renderReleaseHealthStepSummary(result, environment = process.env
   return lines.join('\n') + '\n';
 }
 
-function deferredRateSummary() {
+function deferredRateSummary(repositoryCount) {
   return {
     ok: null,
     deferred: true,
@@ -2420,7 +2477,7 @@ function deferredRateSummary() {
     owner,
     repository_prefix: repoPrefix,
     scan_mode: scanMode,
-    repositories: 0,
+    repositories: repositoryCount,
     active_workflows: 0,
     green_workflows: 0,
     pending_workflows: 0,
@@ -2459,7 +2516,7 @@ function deferredRateSummary() {
     github_api_rate_remaining: requestStats.rate_remaining,
     github_api_rate_reset_at: requestStats.rate_reset_at,
     failures: [],
-    warnings: ['Continuous scan deferred for API quota; a later scheduled run must complete the inventory.'],
+    warnings: ['Repository scope was attested, but the continuous health scan was deferred for API quota.'],
   };
 }
 
