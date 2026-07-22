@@ -55,6 +55,21 @@ jobs:
         with:
           node-version: '24'
 
+      - name: Mint selected-repository release-health GitHub App token
+        id: release_health_app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ secrets.SSAI_RELEASE_MONITOR_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SSAI_RELEASE_MONITOR_APP_PRIVATE_KEY }}
+          owner: ScaleSmall
+          permission-actions: read
+          permission-checks: read
+          permission-contents: read
+          permission-deployments: read
+          permission-metadata: read
+          permission-pull-requests: read
+          permission-statuses: read
+
       - name: Restore bounded scheduled-incident state
         id: restore_release_health_state
         if: ${{ github.event_name == 'schedule' }}
@@ -65,15 +80,16 @@ jobs:
           restore-keys: |
             ssai-release-health-state-v2-v1-
 
-      - name: Verify monitor credential is available
+      - name: Verify monitor credentials are available
         shell: bash
         env:
-          SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SSAI_RELEASE_MONITOR_READ_TOKEN }}
+          SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ steps.release_health_app_token.outputs.token }}
+          SSAI_RELEASE_MONITOR_GITHUB_INSTALLATION_ID: ${{ steps.release_health_app_token.outputs.installation-id }}
           SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256: ${{ secrets.SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256 }}
           SSAI_RELEASE_MONITOR_STATE_HMAC_KEY: ${{ secrets.SSAI_RELEASE_MONITOR_STATE_HMAC_KEY }}
         run: |
           set -euo pipefail
-          if [ "${#SSAI_RELEASE_MONITOR_GITHUB_TOKEN}" -lt 20 ] || [ "${#SSAI_RELEASE_MONITOR_STATE_HMAC_KEY}" -lt 32 ] || ! [[ "$SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256" =~ ^[a-f0-9]{64}$ ]]; then
+          if [ "${#SSAI_RELEASE_MONITOR_GITHUB_TOKEN}" -lt 20 ] || ! [[ "$SSAI_RELEASE_MONITOR_GITHUB_INSTALLATION_ID" =~ ^[1-9][0-9]*$ ]] || [ "${#SSAI_RELEASE_MONITOR_STATE_HMAC_KEY}" -lt 32 ] || ! [[ "$SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256" =~ ^[a-f0-9]{64}$ ]]; then
             echo "::error::The protected release-health-monitor environment credential is unavailable"
             exit 1
           fi
@@ -81,7 +97,7 @@ jobs:
       - name: Reconcile current health and every recent failure
         id: reconcile
         env:
-          SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ secrets.SSAI_RELEASE_MONITOR_READ_TOKEN }}
+          SSAI_RELEASE_MONITOR_GITHUB_TOKEN: ${{ steps.release_health_app_token.outputs.token }}
           SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256: ${{ secrets.SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256 }}
           SSAI_RELEASE_MONITOR_STATE_HMAC_KEY: ${{ secrets.SSAI_RELEASE_MONITOR_STATE_HMAC_KEY }}
           SSAI_RELEASE_MONITOR_STATE_CACHE_MATCHED_KEY: ${{ steps.restore_release_health_state.outputs.cache-matched-key }}
