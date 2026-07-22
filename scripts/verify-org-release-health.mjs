@@ -28,6 +28,7 @@ import {
   findSupersedingDeployment,
   findTrustedMonitorCheckRecovery,
   githubRetryDelayMs,
+  isControlledDisabledMonitorRecoveryWorkflow,
   isTrustedMonitorRecoveryPolicy,
   isEligibleTrustedMonitorImplementationCandidate,
   latestByIdentity,
@@ -88,7 +89,7 @@ const deploymentOriginCutoffMs = nowMs - (deploymentOriginHours * 60 * 60_000);
 const currentRepository = String(process.env.GITHUB_REPOSITORY || '');
 const currentRepoName = currentRepository.startsWith(owner + '/') ? currentRepository.slice(owner.length + 1) : '';
 const currentRunId = numericIdentifier(process.env.GITHUB_RUN_ID);
-const currentRunAttempt = numericIdentifier(process.env.GITHUB_RUN_ATTEMPT) || 1;
+const currentRunAttempt = numericIdentifier(process.env.GITHUB_RUN_ATTEMPT);
 const pageLimits = scanMode === 'incident'
   ? { workflows: 10, runs: 50, commits: 20, pulls: 10, branches: 10, checks: 20, statuses: 20, deployments: 50, repositories: 10 }
   : { workflows: 10, runs: 10, commits: 5, pulls: 3, branches: 3, checks: 5, statuses: 5, deployments: 10, repositories: 10 };
@@ -473,8 +474,9 @@ async function inspectRepository(repo) {
   const workflows = allWorkflows.filter((workflow) => workflow.state === 'active');
   const verifiedForwardFixPolicies = await resolveForwardFixRecoveryPolicies(
     repo.name,
-    workflows,
+    allWorkflows,
     headSha,
+    { recentRuns, defaultBranch },
   );
   await addVerifiedForwardFixOriginShas({
     repoName: repo.name,
@@ -869,14 +871,33 @@ async function collectRepositorySource(repoName, path, ref, allowMissing) {
   return bytes;
 }
 
-async function resolveForwardFixRecoveryPolicies(repoName, workflows, headSha) {
+async function resolveForwardFixRecoveryPolicies(repoName, workflows, headSha, { recentRuns, defaultBranch }) {
   const verified = new Map();
+  const currentRun = repoName === currentRepoName && currentRunId
+    ? recentRuns.find((run) => Number(run.id) === currentRunId
+      && Number(run.run_attempt) === currentRunAttempt)
+    : null;
+  const controlledRunContext = {
+    currentRun,
+    currentRunId,
+    currentRunAttempt,
+    currentRepository,
+    defaultBranch,
+    scanMode,
+    lookbackHours,
+  };
   const configured = [...forwardFixRecoveryPolicies.entries()]
     .filter(([key]) => key.startsWith(repoName + ':'))
     .map(([, policy]) => policy);
   await mapLimit(configured, 2, async (policy) => {
     const workflow = workflows.find((candidate) => Number(candidate.id) === Number(policy.workflowId));
-    if (!workflow) {
+    const controlledDisabledMonitor = isControlledDisabledMonitorRecoveryWorkflow({
+      workflow,
+      policy,
+      currentHeadSha: headSha,
+      context: controlledRunContext,
+    });
+    if (!workflow || (workflow.state !== 'active' && !controlledDisabledMonitor)) {
       failures.push(issue(
         repoName,
         policy.path,
@@ -938,6 +959,7 @@ async function resolveForwardFixRecoveryPolicies(repoName, workflows, headSha) {
         scriptSource: currentMonitorScriptSource,
         utilsSource: currentMonitorUtilsSource,
       } : undefined,
+      controlledRunContext,
     });
     if (!resolved) {
       failures.push(issue(

@@ -35,6 +35,7 @@ import {
   findTrustedMonitorCheckRecovery,
   findTrustedMonitorWorkflowRecovery,
   githubRetryDelayMs,
+  isControlledDisabledMonitorRecoveryWorkflow,
   isTrustedMonitorRecoveryPolicy,
   isEligibleTrustedMonitorImplementationCandidate,
   latestByIdentity,
@@ -1145,19 +1146,20 @@ const forwardFixWorkflow = {
   path: '.github/workflows/n8n-production-exactness.yml',
   state: 'active',
 };
+const forwardFixPolicyInput = {
+  workflowId: forwardFixWorkflow.id,
+  path: forwardFixWorkflow.path,
+  sourceSha256: createHash('sha256').update(forwardFixSource).digest('hex'),
+  headRepository: 'ScaleSmall/SSAI_PoW',
+  failedEvents: ['schedule'],
+  recoveryEvents: ['workflow_dispatch'],
+  jobNames: ['verify-production'],
+  recoveryDisplayTitles: ['Production n8n workflow exactness'],
+};
 const forwardFixPolicy = verifyForwardFixRecoveryPolicy({
   workflow: forwardFixWorkflow,
   workflowSource: forwardFixSource,
-  policy: {
-    workflowId: forwardFixWorkflow.id,
-    path: forwardFixWorkflow.path,
-    sourceSha256: createHash('sha256').update(forwardFixSource).digest('hex'),
-    headRepository: 'ScaleSmall/SSAI_PoW',
-    failedEvents: ['schedule'],
-    recoveryEvents: ['workflow_dispatch'],
-    jobNames: ['verify-production'],
-    recoveryDisplayTitles: ['Production n8n workflow exactness'],
-  },
+  policy: forwardFixPolicyInput,
 });
 assert.ok(forwardFixPolicy, 'an exact active source-hashed workflow policy must verify');
 assert.equal(isTrustedMonitorRecoveryPolicy(forwardFixPolicy), false, 'a generic forward-fix policy must not enter trusted monitor recovery');
@@ -1351,6 +1353,105 @@ assert.deepEqual(
   [monitorCurrentSha],
   'a verified policy must initially trust only the exact current implementation SHA',
 );
+const controlledDisabledMonitorRun = {
+  id: 799,
+  run_attempt: 2,
+  workflow_id: monitorWorkflow.id,
+  head_branch: 'main',
+  head_sha: monitorCurrentSha,
+  head_repository: { full_name: 'ScaleSmall/SSAI_Shared' },
+  event: 'workflow_dispatch',
+  display_title: 'Release health monitor [incident:168h]',
+  status: 'in_progress',
+  conclusion: null,
+};
+const controlledDisabledMonitorContext = {
+  currentRun: controlledDisabledMonitorRun,
+  currentRunId: controlledDisabledMonitorRun.id,
+  currentRunAttempt: controlledDisabledMonitorRun.run_attempt,
+  currentRepository: 'ScaleSmall/SSAI_Shared',
+  defaultBranch: 'main',
+  scanMode: 'incident',
+  lookbackHours: 168,
+};
+const disabledMonitorWorkflow = { ...monitorWorkflow, state: 'disabled_manually' };
+assert.equal(isControlledDisabledMonitorRecoveryWorkflow({
+  workflow: disabledMonitorWorkflow,
+  policy: monitorPolicyInput,
+  currentHeadSha: monitorCurrentSha,
+  context: controlledDisabledMonitorContext,
+}), true, 'the exact in-flight current-main incident run may retain policy verification after the runbook re-disables the monitor');
+assert.ok(verifyForwardFixRecoveryPolicy({
+  ...monitorVerificationContext,
+  workflow: disabledMonitorWorkflow,
+  workflowSource: monitorSource,
+  policy: monitorPolicyInput,
+  auditedOriginSources,
+  controlledRunContext: controlledDisabledMonitorContext,
+}), 'the exact controlled disabled monitor must preserve its source-verified recovery policy');
+for (const [label, contextMutation, runMutation = {}] of [
+  ['missing context', null],
+  ['continuous scan', { scanMode: 'continuous' }],
+  ['narrow scan', { lookbackHours: 167 }],
+  ['wrong repository', { currentRepository: 'ScaleSmall/SSAI_Dashboard' }],
+  ['wrong run id', { currentRunId: 798 }],
+  ['wrong attempt', { currentRunAttempt: 1 }],
+  ['missing context attempt', { currentRunAttempt: undefined }],
+  ['zero context attempt', { currentRunAttempt: 0 }],
+  ['wrong branch', {}, { head_branch: 'release' }],
+  ['wrong head SHA', {}, { head_sha: monitorOldSha }],
+  ['wrong head repository', {}, { head_repository: { full_name: 'fork/SSAI_Shared' } }],
+  ['wrong workflow', {}, { workflow_id: 123 }],
+  ['missing API attempt', {}, { run_attempt: undefined }],
+  ['zero API attempt', {}, { run_attempt: 0 }],
+  ['scheduled run', {}, { event: 'schedule' }],
+  ['wrong run title', {}, { display_title: 'Release health monitor [continuous:6h]' }],
+  ['queued run', {}, { status: 'queued' }],
+  ['missing conclusion', {}, { conclusion: undefined }],
+  ['empty conclusion', {}, { conclusion: '' }],
+  ['completed run', {}, { status: 'completed', conclusion: 'success' }],
+]) {
+  const mutatedContext = contextMutation === null ? null : {
+    ...controlledDisabledMonitorContext,
+    ...contextMutation,
+    currentRun: { ...controlledDisabledMonitorRun, ...runMutation },
+  };
+  assert.equal(isControlledDisabledMonitorRecoveryWorkflow({
+    workflow: disabledMonitorWorkflow,
+    policy: monitorPolicyInput,
+    currentHeadSha: monitorCurrentSha,
+    context: mutatedContext,
+  }), false, label + ' must not authorize a disabled monitor recovery policy');
+  assert.equal(verifyForwardFixRecoveryPolicy({
+    ...monitorVerificationContext,
+    workflow: disabledMonitorWorkflow,
+    workflowSource: monitorSource,
+    policy: monitorPolicyInput,
+    auditedOriginSources,
+    controlledRunContext: mutatedContext,
+  }), null, label + ' must fail closed during disabled monitor policy verification');
+}
+assert.equal(isControlledDisabledMonitorRecoveryWorkflow({
+  workflow: { ...disabledMonitorWorkflow, state: 'disabled_inactivity' },
+  policy: monitorPolicyInput,
+  currentHeadSha: monitorCurrentSha,
+  context: controlledDisabledMonitorContext,
+}), false, 'only the runbook-controlled disabled_manually state may retain policy verification');
+assert.equal(verifyForwardFixRecoveryPolicy({
+  ...monitorVerificationContext,
+  workflow: { ...disabledMonitorWorkflow, state: 'disabled_inactivity' },
+  workflowSource: monitorSource,
+  policy: monitorPolicyInput,
+  auditedOriginSources,
+  controlledRunContext: controlledDisabledMonitorContext,
+}), null, 'a different disabled state must fail closed');
+assert.equal(verifyForwardFixRecoveryPolicy({
+  workflow: { ...forwardFixWorkflow, state: 'disabled_manually' },
+  workflowSource: forwardFixSource,
+  policy: forwardFixPolicyInput,
+  currentHeadSha: monitorCurrentSha,
+  controlledRunContext: controlledDisabledMonitorContext,
+}), null, 'a generic forward-fix policy must never inherit the controlled monitor exception');
 const exactManualIncidentRecoveryRun = {
   id: 800,
   run_attempt: 1,
