@@ -8,7 +8,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 
 const readWorkflow = async (name) =>
-  (await readFile(path.join(repoRoot, '.github', 'workflows', name), 'utf8')).replace(/\r\n/g, '\n');
+  (await readFile(path.join(repoRoot, '.github', 'workflows', name), 'utf8')).replace(/\r\n?|\n/g, '\n');
+
+const readSource = async (...segments) =>
+  (await readFile(path.join(repoRoot, ...segments), 'utf8')).replace(/\r\n?|\n/g, '\n');
 
 const requireText = (source, expected, description) => {
   if (!source.includes(expected)) {
@@ -53,7 +56,7 @@ const requireSpaceIndentation = (source, description) => {
 const validate = await readWorkflow('validate.yml');
 const propagate = await readWorkflow('propagate.yml');
 const releaseHealth = await readWorkflow('release-health-monitor.yml');
-const releaseHealthVerifier = await readFile(path.join(repoRoot, 'scripts', 'verify-org-release-health.mjs'), 'utf8');
+const releaseHealthVerifier = await readSource('scripts', 'verify-org-release-health.mjs');
 const combined = `${validate}\n${propagate}\n${releaseHealth}`;
 
 requireText(validate, 'permissions:\n  contents: read', 'read-only workflow permissions');
@@ -151,8 +154,9 @@ requireText(releaseHealth, "SSAI_RELEASE_MONITOR_RATE_RESERVE: ${{ inputs.scan_m
 requireText(releaseHealth, "SSAI_RELEASE_MONITOR_API_CONCURRENCY: '6'", 'release-health global API concurrency');
 requireText(releaseHealth, 'actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830', 'pinned scheduled-incident state restore');
 requireText(releaseHealth, 'actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830', 'pinned scheduled-incident state save');
-requireText(releaseHealth, 'ssai-release-health-state-v2-v1-lookup', 'non-sensitive fixed cache lookup key');
-requireText(releaseHealth, 'ssai-release-health-state-v2-v1-', 'epoch-bound non-sensitive cache prefix');
+requireText(releaseHealth, 'ssai-release-health-state-v3-v1-lookup', 'non-sensitive fixed cache lookup key');
+requireText(releaseHealth, 'ssai-release-health-state-v3-v1-', 'epoch-bound non-sensitive cache prefix');
+requireText(releaseHealth, 'ssai-release-health-state-v2-v1-', 'authenticated legacy state migration restore prefix');
 rejectPattern(releaseHealth, /state-v\d+[^\n]*github\.run_id/, 'source run ID in public cache action key');
 requireText(releaseHealth, "if: ${{ github.event_name == 'schedule' }}", 'schedule-only state restore');
 requireText(releaseHealth, "always() && github.event_name == 'schedule' && steps.reconcile.outputs.incident_state_changed == 'true'", 'fail-closed changed-state save');
