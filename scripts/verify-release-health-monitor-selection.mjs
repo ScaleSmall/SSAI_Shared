@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import {
@@ -507,6 +507,18 @@ for (const forbiddenField of [
   assert.equal(hostedStepSummary.includes(forbiddenField), false, 'hosted step summary must omit count/detail field: ' + forbiddenField);
 }
 assert.match(hostedStepSummary, /Notification outcome: new-or-worsened-incident/);
+assert.deepEqual(
+  releaseHealthLogPayload(
+    { ...adversarialHostedResult, notification_outcome: 'incident-improved-suppressed' },
+    hostedPublicEnvironment,
+  ),
+  {
+    result: 'degraded',
+    inventory_complete: true,
+    notification_outcome: 'incident-improved-suppressed',
+  },
+  'hosted output must expose the coarse improvement enum without private incident detail',
+);
 
 const renamedHostedEnvironment = {
   GITHUB_ACTIONS: 'TRUE',
@@ -614,9 +626,43 @@ assert.deepEqual(
 );
 const partialRecoveryA = evaluateIncidentNotification('continuous', 'schedule', worsenedAB.current, [incidentFailureA]);
 assert.deepEqual(
-  { changed: partialRecoveryA.changed, suppressed: partialRecoveryA.suppressed },
-  { changed: true, suppressed: false },
-  'partial recovery must surface the changed unresolved incident',
+  { changed: partialRecoveryA.changed, improved: partialRecoveryA.improved, suppressed: partialRecoveryA.suppressed },
+  { changed: true, improved: true, suppressed: true },
+  'removal-only partial recovery must save the improved state without producing another red run',
+);
+const replacedB = {
+  ...incidentFailureB,
+  notification_key: { ...incidentFailureB.notification_key, failure_class: 'timed_out' },
+};
+const equalCountReplacement = evaluateIncidentNotification(
+  'continuous',
+  'schedule',
+  worsenedAB.current,
+  [incidentFailureA, replacedB],
+);
+assert.deepEqual(
+  {
+    changed: equalCountReplacement.changed,
+    improved: equalCountReplacement.improved,
+    suppressed: equalCountReplacement.suppressed,
+  },
+  { changed: true, improved: false, suppressed: false },
+  'an equal-count cluster replacement must remain a red regression',
+);
+const mixedRemovalAndAddition = evaluateIncidentNotification(
+  'continuous',
+  'schedule',
+  worsenedAB.current,
+  [replacedB],
+);
+assert.deepEqual(
+  {
+    changed: mixedRemovalAndAddition.changed,
+    improved: mixedRemovalAndAddition.improved,
+    suppressed: mixedRemovalAndAddition.suppressed,
+  },
+  { changed: true, improved: false, suppressed: false },
+  'a lower-count incident containing a new cluster must remain a red regression',
 );
 const cleanAfterA = evaluateIncidentNotification('continuous', 'schedule', partialRecoveryA.current, []);
 assert.deepEqual(
@@ -684,7 +730,8 @@ const stateContext = {
   repository: 'ScaleSmall/SSAI_Shared',
   workflowRef: 'ScaleSmall/SSAI_Shared/.github/workflows/release-health-monitor.yml@refs/heads/main',
   ref: 'refs/heads/main',
-  cachePrefix: 'ssai-release-health-state-v2-v1-',
+  cachePrefix: 'ssai-release-health-state-v3-v1-',
+  legacyCachePrefix: 'ssai-release-health-state-v2-v1-',
   hmacEpoch: 'v1',
 };
 const stateAuthenticationKey = 'state-hmac-key-'.repeat(4);
@@ -698,13 +745,31 @@ const stateBytes = Buffer.from(JSON.stringify(stateRecord, null, 2) + '\n');
 const stateKey = stateContext.cachePrefix + 'at-2026-07-21T18-00-00-000Z';
 assert.equal(
   decodeScheduledIncidentState(stateBytes, stateKey, stateContext, stateAuthenticationKey).notificationStateHmac,
-  notificationStateHmac(fingerprintA, stateAuthenticationKey),
+  notificationStateHmac(fingerprintA, stateAuthenticationKey, '2026-07-21T18:00:00.000Z'),
   'valid authenticated state must restore exactly',
 );
 assert.equal(
   decodeScheduledIncidentState(stateBytes, stateKey, stateContext, stateAuthenticationKey).notificationStateHmac,
-  notificationStateHmac(fingerprintA, stateAuthenticationKey),
+  notificationStateHmac(fingerprintA, stateAuthenticationKey, '2026-07-21T18:00:00.000Z'),
   'rotating the independent read PAT cannot invalidate state authenticated by the dedicated HMAC key',
+);
+const laterStateRecord = createScheduledIncidentStateRecord(
+  fingerprintA,
+  stateContext,
+  stateAuthenticationKey,
+  '2026-07-21T18:01:00.000Z',
+);
+assert.notEqual(
+  laterStateRecord.notification_state_hmac_sha256,
+  stateRecord.notification_state_hmac_sha256,
+  'opaque notification state HMACs must be salted per cache generation to prevent cross-cache linkability',
+);
+assert.equal(
+  laterStateRecord.notification_cluster_hmac_tokens.some((token) => (
+    stateRecord.notification_cluster_hmac_tokens.includes(token)
+  )),
+  false,
+  'real and padded opaque cluster tokens must not be linkable across cache generations',
 );
 const opaqueRepeatedIncident = evaluateIncidentNotification(
   'continuous',
@@ -718,11 +783,117 @@ assert.deepEqual(
   { changed: false, suppressed: true },
   'an authenticated opaque state token must suppress only the exact unchanged incident',
 );
+const worsenedStateRecord = createScheduledIncidentStateRecord(
+  fingerprintAB,
+  stateContext,
+  stateAuthenticationKey,
+  '2026-07-21T18:05:00.000Z',
+);
+const worsenedStateBytes = Buffer.from(JSON.stringify(worsenedStateRecord, null, 2) + '\n');
+const worsenedStateKey = stateContext.cachePrefix + 'at-2026-07-21T18-05-00-000Z';
+const opaquePartialRecovery = evaluateIncidentNotification(
+  'continuous',
+  'schedule',
+  decodeScheduledIncidentState(worsenedStateBytes, worsenedStateKey, stateContext, stateAuthenticationKey),
+  [incidentFailureA],
+  stateAuthenticationKey,
+);
+assert.deepEqual(
+  {
+    changed: opaquePartialRecovery.changed,
+    improved: opaquePartialRecovery.improved,
+    suppressed: opaquePartialRecovery.suppressed,
+  },
+  { changed: true, improved: true, suppressed: true },
+  'authenticated opaque cluster tokens must recognize and suppress removal-only improvement',
+);
+const opaqueMixedChange = evaluateIncidentNotification(
+  'continuous',
+  'schedule',
+  decodeScheduledIncidentState(worsenedStateBytes, worsenedStateKey, stateContext, stateAuthenticationKey),
+  [replacedB],
+  stateAuthenticationKey,
+);
+assert.deepEqual(
+  {
+    changed: opaqueMixedChange.changed,
+    improved: opaqueMixedChange.improved,
+    suppressed: opaqueMixedChange.suppressed,
+  },
+  { changed: true, improved: false, suppressed: false },
+  'authenticated opaque cluster tokens must fail closed when a removal is mixed with an addition',
+);
+const legacyCreatedAt = '2026-07-21T17:55:00.000Z';
+const legacyUnsignedState = {
+  schema: 2,
+  repository_id: stateContext.repositoryId,
+  repository: stateContext.repository,
+  workflow_ref: stateContext.workflowRef,
+  ref: stateContext.ref,
+  notification_state_hmac_sha256: notificationStateHmac(fingerprintA, stateAuthenticationKey),
+  state_hmac_epoch: stateContext.hmacEpoch,
+  created_at: legacyCreatedAt,
+  scan_mode: 'continuous',
+  trigger_event: 'schedule',
+};
+const legacyStateRecord = {
+  ...legacyUnsignedState,
+  state_hmac_sha256: createHmac('sha256', stateAuthenticationKey)
+    .update('release-health-state-record-v1\n' + JSON.stringify(legacyUnsignedState))
+    .digest('hex'),
+};
+const legacyStateKey = stateContext.legacyCachePrefix + 'at-' + legacyCreatedAt.replace(/[:.]/g, '-');
+const legacyState = decodeScheduledIncidentState(
+  Buffer.from(JSON.stringify(legacyStateRecord) + '\n'),
+  legacyStateKey,
+  stateContext,
+  stateAuthenticationKey,
+);
+const exactLegacyMigration = evaluateIncidentNotification(
+  'continuous',
+  'schedule',
+  legacyState,
+  [incidentFailureA],
+  stateAuthenticationKey,
+);
+assert.deepEqual(
+  {
+    changed: exactLegacyMigration.changed,
+    improved: exactLegacyMigration.improved,
+    suppressed: exactLegacyMigration.suppressed,
+    stateWriteRequired: exactLegacyMigration.stateWriteRequired,
+  },
+  { changed: false, improved: false, suppressed: true, stateWriteRequired: true },
+  'an exact authenticated v2 state must migrate to v3 without producing another red run',
+);
+const changedLegacyMigration = evaluateIncidentNotification(
+  'continuous',
+  'schedule',
+  legacyState,
+  [incidentFailureA, incidentFailureB],
+  stateAuthenticationKey,
+);
+assert.deepEqual(
+  {
+    changed: changedLegacyMigration.changed,
+    improved: changedLegacyMigration.improved,
+    suppressed: changedLegacyMigration.suppressed,
+    stateWriteRequired: changedLegacyMigration.stateWriteRequired,
+  },
+  { changed: true, improved: false, suppressed: false, stateWriteRequired: true },
+  'a changed v2 incident must remain fail-closed when its opaque state cannot prove a removal-only transition',
+);
+const confidentialClusterDigests = Array.from({ length: 73 }, (_, index) => (
+  createHash('sha256').update('confidential-cluster-' + index).digest('hex')
+)).sort();
 const confidentialSnapshot = {
   status: 'incident',
-  incidentFingerprint: '5'.repeat(64),
+  incidentFingerprint: createHash('sha256')
+    .update('release-health-incident-clusters-v2\n' + confidentialClusterDigests.join('\n'))
+    .digest('hex'),
   failureCount: 73,
   failureDigestSample: Array.from({ length: 16 }, () => '6'.repeat(64)),
+  clusterDigests: confidentialClusterDigests,
 };
 const confidentialStateBytes = Buffer.from(JSON.stringify(createScheduledIncidentStateRecord(
   confidentialSnapshot,
@@ -741,9 +912,14 @@ assert.equal(
   healthyStateBytes.length,
   'fork-visible cache state size must not reveal healthy versus incident state',
 );
+assert.equal(
+  confidentialStateBytes.length < 192 * 1024,
+  true,
+  'fixed-size opaque cache state must remain inside its bounded write limit',
+);
 for (const privateStateMarker of [
   'incident', 'healthy', confidentialSnapshot.incidentFingerprint, confidentialSnapshot.failureDigestSample[0],
-  'failure_count', 'failure_digest_sample', 'source_run_id', 'source_sha',
+  confidentialSnapshot.clusterDigests[0], 'failure_count', 'failure_digest_sample', 'source_run_id', 'source_sha',
 ]) {
   assert.equal(
     confidentialStateBytes.includes(Buffer.from(privateStateMarker)),
@@ -754,10 +930,20 @@ for (const privateStateMarker of [
 assert.deepEqual(
   Object.keys(stateRecord).sort(),
   [
-    'created_at', 'notification_state_hmac_sha256', 'ref', 'repository', 'repository_id', 'scan_mode', 'schema',
-    'state_hmac_epoch', 'state_hmac_sha256', 'trigger_event', 'workflow_ref',
+    'created_at', 'notification_cluster_hmac_tokens', 'notification_state_hmac_sha256', 'ref', 'repository',
+    'repository_id', 'scan_mode', 'schema', 'state_hmac_epoch', 'state_hmac_sha256', 'trigger_event', 'workflow_ref',
   ],
-  'cache state must have a fixed public-provenance plus opaque-HMAC shape',
+  'cache state must have a fixed public-provenance plus padded opaque-HMAC shape',
+);
+assert.equal(
+  stateRecord.notification_cluster_hmac_tokens.length,
+  2048,
+  'cache state must pad the opaque cluster token inventory to its fixed maximum',
+);
+assert.equal(
+  new Set(stateRecord.notification_cluster_hmac_tokens).size,
+  stateRecord.notification_cluster_hmac_tokens.length,
+  'cache state cluster tokens and padding must be collision-free',
 );
 assert.throws(
   () => decodeScheduledIncidentState(null, stateKey, stateContext, stateAuthenticationKey),
@@ -784,6 +970,22 @@ assert.equal(
   ),
   null,
   'wrong-schema restored state must safely reinitialize',
+);
+assert.equal(
+  decodeScheduledIncidentStateOrNull(
+    Buffer.from(JSON.stringify({
+      ...stateRecord,
+      notification_cluster_hmac_tokens: [
+        '0'.repeat(64),
+        ...stateRecord.notification_cluster_hmac_tokens.slice(1),
+      ].sort(),
+    }) + '\n'),
+    stateKey,
+    stateContext,
+    stateAuthenticationKey,
+  ),
+  null,
+  'tampered opaque cluster tokens must safely reinitialize instead of suppressing',
 );
 assert.equal(
   decodeScheduledIncidentStateOrNull(
