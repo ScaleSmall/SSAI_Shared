@@ -53,6 +53,34 @@ const requireSpaceIndentation = (source, description) => {
   if (tabbedLine >= 0) throw new Error(`${description} contains a tab on line ${tabbedLine + 1}`);
 };
 
+const expandCronMinuteField = (field, description) => {
+  const minutes = new Set();
+  for (const segment of field.split(',')) {
+    const [range, rawStep] = segment.split('/');
+    const step = rawStep === undefined ? 1 : Number.parseInt(rawStep, 10);
+    const [rawStart, rawEnd] = range === '*'
+      ? ['0', '59']
+      : range.includes('-')
+        ? range.split('-')
+        : [range, range];
+    const start = Number.parseInt(rawStart, 10);
+    const end = Number.parseInt(rawEnd, 10);
+    if (
+      !Number.isInteger(start)
+      || !Number.isInteger(end)
+      || !Number.isInteger(step)
+      || start < 0
+      || end > 59
+      || start > end
+      || step < 1
+    ) {
+      throw new Error(`Invalid cron minute field for ${description}: ${field}`);
+    }
+    for (let minute = start; minute <= end; minute += step) minutes.add(minute);
+  }
+  return minutes;
+};
+
 const validate = await readWorkflow('validate.yml');
 const propagate = await readWorkflow('propagate.yml');
 const releaseHealth = await readWorkflow('release-health-monitor.yml');
@@ -95,7 +123,36 @@ requireText(propagate, "repos/ScaleSmall/SSAI_Dashboard/dispatches", 'Dashboard 
 requireText(propagate, 'GH_TOKEN: ${{ secrets.SCALESMALL_PAT }}', 'repository dispatch token source');
 
 requireText(releaseHealth, 'workflow_dispatch:', 'manual release-health control');
-requireText(releaseHealth, "cron: '7,22,37,52 * * * *'", 'staggered 15-minute release-health schedule');
+const releaseHealthCron = '3,18,33,48 * * * *';
+requireText(releaseHealth, `cron: '${releaseHealthCron}'`, 'fleet-staggered 15-minute release-health schedule');
+const releaseHealthMinutes = [...expandCronMinuteField(releaseHealthCron.split(/\s+/)[0], 'release-health monitor')]
+  .sort((left, right) => left - right);
+const cyclicReleaseHealthIntervals = releaseHealthMinutes.map((minute, index) => {
+  const nextMinute = releaseHealthMinutes[(index + 1) % releaseHealthMinutes.length];
+  return (nextMinute - minute + 60) % 60;
+});
+assert.deepEqual(cyclicReleaseHealthIntervals, [15, 15, 15, 15], 'release-health cadence must remain exactly 15 minutes');
+// Keep these minute fields aligned with every in-scope fleet cron so the monitor
+// does not sample partial state while scheduled production work is starting.
+const fleetScheduleMinuteReservations = new Map([
+  ['SSAI_AI_Audit production-canary.yml', '17 14 * * *'],
+  ['SSAI_Analytics_Reporting monthly-reporting.yml monthly', '20 7 1 * *'],
+  ['SSAI_Analytics_Reporting monthly-reporting.yml daily', '35 7 * * *'],
+  ['SSAI_Analytics_Reporting production-hardening.yml', '37 13 * * *'],
+  ['SSAI_Analytics_Reporting production-pages-canary.yml', '17 12 * * *'],
+  ['SSAI_CI_Engine production-ci-worker.yml', '7-57/10 * * * *'],
+  ['SSAI_Content_Engine production-content-engine-worker.yml', '*/10 * * * *'],
+  ['SSAI_Dashboard pull-shared-with-protected-evidence.yml', '11 * * * *'],
+  ['SSAI_PoW n8n-production-exactness.yml', '19 */6 * * *'],
+  ['SSAI_Production_QA production-service-canaries.yml', '37 * * * *'],
+]);
+for (const [reservation, cron] of fleetScheduleMinuteReservations) {
+  const reservedMinutes = expandCronMinuteField(cron.split(/\s+/)[0], reservation);
+  const collisions = releaseHealthMinutes.filter((minute) => reservedMinutes.has(minute));
+  if (collisions.length > 0) {
+    throw new Error(`Release-health schedule collides with ${reservation} at minute(s): ${collisions.join(', ')}`);
+  }
+}
 requireText(releaseHealth, 'permissions:\n  contents: read', 'read-only release-health permissions');
 requireText(releaseHealth, 'cancel-in-progress: false', 'non-cancelling release-health serialization');
 requireText(releaseHealth, 'runs-on: ubuntu-24.04', 'pinned release-health runner');
