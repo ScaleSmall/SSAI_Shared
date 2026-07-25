@@ -114,7 +114,7 @@ const legacyMonitorTitle = 'Scale Small AI Release Health Monitor';
 const legacySnapshotWorkflowSourceSha256 = '0faccc93dd783cd0c76ecd837bcd5bb6cbb046b2670a0f7f41d039e433c49b04';
 const legacyBoundedWorkflowSourceSha256 = '1adbb7b1738f9562968a644b8854bf7fc04496eea976809cae83429204f14858';
 export const auditedPriorMonitorWorkflowSourceSha256 = '3672ed17290279e20d75336e810d9327a59786c16a77332aa5be2f4adb0238a1';
-export const currentMonitorWorkflowSourceSha256 = '2d0ef0ed5461b8efb6c101c669bd9ad3971ee3ba6b339d01513d3a4fac7e9d16';
+export const currentMonitorWorkflowSourceSha256 = 'fec09403238410de717e85541f3a02c66919460b2da4244652a80d43cb8341fa';
 const auditedMonitorSourceEvidence = new Map([
   ['82fc98124d0b5412e3591c9357da76ba7f324737', {
     workflowSourceSha256: legacySnapshotWorkflowSourceSha256,

@@ -42,7 +42,7 @@ Keep the existing `SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256` and
    checks pass.
 3. A disabled workflow does not respond to `workflow_dispatch`. After the App is installed and
    both protected-environment secrets exist, enable the workflow immediately after a staggered
-   15-minute schedule boundary (minutes 7, 22, 37, and 52 UTC), dispatch one
+   15-minute schedule boundary (minutes 3, 18, 33, and 48 UTC), dispatch one
    current-default-branch `incident` scan, confirm that the run was created, and disable the
    workflow again before the next boundary. Require an exact 168-hour scan and a terminal
    successful conclusion.
