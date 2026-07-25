@@ -41,10 +41,11 @@ Keep the existing `SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256` and
 2. Merge the reviewed authentication change only after all repository contract and security
    checks pass.
 3. A disabled workflow does not respond to `workflow_dispatch`. After the App is installed and
-   both protected-environment secrets exist, enable the workflow immediately after a 15-minute
-   schedule boundary, dispatch one current-default-branch `incident` scan, confirm that the run
-   was created, and disable the workflow again before the next boundary. Require an exact
-   168-hour scan and a terminal successful conclusion.
+   both protected-environment secrets exist, enable the workflow immediately after a staggered
+   15-minute schedule boundary (minutes 7, 22, 37, and 52 UTC), dispatch one
+   current-default-branch `incident` scan, confirm that the run was created, and disable the
+   workflow again before the next boundary. Require an exact 168-hour scan and a terminal
+   successful conclusion.
 4. After that incident is green, re-enable the workflow and monitor consecutive scheduled runs.
    Require a changed state to persist successfully and the following unchanged state to be
    suppressed without hiding a changed or recovered condition. Disable the workflow immediately

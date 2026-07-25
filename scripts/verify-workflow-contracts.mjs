@@ -95,7 +95,7 @@ requireText(propagate, "repos/ScaleSmall/SSAI_Dashboard/dispatches", 'Dashboard 
 requireText(propagate, 'GH_TOKEN: ${{ secrets.SCALESMALL_PAT }}', 'repository dispatch token source');
 
 requireText(releaseHealth, 'workflow_dispatch:', 'manual release-health control');
-requireText(releaseHealth, "cron: '*/15 * * * *'", '15-minute release-health schedule');
+requireText(releaseHealth, "cron: '7,22,37,52 * * * *'", 'staggered 15-minute release-health schedule');
 requireText(releaseHealth, 'permissions:\n  contents: read', 'read-only release-health permissions');
 requireText(releaseHealth, 'cancel-in-progress: false', 'non-cancelling release-health serialization');
 requireText(releaseHealth, 'runs-on: ubuntu-24.04', 'pinned release-health runner');
