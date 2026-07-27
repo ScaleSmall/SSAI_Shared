@@ -8,15 +8,6 @@ on:
       - 'package.json'
       - 'package-lock.json'
   workflow_dispatch:
-    inputs:
-      dispatch_connect:
-        description: Dispatch SSAI_Connect rebuild after TikTok review is complete.
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
 
 permissions:
   contents: read
@@ -25,13 +16,7 @@ jobs:
   trigger-rebuilds:
     runs-on: ubuntu-24.04
     steps:
-      - name: Skip protected Connect propagation
-        if: ${{ github.event_name == 'push' || inputs.dispatch_connect != 'true' }}
-        run: |
-          echo "SSAI_Connect dispatch is intentionally skipped while connect.scalesmall.ai is reserved for TikTok OAuth review."
-
       - name: Trigger SSAI_Connect rebuild
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_connect == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.SCALESMALL_PAT }}
         run: |
