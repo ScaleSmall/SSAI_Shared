@@ -236,20 +236,53 @@ assert.throws(
 );
 
 const attestedInventory = [
+  { name: 'SSAI_AI_Audit', full_name: 'ScaleSmall/SSAI_AI_Audit', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Analytics_Reporting', full_name: 'ScaleSmall/SSAI_Analytics_Reporting', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Brand_Identity', full_name: 'ScaleSmall/SSAI_Brand_Identity', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_CI_Engine', full_name: 'ScaleSmall/SSAI_CI_Engine', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Connect', full_name: 'ScaleSmall/SSAI_Connect', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Content_Engine', full_name: 'ScaleSmall/SSAI_Content_Engine', owner: { login: 'ScaleSmall' }, archived: false },
   { name: 'SSAI_Dashboard', full_name: 'ScaleSmall/SSAI_Dashboard', owner: { login: 'ScaleSmall' }, archived: false },
-  { name: 'SSAI_Shared', full_name: 'ScaleSmall/SSAI_Shared', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Database', full_name: 'ScaleSmall/SSAI_Database', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Intel', full_name: 'ScaleSmall/SSAI_Intel', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_LDP', full_name: 'ScaleSmall/SSAI_LDP', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Leads', full_name: 'ScaleSmall/SSAI_Leads', owner: { login: 'ScaleSmall' }, archived: false },
   { name: 'SSAI_NAP_Entity', full_name: 'ScaleSmall/SSAI_NAP_Entity', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Onboarding', full_name: 'ScaleSmall/SSAI_Onboarding', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_PoW', full_name: 'ScaleSmall/SSAI_PoW', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Production_QA', full_name: 'ScaleSmall/SSAI_Production_QA', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_RR', full_name: 'ScaleSmall/SSAI_RR', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Shared', full_name: 'ScaleSmall/SSAI_Shared', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Test_Emulator', full_name: 'ScaleSmall/SSAI_Test_Emulator', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Video_Prompt_System', full_name: 'ScaleSmall/SSAI_Video_Prompt_System', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Website', full_name: 'ScaleSmall/SSAI_Website', owner: { login: 'ScaleSmall' }, archived: false },
+  { name: 'SSAI_Workflows_Shared', full_name: 'ScaleSmall/SSAI_Workflows_Shared', owner: { login: 'ScaleSmall' }, archived: false },
 ];
 const attestedInventorySha256 = expectedInventoryDigest(attestedInventory);
+const reviewedInventorySha256 = '1b0f98d54264554fdc81d3f7d5b89e2324f9660ebe15526e49e878d2a932df4b';
+const supersededInventorySha256 = 'b372264a22a6ca71ef22c8cbf4eb7ff37029a17ee943d36a13c423a2c4cbc69e';
+assert.equal(
+  attestedInventorySha256,
+  reviewedInventorySha256,
+  'the reviewed 21-repository inventory digest must include Connect exactly once',
+);
 assert.equal(
   verifyExpectedInventoryAttestation([...attestedInventory].reverse(), attestedInventorySha256),
   true,
   'the exact repository set must pass independent of API order',
 );
 assert.throws(
-  () => verifyExpectedInventoryAttestation(attestedInventory.slice(1), attestedInventorySha256),
+  () => verifyExpectedInventoryAttestation(attestedInventory, supersededInventorySha256),
   /completeness attestation/,
-  'an omitted private repository must fail inventory completeness',
+  'the superseded 20-repository inventory digest must fail closed',
+);
+assert.throws(
+  () => verifyExpectedInventoryAttestation(
+    attestedInventory.filter((repository) => repository.name !== 'SSAI_Connect'),
+    attestedInventorySha256,
+  ),
+  /completeness attestation/,
+  'an omitted Connect repository must fail inventory completeness',
 );
 assert.throws(
   () => verifyExpectedInventoryAttestation(
@@ -288,24 +321,9 @@ assert.throws(
   'an oversized installation page must fail closed',
 );
 assert.equal(
-  verifyInstallationRepositoryScope(attestedInventory, 'ScaleSmall', 'SSAI_', new Set(['SSAI_Connect'])),
+  verifyInstallationRepositoryScope(attestedInventory, 'ScaleSmall', 'SSAI_', new Set()),
   true,
-  'the exact selected-repository installation must pass scope validation',
-);
-assert.throws(
-  () => verifyInstallationRepositoryScope(
-    [...attestedInventory, {
-      name: 'SSAI_Connect',
-      full_name: 'ScaleSmall/SSAI_Connect',
-      owner: { login: 'ScaleSmall' },
-      archived: false,
-    }],
-    'ScaleSmall',
-    'SSAI_',
-    new Set(['SSAI_Connect']),
-  ),
-  /outside the approved release-health scope/,
-  'the protected Connect repository must never be included in the App installation',
+  'the exact selected-repository installation including Connect must pass scope validation',
 );
 
 for (const [label, repository] of [
@@ -339,7 +357,7 @@ for (const [label, repository] of [
       [...attestedInventory, repository],
       'ScaleSmall',
       'SSAI_',
-      new Set(['SSAI_Connect']),
+      new Set(),
     ),
     /outside the approved release-health scope/,
     `an installation repository with ${label} must fail closed`,

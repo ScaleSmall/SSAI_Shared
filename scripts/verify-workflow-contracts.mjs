@@ -85,6 +85,7 @@ const validate = await readWorkflow('validate.yml');
 const propagate = await readWorkflow('propagate.yml');
 const releaseHealth = await readWorkflow('release-health-monitor.yml');
 const releaseHealthVerifier = await readSource('scripts', 'verify-org-release-health.mjs');
+const releaseHealthRunbook = await readSource('docs', 'RELEASE_HEALTH_GITHUB_APP_RUNBOOK.md');
 const combined = `${validate}\n${propagate}\n${releaseHealth}`;
 
 requireText(validate, 'permissions:\n  contents: read', 'read-only workflow permissions');
@@ -113,14 +114,12 @@ if (JSON.stringify(automaticPropagationPaths) !== JSON.stringify(expectedPropaga
     `Automatic propagation paths must be exactly package-bearing files: ${automaticPropagationPaths.join(', ')}`,
   );
 }
-requireText(propagate, 'dispatch_connect:', 'protected Connect dispatch gate');
 requireText(propagate, 'permissions:\n  contents: read', 'read-only propagation permissions');
 requireText(propagate, 'runs-on: ubuntu-24.04', 'pinned propagation runner');
-requireText(propagate, 'SSAI_Connect dispatch is intentionally skipped', 'protected Connect skip');
-requireText(propagate, "repos/ScaleSmall/SSAI_Connect/dispatches", 'manual Connect dispatch target');
-requireText(propagate, "github.event_name == 'workflow_dispatch' && inputs.dispatch_connect == 'true'", 'manual Connect dispatch guard');
+requireText(propagate, "repos/ScaleSmall/SSAI_Connect/dispatches", 'Connect dispatch target');
 requireText(propagate, "repos/ScaleSmall/SSAI_Dashboard/dispatches", 'Dashboard dispatch target');
 requireText(propagate, 'GH_TOKEN: ${{ secrets.SCALESMALL_PAT }}', 'repository dispatch token source');
+rejectPattern(propagate, /dispatch_connect|TikTok OAuth review|Skip protected Connect propagation/, 'retired TikTok-review propagation gate must stay removed');
 
 requireText(releaseHealth, 'workflow_dispatch:', 'manual release-health control');
 const releaseHealthCron = '3,18,33,48 * * * *';
@@ -317,7 +316,17 @@ requireText(
   "export const auditedPriorMonitorWorkflowSourceSha256 = '3672ed17290279e20d75336e810d9327a59786c16a77332aa5be2f4adb0238a1'",
   'immutable historical monitor workflow digest',
 );
-requireText(releaseHealthVerifier, "const excludedRepositories = new Set(['SSAI_Connect'])", 'protected Connect exclusion');
+requireText(releaseHealthVerifier, 'const excludedRepositories = new Set();', 'empty release-health exclusion set');
+requireText(releaseHealthRunbook, 'including `SSAI_Connect`', 'Connect-inclusive GitHub App inventory runbook');
+requireText(releaseHealthRunbook, 'update\n`SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256`', 'inventory-digest rotation runbook');
+requireText(
+  releaseHealthRunbook,
+  '1b0f98d54264554fdc81d3f7d5b89e2324f9660ebe15526e49e878d2a932df4b',
+  'reviewed Connect-inclusive inventory digest',
+);
+requireText(releaseHealthRunbook, 'Do not reuse the superseded 20-repository digest', 'superseded inventory rejection');
+requireText(releaseHealthRunbook, 'Do not use `workflow_dispatch` as scheduler proof', 'natural scheduler proof runbook');
+rejectPattern(releaseHealthRunbook, /Exclude `SSAI_Connect`|Keep the existing `SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256`/, 'stale Connect exclusion or inventory digest instructions');
 requireText(releaseHealthVerifier, 'findDeploymentCheckRecovery(', 'cross-trigger deployment recovery proof');
 requireText(releaseHealthVerifier, 'findMergedPullCheckRecovery(', 'merged pull-request recovery proof');
 requireText(releaseHealthVerifier, 'associateChecksWithPulls(', 'force-pushed pull-request recovery association');

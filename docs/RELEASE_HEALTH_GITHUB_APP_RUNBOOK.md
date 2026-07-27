@@ -15,8 +15,10 @@ The release-health monitor uses a short-lived GitHub App installation token. Do 
    - Metadata: Read-only
    - Pull requests: Read-only
    - Commit statuses: Read-only
-4. Install the App on **only** the active, non-archived `ScaleSmall/SSAI_*` repositories used by
-   the release-health inventory. Exclude `SSAI_Connect` and every unrelated repository.
+4. Install the App on **only** every active, non-archived `ScaleSmall/SSAI_*` repository used by
+   the release-health inventory, including `SSAI_Connect`. Exclude every archived, non-`SSAI_*`,
+   and unrelated repository. The retired TikTok reviewer demo and tunnel are not repositories
+   in this inventory and must remain retired.
 5. Generate one private key for the App. Store the downloaded PEM securely until it has been
    added to GitHub Actions, then remove the local plaintext copy.
 
@@ -31,8 +33,13 @@ In the `release-health-monitor` environment for `ScaleSmall/SSAI_Shared`, add:
 - `SSAI_RELEASE_MONITOR_APP_CLIENT_ID`: the App's Client ID from its settings page.
 - `SSAI_RELEASE_MONITOR_APP_PRIVATE_KEY`: the complete generated PEM private key.
 
-Keep the existing `SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256` and
-`SSAI_RELEASE_MONITOR_STATE_HMAC_KEY` environment secrets unchanged.
+Whenever the exact reviewed repository set changes, recompute its canonical inventory digest
+with the monitor's `expectedInventoryDigest()` algorithm and update
+`SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256` in the same controlled change window as the App
+installation scope. For the reviewed 21-repository inventory that includes `SSAI_Connect`, the
+required digest is `1b0f98d54264554fdc81d3f7d5b89e2324f9660ebe15526e49e878d2a932df4b`.
+Do not reuse the superseded 20-repository digest. Keep
+`SSAI_RELEASE_MONITOR_STATE_HMAC_KEY` unchanged.
 
 ## Release and UAT
 
@@ -40,16 +47,14 @@ Keep the existing `SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256` and
    secrets are being provisioned.
 2. Merge the reviewed authentication change only after all repository contract and security
    checks pass.
-3. A disabled workflow does not respond to `workflow_dispatch`. After the App is installed and
-   both protected-environment secrets exist, enable the workflow immediately after a staggered
-   15-minute schedule boundary (minutes 3, 18, 33, and 48 UTC), dispatch one
-   current-default-branch `incident` scan, confirm that the run was created, and disable the
-   workflow again before the next boundary. Require an exact 168-hour scan and a terminal
-   successful conclusion.
-4. After that incident is green, re-enable the workflow and monitor consecutive scheduled runs.
-   Require a changed state to persist successfully and the following unchanged state to be
-   suppressed without hiding a changed or recovered condition. Disable the workflow immediately
-   if either run fails.
+3. After the App installation includes the exact reviewed inventory and the protected inventory
+   digest is updated, enable the workflow before the next staggered 15-minute schedule boundary
+   (minutes 3, 18, 33, and 48 UTC). Do not use `workflow_dispatch` as scheduler proof; require the
+   first natural scheduled run on exact current `main` to finish successfully and report the
+   complete reviewed inventory.
+4. Monitor the following natural scheduled run. Require a changed state to persist successfully
+   and the following unchanged state to be suppressed without hiding a changed or recovered
+   condition. Disable the workflow immediately if either run fails.
 5. Leave the schedule enabled only after both hosted checks pass.
 
 The pinned token action revokes its installation token during job cleanup. Never enable
