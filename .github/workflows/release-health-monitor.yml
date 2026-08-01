@@ -21,11 +21,13 @@ on:
     - cron: '3,18,33,48 * * * *'
 
 concurrency:
-  group: scale-small-ai-release-health-monitor
+  # v2 isolates the protected scheduler from the immutable orphaned v1 run.
+  group: scale-small-ai-release-health-monitor-v2
   cancel-in-progress: false
 
 permissions:
   contents: read
+  issues: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -76,8 +78,9 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ${{ runner.temp }}/ssai-release-health-monitor/state.json
-          key: ssai-release-health-state-v3-v1-lookup
+          key: ssai-release-health-state-v4-v1-lookup
           restore-keys: |
+            ssai-release-health-state-v4-v1-
             ssai-release-health-state-v3-v1-
             ssai-release-health-state-v2-v1-
 
@@ -102,9 +105,12 @@ jobs:
           SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256: ${{ secrets.SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256 }}
           SSAI_RELEASE_MONITOR_STATE_HMAC_KEY: ${{ secrets.SSAI_RELEASE_MONITOR_STATE_HMAC_KEY }}
           SSAI_RELEASE_MONITOR_STATE_CACHE_MATCHED_KEY: ${{ steps.restore_release_health_state.outputs.cache-matched-key }}
-          SSAI_RELEASE_MONITOR_STATE_CACHE_PREFIX: ssai-release-health-state-v3-v1-
+          SSAI_RELEASE_MONITOR_STATE_CACHE_PREFIX: ssai-release-health-state-v4-v1-
           SSAI_RELEASE_MONITOR_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           SSAI_RELEASE_MONITOR_STATE_PATH: ${{ runner.temp }}/ssai-release-health-monitor/state.json
+          # A completed scheduled scan must first persist and deliver its exact
+          # incident state. A later step restores the degraded job conclusion.
+          SSAI_RELEASE_MONITOR_DEFER_DEGRADED_EXIT: ${{ github.event_name == 'schedule' }}
         shell: bash
         run: |
           node --input-type=module <<'NODE'
@@ -140,6 +146,7 @@ jobs:
           fail-on-cache-miss: true
 
       - name: Require changed scheduled-incident state persistence
+        id: require_release_health_state
         if: ${{ always() && github.event_name == 'schedule' && steps.reconcile.outputs.incident_state_changed == 'true' }}
         shell: bash
         env:
@@ -152,3 +159,21 @@ jobs:
             echo "::error::Release-health monitor failed closed"
             exit 1
           fi
+
+      - name: Reconcile the managed GitHub incident issue
+        id: reconcile_managed_incident
+        if: ${{ always() && github.event_name == 'schedule' && steps.reconcile.outcome == 'success' && steps.reconcile.outputs.scan_completed == 'true' && steps.reconcile.outputs.notification_reconciliation_required == 'true' && (steps.reconcile.outputs.incident_state_changed != 'true' || (steps.verify_release_health_state.outcome == 'success' && steps.require_release_health_state.outcome == 'success')) }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SSAI_RELEASE_MONITOR_INCIDENT_STATE: ${{ steps.reconcile.outputs.incident_state }}
+          SSAI_RELEASE_MONITOR_NOTIFICATION_OUTCOME: ${{ steps.reconcile.outputs.notification_outcome }}
+          SSAI_RELEASE_MONITOR_DELIVERY_IDENTITY: ${{ steps.reconcile.outputs.incident_delivery_identity }}
+        run: node scripts/sync-release-health-incident-issue.mjs
+
+      - name: Restore degraded release-health conclusion after delivery
+        if: ${{ always() && github.event_name == 'schedule' && steps.reconcile.outcome == 'success' && steps.reconcile.outputs.scan_completed == 'true' && steps.reconcile.outputs.health_degraded == 'true' }}
+        shell: bash
+        run: |
+          echo "::error::The completed release-health scan found a new or worsened incident"
+          exit 1

@@ -152,7 +152,8 @@ for (const [reservation, cron] of fleetScheduleMinuteReservations) {
     throw new Error(`Release-health schedule collides with ${reservation} at minute(s): ${collisions.join(', ')}`);
   }
 }
-requireText(releaseHealth, 'permissions:\n  contents: read', 'read-only release-health permissions');
+requireText(releaseHealth, 'permissions:\n  contents: read\n  issues: write', 'bounded same-repository incident delivery permission');
+rejectPattern(releaseHealth, /(?:actions|checks|contents|deployments|packages|pull-requests|statuses|workflows): write/, 'unapproved release-health write permission');
 requireText(releaseHealth, 'cancel-in-progress: false', 'non-cancelling release-health serialization');
 requireText(releaseHealth, 'runs-on: ubuntu-24.04', 'pinned release-health runner');
 requireText(releaseHealth, 'persist-credentials: false', 'release-health checkout credential isolation');
@@ -208,10 +209,13 @@ requireText(releaseHealth, "SSAI_RELEASE_MONITOR_LOOKBACK_HOURS: ${{ inputs.scan
 requireText(releaseHealth, "SSAI_RELEASE_MONITOR_MAX_REQUESTS: ${{ inputs.scan_mode == 'incident' && '3500' || '600' }}", 'release-health API request budget');
 requireText(releaseHealth, "SSAI_RELEASE_MONITOR_RATE_RESERVE: ${{ inputs.scan_mode == 'incident' && '250' || '1000' }}", 'release-health API reserve');
 requireText(releaseHealth, "SSAI_RELEASE_MONITOR_API_CONCURRENCY: '6'", 'release-health global API concurrency');
+requireText(releaseHealth, 'group: scale-small-ai-release-health-monitor-v2', 'orphan-isolated serialized release-health concurrency');
+requireText(releaseHealth, 'cancel-in-progress: false', 'non-destructive release-health concurrency');
 requireText(releaseHealth, 'actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830', 'pinned scheduled-incident state restore');
 requireText(releaseHealth, 'actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830', 'pinned scheduled-incident state save');
-requireText(releaseHealth, 'ssai-release-health-state-v3-v1-lookup', 'non-sensitive fixed cache lookup key');
-requireText(releaseHealth, 'ssai-release-health-state-v3-v1-', 'epoch-bound non-sensitive cache prefix');
+requireText(releaseHealth, 'ssai-release-health-state-v4-v1-lookup', 'non-sensitive fixed cache lookup key');
+requireText(releaseHealth, 'ssai-release-health-state-v4-v1-', 'epoch-bound non-sensitive cache prefix');
+requireText(releaseHealth, 'ssai-release-health-state-v3-v1-', 'authenticated previous-state migration restore prefix');
 requireText(releaseHealth, 'ssai-release-health-state-v2-v1-', 'authenticated legacy state migration restore prefix');
 rejectPattern(releaseHealth, /state-v\d+[^\n]*github\.run_id/, 'source run ID in public cache action key');
 requireText(releaseHealth, "if: ${{ github.event_name == 'schedule' }}", 'schedule-only state restore');
@@ -224,9 +228,22 @@ requireText(releaseHealth, 'lookup-only: true', 'side-effect-free cache visibili
 requireText(releaseHealth, 'fail-on-cache-miss: true', 'fail-closed missing changed-state cache');
 requireText(releaseHealth, 'STATE_CACHE_HIT: ${{ steps.verify_release_health_state.outputs.cache-hit }}', 'cache feature-availability output gate');
 requireText(releaseHealth, 'MATCHED_STATE_KEY: ${{ steps.verify_release_health_state.outputs.cache-matched-key }}', 'exact persisted cache identity gate');
+requireText(releaseHealth, 'id: require_release_health_state', 'exact persistence assertion outcome gate');
 requireText(releaseHealth, '::error::Release-health monitor failed closed', 'generic fail-closed state-persistence error');
 rejectPattern(releaseHealth, /Changed release-health incident state was not durably persisted/, 'detailed public state-persistence error');
 rejectPattern(releaseHealth, /continue-on-error:\s*true/, 'state restore/save failure suppression');
+requireText(releaseHealth, 'notification_reconciliation_required', 'schedule-time incident reconciliation gate');
+requireText(releaseHealth, "steps.reconcile.outcome == 'success'", 'successful monitor result before incident reconciliation');
+requireText(releaseHealth, "steps.reconcile.outputs.scan_completed == 'true'", 'explicit completed-scan delivery gate');
+requireText(releaseHealth, 'steps.verify_release_health_state.outcome == \'success\'', 'delivery after durable state verification');
+requireText(releaseHealth, 'steps.require_release_health_state.outcome == \'success\'', 'delivery after exact persistence assertion');
+requireText(releaseHealth, "steps.reconcile.outputs.health_degraded == 'true'", 'degraded scheduled conclusion restored after delivery');
+requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_DEFER_DEGRADED_EXIT:', 'scheduled scan and health conclusion decoupling');
+requireText(releaseHealth, 'GITHUB_TOKEN: ${{ github.token }}', 'job-scoped same-repository issue token');
+requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_INCIDENT_STATE: ${{ steps.reconcile.outputs.incident_state }}', 'desired managed issue state handoff');
+requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_NOTIFICATION_OUTCOME: ${{ steps.reconcile.outputs.notification_outcome }}', 'allowlisted incident outcome handoff');
+requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_DELIVERY_IDENTITY: ${{ steps.reconcile.outputs.incident_delivery_identity }}', 'durable non-sensitive delivery identity handoff');
+requireText(releaseHealth, 'node scripts/sync-release-health-incident-issue.mjs', 'managed issue incident delivery');
 requireText(releaseHealth, "await import('./scripts/verify-org-release-health.mjs')", 'workflow-attested dynamic monitor bootstrap');
 requireText(releaseHealth, 'executeReleaseHealthMonitorEntryPoint(monitor.runReleaseHealthMonitor)', 'redacted organization release-health entry point');
 rejectPattern(releaseHealth, /run:\s*node scripts\/verify-org-release-health\.mjs/, 'unwrapped hosted monitor execution');
@@ -288,9 +305,17 @@ requireText(releaseHealthVerifier, 'findPolicyBoundCheckRecovery(', 'coverage-aw
 requireText(releaseHealthVerifier, 'const directRecovery = trustedMonitorPolicy ? null : policyBoundRecovery;', 'trusted monitor generic-recovery bypass prevention');
 requireText(releaseHealthVerifier, "monitorSelfRecoveryContract: 'release-health-monitor-v1'", 'trusted monitor recovery contract');
 requireText(releaseHealthVerifier, 'source_run_attempt:', 'exact current run-attempt binding');
+requireText(releaseHealthVerifier, "'incident_delivery_identity=' + exactIncidentDeliveryIdentity", 'authenticated stable delivery identity output');
+requireText(releaseHealthVerifier, 'incidentDeliveryIdentity: state.delivery_identity', 'restored delivery identity reconciliation');
+requireText(releaseHealthVerifier, 'const previousIncidentStateSchema = 3', 'explicit previous-state migration schema');
+requireText(releaseHealthVerifier, 'validatePreviousPersistedIncidentState(', 'authenticated v3-to-v4 state migration');
+requireText(releaseHealthVerifier, "const previousCachePrefix = 'ssai-release-health-state-v3-'", 'previous-state cache provenance boundary');
 requireText(releaseHealthVerifier, 'auditedMonitorOrigins:', 'immutable audited monitor-origin policy');
 requireText(releaseHealthVerifier, 'collectMonitorImplementationSource(', 'historical monitor implementation source verification');
-requireText(releaseHealthVerifier, 'auditedOriginSources', 'historical workflow/script/utils digest handoff');
+requireText(releaseHealthVerifier, 'auditedOriginSources', 'historical workflow/script/utils/delivery digest handoff');
+requireText(releaseHealthVerifier, "'scripts/sync-release-health-incident-issue.mjs'", 'source-attested incident delivery implementation');
+requireText(releaseHealthVerifier, 'candidates.size * 4', 'four-file trusted monitor source request budget');
+requireText(releaseHealthVerifier, 'exact four-file implementation', 'four-file trusted monitor recovery warning');
 requireText(releaseHealthVerifier, 'attestTrustedMonitorRecoverySuccesses(', 'durable cross-SHA monitor recovery attestation');
 requireText(releaseHealthVerifier, 'maxMonitorImplementationAttestations = 32', 'bounded monitor implementation attestation inventory');
 requireText(releaseHealthVerifier, 'maxRecoveryAncestorComparisons = 64', 'bounded recovery ancestor verification inventory');
