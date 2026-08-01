@@ -40,8 +40,10 @@ import {
   isEligibleTrustedMonitorImplementationCandidate,
   latestByIdentity,
   partitionWorkflowHealth,
+  parseReleaseHealthDeliveryIdentity,
   recordActivityTime,
   rateHeadroomDecision,
+  releaseHealthDeliveryIdentity,
   verifyForwardFixRecoveryPolicy,
   workflowStreamIdentity,
 } from './release-health-monitor-utils.mjs';
@@ -55,12 +57,14 @@ import {
   expectedInventoryDigest,
   executeReleaseHealthMonitorEntryPoint,
   fingerprintReleaseHealthIncident,
+  incidentStateOutputLines,
   isExactManualIncidentRecoveryCheck,
   isExactManualIncidentRecoveryRun,
   isExactSelfMonitorEnvironmentDeployment,
   notificationStateHmac,
   releaseHealthLogPayload,
   renderReleaseHealthStepSummary,
+  shouldSetDegradedExitCode,
   scheduledIncidentStateEnabled,
   validateInstallationRepositoryPage,
   verifyExpectedInventoryAttestation,
@@ -68,6 +72,22 @@ import {
   auditedPriorMonitorWorkflowSourceSha256,
   currentMonitorWorkflowSourceSha256,
 } from './verify-org-release-health.mjs';
+
+const incidentDeliveryIdentity = 'run-30264003709-attempt-1';
+assert.equal(
+  releaseHealthDeliveryIdentity('30264003709', '1'),
+  incidentDeliveryIdentity,
+  'delivery identity must bind a public GitHub run and attempt without incident-derived data',
+);
+assert.deepEqual(
+  parseReleaseHealthDeliveryIdentity(incidentDeliveryIdentity),
+  { identity: incidentDeliveryIdentity, runId: '30264003709', runAttempt: '1' },
+);
+assert.throws(
+  () => parseReleaseHealthDeliveryIdentity('run-0-attempt-1'),
+  /delivery identity is invalid/,
+  'delivery identity must reject non-GitHub run provenance',
+);
 
 const currentWorkflowSource = (await readFile(
   new URL('../.github/workflows/release-health-monitor.yml', import.meta.url),
@@ -88,6 +108,67 @@ assert.notEqual(
   auditedPriorMonitorWorkflowSourceSha256,
   'current source attestation must not overwrite the historical audited workflow digest',
 );
+assert.deepEqual(
+  incidentStateOutputLines(
+    true,
+    'ssai-release-health-state-v4-v1-at-2026-08-01T01-02-03-004Z',
+    incidentDeliveryIdentity,
+    {
+      incident_state: 'incident',
+      notification_outcome: 'new-or-worsened-incident',
+    },
+  ),
+  [
+    'scan_completed=true',
+    'health_degraded=true',
+    'incident_state_changed=true',
+    'incident_state=incident',
+    'notification_outcome=new-or-worsened-incident',
+    'notification_reconciliation_required=true',
+    'incident_delivery_identity=' + incidentDeliveryIdentity,
+    'incident_state_cache_key=ssai-release-health-state-v4-v1-at-2026-08-01T01-02-03-004Z',
+  ],
+  'a durable new-or-worsened state must require delivery and bind the exact cache key',
+);
+assert.deepEqual(
+  incidentStateOutputLines(false, '', incidentDeliveryIdentity, {
+    incident_state: 'incident',
+    notification_outcome: 'known-incident-suppressed',
+  }),
+  [
+    'scan_completed=true',
+    'health_degraded=false',
+    'incident_state_changed=false',
+    'incident_state=incident',
+    'notification_outcome=known-incident-suppressed',
+    'notification_reconciliation_required=true',
+    'incident_delivery_identity=' + incidentDeliveryIdentity,
+  ],
+  'an unchanged known incident must still reconcile the managed issue idempotently',
+);
+assert.throws(
+  () => incidentStateOutputLines(false, 'unexpected-cache-key', incidentDeliveryIdentity, {
+    incident_state: 'healthy',
+    notification_outcome: 'healthy',
+  }),
+  /cannot publish a cache key/,
+);
+assert.equal(
+  shouldSetDegradedExitCode(1, false, {}),
+  true,
+  'a degraded manual or direct scan must retain its failing conclusion',
+);
+assert.equal(
+  shouldSetDegradedExitCode(1, false, { SSAI_RELEASE_MONITOR_DEFER_DEGRADED_EXIT: 'true' }),
+  false,
+  'a completed scheduled incident may defer failure until durable delivery finishes',
+);
+assert.equal(
+  shouldSetDegradedExitCode(1, true, {}),
+  false,
+  'an unchanged known scheduled incident remains suppressed after reconciliation',
+);
+assert.throws(() => shouldSetDegradedExitCode(-1, false, {}), /conclusion input is invalid/);
 
 const incidentFailureA = {
   repo: 'SSAI_Dashboard',
@@ -748,16 +829,20 @@ const stateContext = {
   repository: 'ScaleSmall/SSAI_Shared',
   workflowRef: 'ScaleSmall/SSAI_Shared/.github/workflows/release-health-monitor.yml@refs/heads/main',
   ref: 'refs/heads/main',
-  cachePrefix: 'ssai-release-health-state-v3-v1-',
+  cachePrefix: 'ssai-release-health-state-v4-v1-',
+  previousCachePrefix: 'ssai-release-health-state-v3-v1-',
   legacyCachePrefix: 'ssai-release-health-state-v2-v1-',
   hmacEpoch: 'v1',
 };
 const stateAuthenticationKey = 'state-hmac-key-'.repeat(4);
+const laterIncidentDeliveryIdentity = 'run-30264003710-attempt-1';
+const worsenedIncidentDeliveryIdentity = 'run-30264003711-attempt-1';
 const stateRecord = createScheduledIncidentStateRecord(
   fingerprintA,
   stateContext,
   stateAuthenticationKey,
   '2026-07-21T18:00:00.000Z',
+  incidentDeliveryIdentity,
 );
 const stateBytes = Buffer.from(JSON.stringify(stateRecord, null, 2) + '\n');
 const stateKey = stateContext.cachePrefix + 'at-2026-07-21T18-00-00-000Z';
@@ -776,6 +861,70 @@ const laterStateRecord = createScheduledIncidentStateRecord(
   stateContext,
   stateAuthenticationKey,
   '2026-07-21T18:01:00.000Z',
+  laterIncidentDeliveryIdentity,
+);
+assert.equal(
+  decodeScheduledIncidentState(stateBytes, stateKey, stateContext, stateAuthenticationKey)
+    .incidentDeliveryIdentity,
+  incidentDeliveryIdentity,
+  'valid authenticated state must restore its stable non-sensitive delivery identity',
+);
+const previousStateUnsigned = {
+  schema: 3,
+  repository_id: stateContext.repositoryId,
+  repository: stateContext.repository,
+  workflow_ref: stateContext.workflowRef,
+  ref: stateContext.ref,
+  notification_state_hmac_sha256: stateRecord.notification_state_hmac_sha256,
+  notification_cluster_hmac_tokens: stateRecord.notification_cluster_hmac_tokens,
+  state_hmac_epoch: stateContext.hmacEpoch,
+  created_at: stateRecord.created_at,
+  scan_mode: 'continuous',
+  trigger_event: 'schedule',
+};
+const previousStateRecord = {
+  ...previousStateUnsigned,
+  state_hmac_sha256: createHmac('sha256', stateAuthenticationKey)
+    .update('release-health-state-record-v1\n' + JSON.stringify(previousStateUnsigned))
+    .digest('hex'),
+};
+const previousStateKey = stateContext.previousCachePrefix + 'at-'
+  + stateRecord.created_at.replace(/[:.]/g, '-');
+const previousState = decodeScheduledIncidentState(
+  Buffer.from(JSON.stringify(previousStateRecord) + '\n'),
+  previousStateKey,
+  stateContext,
+  stateAuthenticationKey,
+);
+assert.equal(previousState.notificationStateHmac, stateRecord.notification_state_hmac_sha256);
+assert.deepEqual(previousState.notificationClusterTokens, stateRecord.notification_cluster_hmac_tokens);
+assert.equal(previousState.incidentDeliveryIdentity, null);
+const exactPreviousMigration = evaluateIncidentNotification(
+  'continuous',
+  'schedule',
+  previousState,
+  [incidentFailureA],
+  stateAuthenticationKey,
+);
+assert.deepEqual(
+  {
+    changed: exactPreviousMigration.changed,
+    improved: exactPreviousMigration.improved,
+    suppressed: exactPreviousMigration.suppressed,
+    stateWriteRequired: exactPreviousMigration.stateWriteRequired,
+  },
+  { changed: false, improved: false, suppressed: true, stateWriteRequired: true },
+  'an exact authenticated v3 state must migrate to v4 without producing another red run',
+);
+assert.equal(
+  decodeScheduledIncidentState(
+    Buffer.from(JSON.stringify(laterStateRecord) + '\n'),
+    stateContext.cachePrefix + 'at-' + laterStateRecord.created_at.replace(/[:.]/g, '-'),
+    stateContext,
+    stateAuthenticationKey,
+  ).incidentDeliveryIdentity,
+  laterIncidentDeliveryIdentity,
+  'the v4 rewrite must authenticate and restore the fresh delivery identity',
 );
 assert.notEqual(
   laterStateRecord.notification_state_hmac_sha256,
@@ -806,6 +955,7 @@ const worsenedStateRecord = createScheduledIncidentStateRecord(
   stateContext,
   stateAuthenticationKey,
   '2026-07-21T18:05:00.000Z',
+  worsenedIncidentDeliveryIdentity,
 );
 const worsenedStateBytes = Buffer.from(JSON.stringify(worsenedStateRecord, null, 2) + '\n');
 const worsenedStateKey = stateContext.cachePrefix + 'at-2026-07-21T18-05-00-000Z';
@@ -882,7 +1032,7 @@ assert.deepEqual(
     stateWriteRequired: exactLegacyMigration.stateWriteRequired,
   },
   { changed: false, improved: false, suppressed: true, stateWriteRequired: true },
-  'an exact authenticated v2 state must migrate to v3 without producing another red run',
+  'an exact authenticated v2 state must migrate to v4 without producing another red run',
 );
 const changedLegacyMigration = evaluateIncidentNotification(
   'continuous',
@@ -918,12 +1068,14 @@ const confidentialStateBytes = Buffer.from(JSON.stringify(createScheduledInciden
   stateContext,
   stateAuthenticationKey,
   '2026-07-21T18:15:00.000Z',
+  incidentDeliveryIdentity,
 )));
 const healthyStateBytes = Buffer.from(JSON.stringify(createScheduledIncidentStateRecord(
   fingerprintReleaseHealthIncident([]),
   stateContext,
   stateAuthenticationKey,
   '2026-07-21T18:15:00.000Z',
+  incidentDeliveryIdentity,
 )));
 assert.equal(
   confidentialStateBytes.length,
@@ -948,8 +1100,9 @@ for (const privateStateMarker of [
 assert.deepEqual(
   Object.keys(stateRecord).sort(),
   [
-    'created_at', 'notification_cluster_hmac_tokens', 'notification_state_hmac_sha256', 'ref', 'repository',
-    'repository_id', 'scan_mode', 'schema', 'state_hmac_epoch', 'state_hmac_sha256', 'trigger_event', 'workflow_ref',
+    'created_at', 'delivery_identity', 'notification_cluster_hmac_tokens', 'notification_state_hmac_sha256',
+    'ref', 'repository', 'repository_id', 'scan_mode', 'schema', 'state_hmac_epoch', 'state_hmac_sha256',
+    'trigger_event', 'workflow_ref',
   ],
   'cache state must have a fixed public-provenance plus padded opaque-HMAC shape',
 );
@@ -1004,6 +1157,19 @@ assert.equal(
   ),
   null,
   'tampered opaque cluster tokens must safely reinitialize instead of suppressing',
+);
+assert.equal(
+  decodeScheduledIncidentStateOrNull(
+    Buffer.from(JSON.stringify({
+      ...stateRecord,
+      delivery_identity: 'run-0-attempt-1',
+    }) + '\n'),
+    stateKey,
+    stateContext,
+    stateAuthenticationKey,
+  ),
+  null,
+  'tampered or invalid delivery identity must safely reinitialize instead of suppressing reconciliation',
 );
 assert.equal(
   decodeScheduledIncidentStateOrNull(
@@ -1506,11 +1672,13 @@ const monitorOldSha = '3'.repeat(40);
 const monitorCurrentSha = '4'.repeat(40);
 const monitorCurrentScriptSource = Buffer.from('console.log("current monitor");\n', 'utf8');
 const monitorCurrentUtilsSource = Buffer.from('export const currentMonitor = true;\n', 'utf8');
+const monitorCurrentDeliverySource = Buffer.from('export const delivery = true;\n', 'utf8');
 const monitorVerificationContext = {
   currentHeadSha: monitorCurrentSha,
   monitorImplementationSource: {
     scriptSource: monitorCurrentScriptSource,
     utilsSource: monitorCurrentUtilsSource,
+    deliverySource: monitorCurrentDeliverySource,
   },
 };
 const auditedHistoricalWorkflowSource = Buffer.from('name: legacy monitor\non:\n  workflow_dispatch:\n', 'utf8');
@@ -1539,6 +1707,7 @@ const monitorPolicyInput = {
     workflowSourceSha256: createHash('sha256').update(auditedHistoricalWorkflowSource).digest('hex'),
     scriptSourceSha256: createHash('sha256').update(auditedHistoricalScriptSource).digest('hex'),
     utilsSourceSha256: createHash('sha256').update(auditedHistoricalUtilsSource).digest('hex'),
+    deliverySourceSha256: null,
   }, {
     runId: 705,
     runAttempt: 1,
@@ -1552,12 +1721,14 @@ const monitorPolicyInput = {
     workflowSourceSha256: createHash('sha256').update(auditedHistoricalWorkflowSource).digest('hex'),
     scriptSourceSha256: createHash('sha256').update(auditedHistoricalScriptSource).digest('hex'),
     utilsSourceSha256: createHash('sha256').update(auditedHistoricalUtilsSource).digest('hex'),
+    deliverySourceSha256: null,
   }],
 };
 const auditedOriginSources = new Map([[monitorOldSha, {
   workflowSource: auditedHistoricalWorkflowSource,
   scriptSource: auditedHistoricalScriptSource,
   utilsSource: auditedHistoricalUtilsSource,
+  deliverySource: null,
 }]]);
 const monitorPolicy = verifyForwardFixRecoveryPolicy({
   ...monitorVerificationContext,
@@ -1778,7 +1949,8 @@ assert.equal(attestTrustedMonitorImplementation(monitorPolicy, {
   workflowSource: monitorSource,
   scriptSource: monitorCurrentScriptSource,
   utilsSource: monitorCurrentUtilsSource,
-}), true, 'an exact three-file implementation match may attest a default-main ancestor');
+  deliverySource: monitorCurrentDeliverySource,
+}), true, 'an exact four-file implementation match may attest a default-main ancestor');
 assert.equal(monitorPolicy.attestedMonitorHeadShas.has(monitorEquivalentAncestorSha), true);
 for (const [label, candidateSha, runMutation, defaultCommitShas] of [
   ['fork', '8'.repeat(40), { head_repository: { full_name: 'untrusted/fork' } }, new Set(['8'.repeat(40)])],
@@ -1793,7 +1965,8 @@ for (const [label, candidateSha, runMutation, defaultCommitShas] of [
     workflowSource: monitorSource,
     scriptSource: monitorCurrentScriptSource,
     utilsSource: monitorCurrentUtilsSource,
-  }), false, label + ' success must not receive source attestation even when its three files match');
+    deliverySource: monitorCurrentDeliverySource,
+  }), false, label + ' success must not receive source attestation even when its four files match');
   assert.equal(monitorPolicy.attestedMonitorHeadShas.has(candidateSha), false);
 }
 assert.equal(attestTrustedMonitorImplementation(monitorPolicy, {
@@ -1803,14 +1976,17 @@ assert.equal(attestTrustedMonitorImplementation(monitorPolicy, {
   workflowSource: monitorSource,
   scriptSource: Buffer.from('console.log("changed ancestor");\n', 'utf8'),
   utilsSource: monitorCurrentUtilsSource,
+  deliverySource: monitorCurrentDeliverySource,
 }), false, 'a changed default-main implementation must not be attested');
 for (const [label, mutation] of [
   ['workflow', { workflowSource: monitorSource + '# changed\n' }],
   ['script', { scriptSource: Buffer.from('console.log("changed");\n', 'utf8') }],
   ['utils', { utilsSource: Buffer.from('export const changed = true;\n', 'utf8') }],
+  ['delivery', { deliverySource: Buffer.from('export const delivery = false;\n', 'utf8') }],
   ['missing workflow', { workflowSource: null }],
   ['missing script', { scriptSource: null }],
   ['missing utils', { utilsSource: null }],
+  ['missing delivery', { deliverySource: null }],
 ]) {
   const rejectedSha = createHash('sha1').update(label).digest('hex');
   const rejectedDefaultCommitShas = new Set([...monitorDefaultCommitShas, rejectedSha]);
@@ -1821,6 +1997,7 @@ for (const [label, mutation] of [
     workflowSource: monitorSource,
     scriptSource: monitorCurrentScriptSource,
     utilsSource: monitorCurrentUtilsSource,
+    deliverySource: monitorCurrentDeliverySource,
     ...mutation,
   }), false, label + ' mismatch or absence must fail closed');
   assert.equal(monitorPolicy.attestedMonitorHeadShas.has(rejectedSha), false);
@@ -1831,7 +2008,11 @@ assert.equal(verifyForwardFixRecoveryPolicy({
   policy: monitorPolicyInput,
   auditedOriginSources,
   currentHeadSha: monitorCurrentSha,
-  monitorImplementationSource: { scriptSource: monitorCurrentScriptSource, utilsSource: null },
+  monitorImplementationSource: {
+    scriptSource: monitorCurrentScriptSource,
+    utilsSource: null,
+    deliverySource: monitorCurrentDeliverySource,
+  },
 }), null, 'a trusted current policy must fail closed when any implementation source is missing');
 assert.equal(verifyForwardFixRecoveryPolicy({
   ...monitorVerificationContext,
@@ -1855,8 +2036,21 @@ assert.equal(verifyForwardFixRecoveryPolicy({
     workflowSource: auditedHistoricalWorkflowSource,
     scriptSource: auditedHistoricalScriptSource,
     utilsSource: Buffer.from('tampered\n', 'utf8'),
+    deliverySource: null,
   }]]),
 }), null, 'a historical implementation digest mismatch must invalidate the entire recovery policy');
+assert.equal(verifyForwardFixRecoveryPolicy({
+  ...monitorVerificationContext,
+  workflow: monitorWorkflow,
+  workflowSource: monitorSource,
+  policy: monitorPolicyInput,
+  auditedOriginSources: new Map([[monitorOldSha, {
+    workflowSource: auditedHistoricalWorkflowSource,
+    scriptSource: auditedHistoricalScriptSource,
+    utilsSource: auditedHistoricalUtilsSource,
+    deliverySource: Buffer.from('unexpected historical delivery implementation\n', 'utf8'),
+  }]]),
+}), null, 'a delivery implementation appearing where historical absence was asserted must invalidate the policy');
 const absentUtilsPolicyInput = {
   ...monitorPolicyInput,
   auditedMonitorOrigins: [{
@@ -1873,6 +2067,7 @@ assert.ok(verifyForwardFixRecoveryPolicy({
     workflowSource: auditedHistoricalWorkflowSource,
     scriptSource: auditedHistoricalScriptSource,
     utilsSource: null,
+    deliverySource: null,
   }]]),
 }), 'an audited historical absence must be verified as an exact null source');
 assert.equal(verifyForwardFixRecoveryPolicy({

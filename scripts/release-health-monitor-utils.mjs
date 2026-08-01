@@ -1,5 +1,26 @@
 import { createHash } from 'node:crypto';
 
+const releaseHealthDeliveryIdentityPattern = /^run-([1-9][0-9]{0,19})-attempt-([1-9][0-9]{0,9})$/;
+
+export function releaseHealthDeliveryIdentity(runId, runAttempt) {
+  const normalizedRunId = String(runId || '').trim();
+  const normalizedRunAttempt = String(runAttempt || '').trim();
+  return parseReleaseHealthDeliveryIdentity(
+    'run-' + normalizedRunId + '-attempt-' + normalizedRunAttempt,
+  ).identity;
+}
+
+export function parseReleaseHealthDeliveryIdentity(value) {
+  const identity = String(value || '').trim();
+  const match = releaseHealthDeliveryIdentityPattern.exec(identity);
+  if (!match) throw new Error('Release-health delivery identity is invalid.');
+  return Object.freeze({
+    identity,
+    runId: match[1],
+    runAttempt: match[2],
+  });
+}
+
 export function latestByIdentity(records, identityOf) {
   if (!Array.isArray(records)) throw new TypeError('records must be an array');
   if (typeof identityOf !== 'function') throw new TypeError('identityOf must be a function');
@@ -422,6 +443,7 @@ export function verifyForwardFixRecoveryPolicy({
       sourceBytes,
       monitorImplementationSource?.scriptSource,
       monitorImplementationSource?.utilsSource,
+      monitorImplementationSource?.deliverySource,
     )
     : null;
   const controlledDisabledMonitor = isControlledDisabledMonitorRecoveryWorkflow({
@@ -455,7 +477,10 @@ export function verifyForwardFixRecoveryPolicy({
         || !sourceDigestMatches(sources.scriptSource, origin.scriptSourceSha256)
         || (origin.utilsSourceSha256 === null
           ? sources.utilsSource !== null
-          : !sourceDigestMatches(sources.utilsSource, origin.utilsSourceSha256))) return null;
+          : !sourceDigestMatches(sources.utilsSource, origin.utilsSourceSha256))
+        || (origin.deliverySourceSha256 === null
+          ? sources.deliverySource !== null
+          : !sourceDigestMatches(sources.deliverySource, origin.deliverySourceSha256))) return null;
     }
   }
   return Object.freeze({
@@ -486,7 +511,7 @@ export function isTrustedMonitorRecoveryPolicy(policy) {
     && policy.monitorSelfRecoveryEvents instanceof Set
     && policy.monitorSelfRecoveryEvents.size > 0
     && Array.isArray(policy.auditedMonitorOrigins)
-    && /^[a-f0-9]{64}:[a-f0-9]{64}:[a-f0-9]{64}$/.test(String(policy.monitorImplementationIdentity || ''))
+    && /^(?:[a-f0-9]{64}:){3}[a-f0-9]{64}$/.test(String(policy.monitorImplementationIdentity || ''))
     && /^[a-f0-9]{40}$/.test(String(policy.currentMonitorHeadSha || ''))
     && policy.attestedMonitorHeadShas instanceof Set
     && policy.attestedMonitorHeadShas.has(policy.currentMonitorHeadSha);
@@ -499,6 +524,7 @@ export function attestTrustedMonitorImplementation(policy, {
   workflowSource,
   scriptSource,
   utilsSource,
+  deliverySource,
 }) {
   if (!isTrustedMonitorRecoveryPolicy(policy)) {
     throw new TypeError('trusted monitor recovery policy must be source-verified');
@@ -509,7 +535,12 @@ export function attestTrustedMonitorImplementation(policy, {
   })) return false;
   const headSha = run.head_sha;
   const normalizedHeadSha = String(headSha || '').trim().toLowerCase();
-  const identity = exactMonitorImplementationIdentity(workflowSource, scriptSource, utilsSource);
+  const identity = exactMonitorImplementationIdentity(
+    workflowSource,
+    scriptSource,
+    utilsSource,
+    deliverySource,
+  );
   if (!/^[a-f0-9]{40}$/.test(normalizedHeadSha) || !identity
     || identity !== policy.monitorImplementationIdentity) return false;
   policy.attestedMonitorHeadShas.add(normalizedHeadSha);
@@ -1289,6 +1320,9 @@ function verifyAuditedMonitorOrigins(value) {
     const utilsSourceSha256 = item.utilsSourceSha256 === null
       ? null
       : String(item.utilsSourceSha256 || '').trim().toLowerCase();
+    const deliverySourceSha256 = item.deliverySourceSha256 === null
+      ? null
+      : String(item.deliverySourceSha256 || '').trim().toLowerCase();
     const identity = runId + ':' + runAttempt;
     if (!Number.isSafeInteger(runId) || runId < 1
       || !Number.isSafeInteger(runAttempt) || runAttempt < 1 || runAttempt > 100
@@ -1305,6 +1339,7 @@ function verifyAuditedMonitorOrigins(value) {
       || !/^[a-f0-9]{64}$/.test(workflowSourceSha256)
       || !/^[a-f0-9]{64}$/.test(scriptSourceSha256)
       || (utilsSourceSha256 !== null && !/^[a-f0-9]{64}$/.test(utilsSourceSha256))
+      || (deliverySourceSha256 !== null && !/^[a-f0-9]{64}$/.test(deliverySourceSha256))
       || seen.has(identity)) return null;
     seen.add(identity);
     verified.push(Object.freeze({
@@ -1321,6 +1356,7 @@ function verifyAuditedMonitorOrigins(value) {
       workflowSourceSha256,
       scriptSourceSha256,
       utilsSourceSha256,
+      deliverySourceSha256,
     }));
   }
   return Object.freeze(verified);
@@ -1336,8 +1372,8 @@ function normalizeSourceBytes(source) {
   return typeof source === 'string' ? Buffer.from(source, 'utf8') : null;
 }
 
-function exactMonitorImplementationIdentity(workflowSource, scriptSource, utilsSource) {
-  const sources = [workflowSource, scriptSource, utilsSource].map(normalizeSourceBytes);
+function exactMonitorImplementationIdentity(workflowSource, scriptSource, utilsSource, deliverySource) {
+  const sources = [workflowSource, scriptSource, utilsSource, deliverySource].map(normalizeSourceBytes);
   if (sources.some((source) => !source)) return null;
   return sources.map((source) => createHash('sha256').update(source).digest('hex')).join(':');
 }
