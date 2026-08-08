@@ -44,6 +44,7 @@ import {
   recordActivityTime,
   rateHeadroomDecision,
   releaseHealthDeliveryIdentity,
+  verifyAuthorizedDisabledWorkflowHold,
   verifyForwardFixRecoveryPolicy,
   workflowStreamIdentity,
 } from './release-health-monitor-utils.mjs';
@@ -527,6 +528,7 @@ const adversarialHostedResult = {
   failed_workflows: 2,
   allowed_no_history_workflows: 1,
   unresolved_no_history_workflows: 1,
+  authorized_disabled_workflow_holds: 1,
   categorized_workflows: 27,
   current_commit_checks: 42,
   recovered_recent_workflow_attempts: 3,
@@ -558,6 +560,16 @@ const adversarialHostedResult = {
       event: 'push',
       head_repository: sensitiveMarkers[0],
     },
+  }],
+  authorized_disabled_workflow_hold_evidence: [{
+    repository: sensitiveMarkers[0],
+    workflow: sensitiveMarkers[1],
+    workflow_id: 299211649,
+    workflow_path: '.github/workflows/production-service-canaries.yml',
+    workflow_state: 'disabled_manually',
+    workflow_source_sha256: sensitiveMarkers[9],
+    reason: sensitiveMarkers[8],
+    recovery_evidence: false,
   }],
   recent_failure_recoveries: {
     workflows: [{ id: 987654321012345, name: sensitiveMarkers[1], head_sha: sensitiveMarkers[6] }],
@@ -591,6 +603,9 @@ assert.deepEqual(
   },
   'hosted output must contain only the three coarse public fields',
 );
+const localStepSummary = renderReleaseHealthStepSummary(adversarialHostedResult, {});
+assert.match(localStepSummary, /Authorized disabled workflow holds: 1/);
+assert.match(localStepSummary, /Recovery evidence: `no`\./);
 assert.equal(
   hostedStepSummary,
   '# Scale Small AI release health\n\n- Result: degraded\n- Inventory complete: yes\n- Notification outcome: new-or-worsened-incident\n',
@@ -1524,6 +1539,64 @@ const workflowRecovery = findSupersedingWorkflowRun(failedRun, [
 assert.equal(workflowRecovery?.id, 305, 'workflow recovery must require the same workflow, branch, and event');
 assert.equal(findSupersedingWorkflowRun({ ...failedRun, id: 306, created_at: '2026-07-18T10:00:00Z' }, [failedRun]), null);
 assert.match(workflowStreamIdentity({ ...failedRun, head_branch: null }), /sha-/i, 'missing branches must fail closed to the exact SHA');
+
+const authorizedDisabledHoldSource = 'name: Production Service Delivery Canaries\non:\n  workflow_dispatch:\n';
+const authorizedDisabledHoldWorkflow = {
+  id: 299211649,
+  name: 'Production Service Delivery Canaries',
+  path: '.github/workflows/production-service-canaries.yml',
+  state: 'disabled_manually',
+};
+const authorizedDisabledHoldPolicy = {
+  workflowId: authorizedDisabledHoldWorkflow.id,
+  name: authorizedDisabledHoldWorkflow.name,
+  path: authorizedDisabledHoldWorkflow.path,
+  state: 'disabled_manually',
+  sourceSha256: createHash('sha256').update(authorizedDisabledHoldSource).digest('hex'),
+  headRepository: 'ScaleSmall/SSAI_Production_QA',
+  reason: 'Explicitly held for a bounded protected activation.',
+};
+const authorizedDisabledHold = verifyAuthorizedDisabledWorkflowHold({
+  workflow: authorizedDisabledHoldWorkflow,
+  policy: authorizedDisabledHoldPolicy,
+  workflowSource: authorizedDisabledHoldSource,
+  repository: 'ScaleSmall/SSAI_Production_QA',
+});
+assert.ok(authorizedDisabledHold, 'the exact source-bound disabled workflow hold must verify');
+assert.equal(authorizedDisabledHold.recoveryEvidence, false, 'an authorized disabled hold must never be recovery evidence');
+assert.equal('recoveryEvents' in authorizedDisabledHold, false, 'a disabled hold must not expose a recovery-event contract');
+assert.equal(isTrustedMonitorRecoveryPolicy(authorizedDisabledHold), false, 'a disabled hold must not enter trusted recovery');
+for (const [label, workflowMutation = {}, policyMutation = {}, sourceMutation = authorizedDisabledHoldSource, repository = 'ScaleSmall/SSAI_Production_QA'] of [
+  ['active state', { state: 'active' }],
+  ['different disabled state', { state: 'disabled_inactivity' }],
+  ['wrong workflow id', { id: 299211650 }],
+  ['wrong workflow name', { name: 'Production Provider Webhook Canaries' }],
+  ['wrong workflow path', { path: '.github/workflows/provider-webhook-canaries.yml' }],
+  ['changed source', {}, {}, authorizedDisabledHoldSource + '# changed\n'],
+  ['wrong repository', {}, {}, authorizedDisabledHoldSource, 'ScaleSmall/SSAI_Dashboard'],
+  ['blank rationale', {}, { reason: '' }],
+  ['recovery-capable policy', {}, { recoveryEvents: ['workflow_dispatch'] }],
+]) {
+  assert.equal(verifyAuthorizedDisabledWorkflowHold({
+    workflow: { ...authorizedDisabledHoldWorkflow, ...workflowMutation },
+    policy: { ...authorizedDisabledHoldPolicy, ...policyMutation },
+    workflowSource: sourceMutation,
+    repository,
+  }), null, label + ' must invalidate the disabled workflow hold');
+}
+const unrelatedHeldWorkflowSuccess = {
+  ...failedRun,
+  id: 307,
+  workflow_id: authorizedDisabledHoldWorkflow.id,
+  status: 'completed',
+  conclusion: 'success',
+  created_at: '2026-07-18T10:05:00Z',
+};
+assert.equal(
+  findSupersedingWorkflowRun(failedRun, [failedRun, unrelatedHeldWorkflowSuccess]),
+  null,
+  'an authorized hold on another workflow must not suppress an unrelated failure',
+);
 
 const forwardFixSource = 'name: Production n8n workflow exactness\non:\n  schedule:\n  workflow_dispatch:\n';
 const forwardFixWorkflow = {

@@ -59,6 +59,64 @@ export function partitionWorkflowHealth(rows, acceptableConclusions) {
   return { green, pending, failed, allowedNoHistory, unresolvedNoHistory, categorized };
 }
 
+export function verifyAuthorizedDisabledWorkflowHold({
+  workflow,
+  policy,
+  workflowSource,
+  repository,
+}) {
+  if (!workflow || typeof workflow !== 'object' || Array.isArray(workflow)) {
+    throw new TypeError('workflow must be an object');
+  }
+  if (!policy || typeof policy !== 'object' || Array.isArray(policy)) return null;
+
+  const allowedPolicyFields = new Set([
+    'workflowId',
+    'name',
+    'path',
+    'state',
+    'sourceSha256',
+    'headRepository',
+    'reason',
+  ]);
+  if (Object.keys(policy).some((field) => !allowedPolicyFields.has(field))) return null;
+
+  const expectedWorkflowId = Number(policy.workflowId);
+  const expectedName = String(policy.name || '').trim();
+  const expectedPath = String(policy.path || '').trim();
+  const expectedState = String(policy.state || '').trim();
+  const expectedRepository = String(policy.headRepository || '').trim();
+  const expectedSourceSha256 = String(policy.sourceSha256 || '').trim().toLowerCase();
+  const reason = String(policy.reason || '').trim();
+  const sourceBytes = normalizeSourceBytes(workflowSource);
+  if (!Number.isSafeInteger(expectedWorkflowId) || expectedWorkflowId < 1
+    || Number(workflow.id) !== expectedWorkflowId
+    || !expectedName || String(workflow.name || '') !== expectedName
+    || !/^\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml$/.test(expectedPath)
+    || String(workflow.path || '') !== expectedPath
+    || expectedState !== 'disabled_manually'
+    || String(workflow.state || '') !== expectedState
+    || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(expectedRepository)
+    || String(repository || '').trim() !== expectedRepository
+    || !/^[a-f0-9]{64}$/.test(expectedSourceSha256)
+    || !reason || reason.length > 500
+    || !Buffer.isBuffer(sourceBytes)) return null;
+
+  const actualSourceSha256 = createHash('sha256').update(sourceBytes).digest('hex');
+  if (actualSourceSha256 !== expectedSourceSha256) return null;
+  return Object.freeze({
+    verified: true,
+    recoveryEvidence: false,
+    workflowId: expectedWorkflowId,
+    name: expectedName,
+    path: expectedPath,
+    state: expectedState,
+    headRepository: expectedRepository,
+    sourceSha256: actualSourceSha256,
+    reason,
+  });
+}
+
 export function evaluateNoHistoryAllowance({
   workflow,
   policy,
