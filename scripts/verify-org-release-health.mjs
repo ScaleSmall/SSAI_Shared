@@ -38,6 +38,7 @@ import {
   recordActivityTime,
   recordOccurrenceTime,
   releaseHealthDeliveryIdentity,
+  verifyAuthorizedDisabledWorkflowHold,
   verifyForwardFixRecoveryPolicy,
   workflowStreamIdentity,
 } from './release-health-monitor-utils.mjs';
@@ -111,6 +112,17 @@ const noHistoryPolicies = new Map([
       allowedEvents: ['schedule', 'workflow_dispatch'],
       maxAgeHours: 30,
     },
+  }],
+]);
+const authorizedDisabledWorkflowHolds = new Map([
+  ['SSAI_Production_QA:299211649', {
+    workflowId: 299211649,
+    name: 'Production Service Delivery Canaries',
+    path: '.github/workflows/production-service-canaries.yml',
+    state: 'disabled_manually',
+    sourceSha256: '50e5c6f7f01364f2b24c7dc7e3082f60959af9b2f048784c73a697677d179591',
+    headRepository: 'ScaleSmall/SSAI_Production_QA',
+    reason: 'This bounded production canary remains intentionally disabled until the protected production-readiness activation sequence explicitly enables it. The hold is inventory evidence only and cannot recover or suppress a failed run or check.',
   }],
 ]);
 const legacyMonitorTitle = 'Scale Small AI Release Health Monitor';
@@ -191,18 +203,6 @@ const auditedMonitorOrigin = (
   };
 };
 const forwardFixRecoveryPolicies = new Map([
-  // The scheduled service canary failed on the pre-fix main commit. The exact
-  // current-main manual run exercised both production jobs successfully.
-  ['SSAI_Production_QA:299211649', {
-    workflowId: 299211649,
-    path: '.github/workflows/production-service-canaries.yml',
-    sourceSha256: '3df3ef39cc333fe5c3858ebf5352b9d5810324b187d41db599f826005f864c5a',
-    headRepository: 'ScaleSmall/SSAI_Production_QA',
-    failedEvents: ['schedule'],
-    recoveryEvents: ['workflow_dispatch'],
-    jobNames: ['End-to-end service delivery canary'],
-    recoveryDisplayTitles: ['Production Service Delivery Canaries'],
-  }],
   // The automatic R&R deployment failed before deployment on the pre-fix main
   // commit. The exact current-main manual run completed the same release path.
   ['SSAI_RR:289080389', {
@@ -369,6 +369,9 @@ if (requestStats.rate_remaining !== null && requestStats.rate_remaining < rateRe
 }
 
 const workflowRows = rows.flatMap((row) => row.workflows);
+const authorizedDisabledWorkflowHoldEvidence = rows.flatMap((row) => (
+  row.authorized_disabled_workflow_holds || []
+));
 const {
   green: greenWorkflows,
   pending: pendingWorkflows,
@@ -394,6 +397,17 @@ const summary = {
   unresolved_no_history_workflows: unresolvedNoHistoryWorkflows.length,
   categorized_workflows: categorizedWorkflows,
   workflow_categories_complete: categorizedWorkflows === workflowRows.length,
+  authorized_disabled_workflow_holds: authorizedDisabledWorkflowHoldEvidence.length,
+  authorized_disabled_workflow_hold_evidence: authorizedDisabledWorkflowHoldEvidence.map((hold) => ({
+    repository: hold.headRepository,
+    workflow: hold.name,
+    workflow_id: hold.workflowId,
+    workflow_path: hold.path,
+    workflow_state: hold.state,
+    workflow_source_sha256: hold.sourceSha256,
+    reason: hold.reason,
+    recovery_evidence: hold.recoveryEvidence,
+  })),
   allowed_no_history_evidence: allowedNoHistoryWorkflows.map((row) => ({
     repo: row.repo,
     workflow: row.name,
@@ -485,6 +499,11 @@ async function inspectRepository(repo) {
   const recentRuns = associateWorkflowRunsWithPulls(rawRecentRuns, recentPullCommits);
 
   const workflows = allWorkflows.filter((workflow) => workflow.state === 'active');
+  const verifiedAuthorizedDisabledHolds = await resolveAuthorizedDisabledWorkflowHolds(
+    repo.name,
+    allWorkflows,
+    headSha,
+  );
   const verifiedForwardFixPolicies = await resolveForwardFixRecoveryPolicies(
     repo.name,
     allWorkflows,
@@ -780,7 +799,15 @@ async function inspectRepository(repo) {
     return { name: status.context, stream: status.stream_identity, status: status.state, conclusion: status.state, url: status.target_url };
   });
 
-  rows.push({ repo: repo.name, default_branch: defaultBranch, head_sha: headSha, workflows: workflowHealth, checks: currentChecks, statuses: currentStatuses });
+  rows.push({
+    repo: repo.name,
+    default_branch: defaultBranch,
+    head_sha: headSha,
+    workflows: workflowHealth,
+    authorized_disabled_workflow_holds: verifiedAuthorizedDisabledHolds,
+    checks: currentChecks,
+    statuses: currentStatuses,
+  });
 }
 
 async function collectRecentWorkflowRuns(repoName) {
@@ -886,6 +913,70 @@ async function collectRepositorySource(repoName, path, ref, allowMissing) {
   const bytes = Buffer.from(content, 'base64');
   if (bytes.length !== size) throw new Error(repoName + ' source response for ' + path + ' failed its byte-length integrity check.');
   return bytes;
+}
+
+async function resolveAuthorizedDisabledWorkflowHolds(repoName, workflows, headSha) {
+  const configured = [...authorizedDisabledWorkflowHolds.entries()]
+    .filter(([key]) => key.startsWith(repoName + ':'))
+    .map(([, policy]) => policy);
+  const resolved = await mapLimit(configured, 2, async (policy) => {
+    const workflow = workflows.find((candidate) => Number(candidate.id) === Number(policy.workflowId));
+    if (!workflow) {
+      failures.push(issue(
+        repoName,
+        policy.path,
+        'configured authorized disabled workflow hold is missing from the repository inventory',
+        '',
+        {
+          type: 'authorized-disabled-workflow-hold-missing',
+          workflow_id: Number(policy.workflowId),
+          workflow_path: String(policy.path || ''),
+          head_sha: String(headSha || '').toLowerCase(),
+        },
+        {
+          type: 'authorized-disabled-workflow-hold-missing',
+          stream_sha256: incidentStreamDigest(['disabled-workflow-hold', Number(policy.workflowId), String(policy.path || '')]),
+          failure_class: 'workflow-missing',
+          episode_anchor: 'hold-head:' + String(headSha || '').toLowerCase(),
+          policy_head_sha: String(headSha || '').toLowerCase(),
+        },
+      ));
+      return null;
+    }
+
+    const workflowSource = await collectWorkflowSource(repoName, policy.path, headSha, true);
+    const hold = verifyAuthorizedDisabledWorkflowHold({
+      workflow,
+      policy,
+      workflowSource,
+      repository: owner + '/' + repoName,
+    });
+    if (!hold) {
+      failures.push(issue(
+        repoName,
+        policy.path,
+        'configured authorized disabled workflow hold failed its exact repository, identity, state, or source-digest verification',
+        workflow.html_url,
+        {
+          type: 'authorized-disabled-workflow-hold-verification',
+          workflow_id: Number(policy.workflowId),
+          workflow_path: String(policy.path || ''),
+          workflow_state: String(workflow.state || ''),
+          head_sha: String(headSha || '').toLowerCase(),
+        },
+        {
+          type: 'authorized-disabled-workflow-hold-verification',
+          stream_sha256: incidentStreamDigest(['disabled-workflow-hold', Number(policy.workflowId), String(policy.path || '')]),
+          failure_class: 'hold-verification',
+          episode_anchor: 'hold-head:' + String(headSha || '').toLowerCase(),
+          policy_head_sha: String(headSha || '').toLowerCase(),
+        },
+      ));
+      return null;
+    }
+    return hold;
+  });
+  return resolved.filter(Boolean);
 }
 
 async function resolveForwardFixRecoveryPolicies(repoName, workflows, headSha, { recentRuns, defaultBranch }) {
@@ -2786,6 +2877,7 @@ export function renderReleaseHealthStepSummary(result, environment = process.env
     '- Failed workflows: ' + result.failed_workflows,
     '- Allowed no-history workflows: ' + result.allowed_no_history_workflows,
     '- Unresolved no-history workflows: ' + result.unresolved_no_history_workflows,
+    '- Authorized disabled workflow holds: ' + (result.authorized_disabled_workflow_holds ?? 0),
     '- Categorized workflows: ' + result.categorized_workflows + '/' + result.active_workflows,
     '- Current commit checks/statuses: ' + result.current_commit_checks,
     '- Workflow failures recovered/provisional/unresolved: ' + result.recovered_recent_workflow_attempts + '/' + result.provisional_self_recovering_workflow_attempts + '/' + result.unresolved_recent_workflow_attempts,
@@ -2816,6 +2908,14 @@ export function renderReleaseHealthStepSummary(result, environment = process.env
         + ' Approved source SHA-256: `' + evidence.workflow_source_sha256 + '`.' + witness;
     }));
   }
+  const disabledHoldEvidence = result.authorized_disabled_workflow_hold_evidence || [];
+  if (disabledHoldEvidence.length) {
+    lines.push('', '## Authorized disabled workflow holds', '', ...disabledHoldEvidence.map((evidence) => (
+      '- ' + evidence.repository + ' / ' + evidence.workflow + ' (`' + evidence.workflow_path + '`): '
+        + evidence.reason + ' State: `' + evidence.workflow_state + '`. Source SHA-256: `'
+        + evidence.workflow_source_sha256 + '`. Recovery evidence: `no`.'
+    )));
+  }
   if (result.failures.length) {
     lines.push('', '## Failures', '', ...result.failures.map((failure) => '- ' + (failure.url ? '[' + failure.repo + ' / ' + failure.owner + '](' + safeMarkdownUrl(failure.url) + ')' : failure.repo + ' / ' + failure.owner) + ': ' + failure.problem));
   }
@@ -2840,8 +2940,10 @@ function deferredRateSummary(repositoryCount) {
     failed_workflows: 0,
     allowed_no_history_workflows: 0,
     unresolved_no_history_workflows: 0,
+    authorized_disabled_workflow_holds: 0,
     categorized_workflows: 0,
     workflow_categories_complete: false,
+    authorized_disabled_workflow_hold_evidence: [],
     allowed_no_history_evidence: [],
     current_commit_checks: 0,
     lookback_hours: lookbackHours,

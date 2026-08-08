@@ -255,23 +255,37 @@ requireText(releaseHealthVerifier, 'partitionWorkflowHealth(', 'exhaustive workf
 requireText(releaseHealthVerifier, 'workflow_categories_complete', 'workflow category completeness assertion');
 requireText(releaseHealthVerifier, 'unresolved_no_history_workflows', 'explicit unresolved no-history accounting');
 requireText(releaseHealthVerifier, 'allowed_no_history_evidence', 'auditable no-history evidence summary');
+requireText(releaseHealthVerifier, 'verifyAuthorizedDisabledWorkflowHold(', 'source-hashed authorized disabled workflow hold');
+requireText(releaseHealthVerifier, 'authorized_disabled_workflow_hold_evidence', 'auditable disabled workflow hold summary');
 requireText(releaseHealthVerifier, 'verifyForwardFixRecoveryPolicy(', 'source-hashed current-main forward-fix policy');
 requireText(releaseHealthVerifier, 'findForwardFixWorkflowRun(', 'bounded cross-trigger workflow forward-fix recovery');
 requireText(releaseHealthVerifier, 'findForwardFixCheck(', 'bounded cross-trigger check forward-fix recovery');
 const productionQaPolicyFields = [
   ['workflowId: 299211649', 'workflow identity'],
+  ["name: 'Production Service Delivery Canaries'", 'workflow name'],
   ["path: '.github/workflows/production-service-canaries.yml'", 'workflow path'],
-  ["sourceSha256: '3df3ef39cc333fe5c3858ebf5352b9d5810324b187d41db599f826005f864c5a'", 'current-main source digest'],
+  ["state: 'disabled_manually'", 'exact authorized disabled state'],
+  ["sourceSha256: '50e5c6f7f01364f2b24c7dc7e3082f60959af9b2f048784c73a697677d179591'", 'current-main source digest'],
   ["headRepository: 'ScaleSmall/SSAI_Production_QA'", 'repository boundary'],
-  ["failedEvents: ['schedule']", 'failed trigger boundary'],
-  ["recoveryEvents: ['workflow_dispatch']", 'recovery trigger boundary'],
-  ["jobNames: ['End-to-end service delivery canary']", 'failed production job boundary'],
-  ["recoveryDisplayTitles: ['Production Service Delivery Canaries']", 'recovery run identity'],
+  ['reason:', 'explicit hold rationale'],
 ];
 const productionQaPolicyBlock = requireRecoveryPolicyBlock(
   releaseHealthVerifier,
   'SSAI_Production_QA:299211649',
   productionQaPolicyFields,
+);
+rejectPattern(
+  productionQaPolicyBlock,
+  /failedEvents|recoveryEvents|jobNames|recoveryDisplayTitles|monitorSelfRecovery/,
+  'authorized disabled workflow hold carrying recovery semantics',
+);
+const forwardFixPolicySection = releaseHealthVerifier.slice(
+  releaseHealthVerifier.indexOf('const forwardFixRecoveryPolicies = new Map(['),
+);
+rejectPattern(
+  forwardFixPolicySection,
+  /SSAI_Production_QA:299211649/,
+  'obsolete Production QA forward-fix recovery policy',
 );
 const rrPolicyFields = [
   ['workflowId: 289080389', 'workflow identity'],
@@ -286,12 +300,12 @@ const rrPolicyFields = [
 requireRecoveryPolicyBlock(releaseHealthVerifier, 'SSAI_RR:289080389', rrPolicyFields);
 assert.throws(
   () => assertRecoveryPolicyFields(
-    productionQaPolicyBlock.replace("recoveryEvents: ['workflow_dispatch']", "recoveryEvents: ['push']"),
+    productionQaPolicyBlock.replace("state: 'disabled_manually'", "state: 'active'"),
     'SSAI_Production_QA:299211649',
     productionQaPolicyFields,
   ),
-  /recovery trigger boundary/,
-  'a mutated recovery event must fail the policy contract',
+  /exact authorized disabled state/,
+  'a mutated disabled hold state must fail the policy contract',
 );
 requireText(releaseHealthVerifier, 'findProvisionalForwardFixWorkflowRecovery(', 'bounded forward-fix workflow self-latch');
 requireText(releaseHealthVerifier, 'findProvisionalForwardFixCheckRecovery(', 'bounded forward-fix check self-latch');
