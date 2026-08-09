@@ -398,6 +398,24 @@ assert.ok(
   'the exact expected repository inventory must be attested before any quota-deferred return',
 );
 requireText(releaseHealthVerifier, 'throw truncationError(', 'fail-closed pagination');
+requireText(releaseHealthVerifier, 'export function releaseHealthPageLimits(mode)', 'mode-bounded release-health pagination policy');
+requireText(releaseHealthVerifier, 'export function releaseHealthCheckPageDisposition(page, batchSize, pageLimit)', 'fail-closed check pagination decision');
+requireText(releaseHealthVerifier, 'export function validateReleaseHealthCheckRunPage(', 'validated check-run pagination response');
+requireText(releaseHealthVerifier, '!Array.isArray(payload.check_runs)', 'malformed check-run page rejection');
+requireText(releaseHealthVerifier, 'checkRun.head_sha !== expectedHeadSha', 'check-run page SHA binding');
+requireText(releaseHealthVerifier, 'duplicate check-run identity', 'cross-page check-run identity uniqueness');
+requireText(releaseHealthVerifier, "type: 'unageable-current-check-run'", 'fail-closed current-check age attestation');
+requireText(releaseHealthVerifier, 'source_run_occurrence_at:', 'source-run occurrence fallback evidence');
+requireText(releaseHealthVerifier, 'source_run_activity_at:', 'source-run recent-activity fallback evidence');
+requireText(releaseHealthVerifier, 'releaseHealthCheckRecentActivityTime(check)', 'source-run activity separated from occurrence ordering');
+requireText(releaseHealthVerifier, 'validateReleaseHealthCheckSourceRun(', 'source-run repository, commit, and identity binding');
+requireText(releaseHealthVerifier, "String(check.app?.slug || '') === 'github-actions'", 'GitHub Actions-only source-run provenance');
+requireText(releaseHealthVerifier, 'sourceRun.repository?.full_name !== expectedRepository', 'source-run repository binding');
+requireText(releaseHealthVerifier, 'check._release_health_current_head === true', 'post-enrichment current-head retention');
+requireText(releaseHealthVerifier, 'checks.push(...batch.map((check) => ({ ...check, _release_health_current_head: false })))', 'unfiltered bounded recent-check enrichment input');
+requireText(releaseHealthVerifier, "return 'check-run:' + checkRunId", 'unageable failure episode identity');
+requireText(releaseHealthVerifier, 'checks: 10', 'continuous 507/508 check-run pagination coverage');
+requireText(releaseHealthVerifier, 'checks: 20', 'incident check-run pagination coverage');
 requireText(releaseHealthVerifier, 'fingerprintReleaseHealthIncident(', 'typed immutable incident fingerprinting');
 requireText(releaseHealthVerifier, 'decodeScheduledIncidentState(', 'cache-key/content integrity validation');
 requireText(releaseHealthVerifier, 'evaluateIncidentNotification(', 'scheduled-only incident notification policy');

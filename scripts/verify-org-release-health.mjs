@@ -96,9 +96,200 @@ const currentRepository = String(process.env.GITHUB_REPOSITORY || '');
 const currentRepoName = currentRepository.startsWith(owner + '/') ? currentRepository.slice(owner.length + 1) : '';
 const currentRunId = numericIdentifier(process.env.GITHUB_RUN_ID);
 const currentRunAttempt = numericIdentifier(process.env.GITHUB_RUN_ATTEMPT);
-const pageLimits = scanMode === 'incident'
-  ? { workflows: 10, runs: 50, commits: 20, pulls: 10, branches: 10, checks: 20, statuses: 20, deployments: 50, repositories: 10 }
-  : { workflows: 10, runs: 10, commits: 5, pulls: 3, branches: 3, checks: 5, statuses: 5, deployments: 10, repositories: 10 };
+export function releaseHealthPageLimits(mode) {
+  if (!['continuous', 'incident'].includes(mode)) {
+    throw new Error('Release-health page-limit mode is invalid.');
+  }
+  return Object.freeze(mode === 'incident'
+    ? { workflows: 10, runs: 50, commits: 20, pulls: 10, branches: 10, checks: 20, statuses: 20, deployments: 50, repositories: 10 }
+    // Long-lived heads can accumulate more than 500 check suites even when
+    // they have only a few logical check streams. Ten pages covers the current
+    // bounded 507/508-run cases while the 600-request budget remains the outer
+    // fail-closed limit for the complete continuous scan.
+    : { workflows: 10, runs: 10, commits: 5, pulls: 3, branches: 3, checks: 10, statuses: 5, deployments: 10, repositories: 10 });
+}
+
+export function releaseHealthCheckPageDisposition(page, batchSize, pageLimit) {
+  if (!Number.isSafeInteger(page) || page < 1
+    || !Number.isSafeInteger(batchSize) || batchSize < 0 || batchSize > 100
+    || !Number.isSafeInteger(pageLimit) || pageLimit < 1 || page > pageLimit) {
+    throw new Error('Release-health check pagination input is invalid.');
+  }
+  if (batchSize < 100) return 'complete';
+  return page === pageLimit ? 'truncated' : 'continue';
+}
+
+export function releaseHealthCheckSourceActivityFallback(checkRun, sourceRun) {
+  if (!checkRun || typeof checkRun !== 'object' || Array.isArray(checkRun)) {
+    throw new Error('Release-health check-run activity input is invalid.');
+  }
+  if (releaseHealthCheckLifecycleActivityTime(checkRun) > 0) return '';
+  return canonicalGitHubTimestamp(sourceRun?.run_started_at)
+    || canonicalGitHubTimestamp(sourceRun?.created_at)
+    || '';
+}
+
+export function releaseHealthCheckSourceRecentActivityFallback(checkRun, sourceRun) {
+  if (!checkRun || typeof checkRun !== 'object' || Array.isArray(checkRun)) {
+    throw new Error('Release-health check-run activity input is invalid.');
+  }
+  const lifecycleActivityTime = releaseHealthCheckLifecycleActivityTime(checkRun);
+  const sourceCandidates = [
+    sourceRun?.updated_at,
+    sourceRun?.completed_at,
+    sourceRun?.run_started_at,
+    sourceRun?.created_at,
+  ]
+    .map((value) => canonicalGitHubTimestamp(value))
+    .filter(Boolean)
+    .map((value) => ({ value, time: Date.parse(value) }))
+    .sort((left, right) => right.time - left.time);
+  const latestSource = sourceCandidates[0];
+  return latestSource && latestSource.time > lifecycleActivityTime ? latestSource.value : '';
+}
+
+export function releaseHealthCheckRecentActivityTime(checkRun) {
+  if (!checkRun || typeof checkRun !== 'object' || Array.isArray(checkRun)) {
+    throw new Error('Release-health check-run recent activity input is invalid.');
+  }
+  const directActivityTime = recordActivityTime(checkRun);
+  const sourceActivityAt = canonicalGitHubTimestamp(checkRun.source_run_activity_at);
+  const sourceActivityTime = sourceActivityAt ? Date.parse(sourceActivityAt) : 0;
+  return Math.max(directActivityTime, sourceActivityTime);
+}
+
+export function validateReleaseHealthCheckSourceRun(checkRun, sourceRun, expectedRepository) {
+  if (!checkRun || typeof checkRun !== 'object' || Array.isArray(checkRun)
+    || typeof expectedRepository !== 'string'
+    || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(expectedRepository)) {
+    throw new Error('Release-health check source-run validation input is invalid.');
+  }
+  if (String(checkRun.app?.slug || '') !== 'github-actions') return null;
+  const expectedRunId = actionsRunId(checkRun.details_url);
+  if (!expectedRunId) return null;
+  if (!sourceRun || typeof sourceRun !== 'object' || Array.isArray(sourceRun)
+    || !Number.isSafeInteger(sourceRun.id) || sourceRun.id !== expectedRunId
+    || sourceRun.head_sha !== checkRun.head_sha
+    || sourceRun.repository?.full_name !== expectedRepository) {
+    throw new Error('GitHub Actions check source run failed repository, commit, or identity binding.');
+  }
+  return sourceRun;
+}
+
+export function releaseHealthActiveCheckDisposition(checkRun, currentTimeMs, stuckThresholdMs) {
+  if (!checkRun || typeof checkRun !== 'object' || Array.isArray(checkRun)
+    || !['queued', 'in_progress', 'waiting', 'requested', 'pending', 'completed'].includes(checkRun.status)
+    || !Number.isFinite(currentTimeMs)
+    || !Number.isFinite(stuckThresholdMs) || stuckThresholdMs < 0) {
+    throw new Error('Release-health active check disposition input is invalid.');
+  }
+  if (checkRun.status === 'completed') return 'completed';
+  const activityTime = recordOccurrenceTime(checkRun);
+  if (activityTime <= 0) return 'unageable';
+  return currentTimeMs - activityTime > stuckThresholdMs ? 'stuck' : 'pending';
+}
+
+export function validateReleaseHealthCheckRunPage(
+  payload,
+  {
+    expectedHeadSha,
+    seenCheckRunIds,
+    priorTotalCount,
+    accumulatedCount,
+    page,
+    pageLimit,
+  },
+) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+    || !Number.isSafeInteger(payload.total_count) || payload.total_count < 0
+    || !Array.isArray(payload.check_runs)) {
+    throw new Error('GitHub check-run page returned an invalid response.');
+  }
+  if (typeof expectedHeadSha !== 'string' || !/^[a-f0-9]{40}$/.test(expectedHeadSha)
+    || !(seenCheckRunIds instanceof Set)
+    || [...seenCheckRunIds].some((id) => !Number.isSafeInteger(id) || id < 1)) {
+    throw new Error('GitHub check-run pagination context is invalid.');
+  }
+  if (priorTotalCount !== null
+    && (!Number.isSafeInteger(priorTotalCount) || priorTotalCount < 0
+      || payload.total_count !== priorTotalCount)) {
+    throw new Error('GitHub check-run total changed during pagination.');
+  }
+  if (!Number.isSafeInteger(accumulatedCount) || accumulatedCount < 0
+    || accumulatedCount + payload.check_runs.length > payload.total_count) {
+    throw new Error('GitHub check-run pagination exceeded its declared total count.');
+  }
+  const pageCheckRunIds = [];
+  const pageCheckRunIdSet = new Set();
+  const allowedStatuses = new Set(['queued', 'in_progress', 'completed', 'waiting', 'requested', 'pending']);
+  const allowedConclusions = new Set([
+    'action_required',
+    'cancelled',
+    'failure',
+    'neutral',
+    'skipped',
+    'stale',
+    'startup_failure',
+    'success',
+    'timed_out',
+  ]);
+  for (const checkRun of payload.check_runs) {
+    const id = checkRun?.id;
+    const name = typeof checkRun?.name === 'string' ? checkRun.name : '';
+    const status = typeof checkRun?.status === 'string' ? checkRun.status : '';
+    const rawConclusion = checkRun?.conclusion;
+    const hasConclusion = Object.prototype.hasOwnProperty.call(checkRun || {}, 'conclusion');
+    const conclusion = typeof rawConclusion === 'string' ? rawConclusion : '';
+    const hasStartedAt = Object.prototype.hasOwnProperty.call(checkRun || {}, 'started_at');
+    const hasCompletedAt = Object.prototype.hasOwnProperty.call(checkRun || {}, 'completed_at');
+    const startedAt = checkRun?.started_at;
+    const completedAt = checkRun?.completed_at;
+    const startedAtIsValid = startedAt === null
+      || (typeof startedAt === 'string' && startedAt.length > 0 && canonicalGitHubTimestamp(startedAt) === startedAt);
+    const completedAtIsValid = completedAt === null
+      || (typeof completedAt === 'string' && completedAt.length > 0 && canonicalGitHubTimestamp(completedAt) === completedAt);
+    const conclusionIsValid = hasConclusion && (status === 'completed'
+      ? typeof rawConclusion === 'string' && allowedConclusions.has(conclusion)
+      : rawConclusion === null);
+    const lifecycleIsValid = hasStartedAt && hasCompletedAt && startedAtIsValid && completedAtIsValid;
+    if (!checkRun || typeof checkRun !== 'object' || Array.isArray(checkRun)
+      || !Number.isSafeInteger(id) || id < 1
+      || checkRun.head_sha !== expectedHeadSha
+      || !name || name !== name.trim() || /[\r\n]/.test(name)
+      || !allowedStatuses.has(status)
+      || !lifecycleIsValid
+      || !Array.isArray(checkRun.pull_requests)
+      || !conclusionIsValid) {
+      throw new Error('GitHub check-run page returned an invalid check-run record.');
+    }
+    if (seenCheckRunIds.has(id) || pageCheckRunIdSet.has(id)) {
+      throw new Error('GitHub check-run pagination returned a duplicate check-run identity.');
+    }
+    pageCheckRunIds.push(id);
+    pageCheckRunIdSet.add(id);
+  }
+  let disposition = releaseHealthCheckPageDisposition(
+    page,
+    payload.check_runs.length,
+    pageLimit,
+  );
+  if (page < pageLimit
+    && accumulatedCount + payload.check_runs.length === payload.total_count) {
+    disposition = 'complete';
+  }
+  if (disposition === 'complete'
+    && accumulatedCount + payload.check_runs.length !== payload.total_count) {
+    throw new Error('GitHub check-run pagination ended before its declared total count.');
+  }
+  return Object.freeze({
+    checkRuns: payload.check_runs,
+    checkRunIds: Object.freeze(pageCheckRunIds),
+    totalCount: payload.total_count,
+    disposition,
+  });
+}
+
+const pageLimits = releaseHealthPageLimits(scanMode);
 
 const noHistoryPolicies = new Map([
   ['SSAI_Analytics_Reporting:Deploy Production Analytics Pages', {
@@ -661,15 +852,18 @@ async function inspectRepository(repo) {
     collectCurrentChecks(repo.name, headSha),
     collectRecentCommitStatuses(repo.name, shaMetadata, headSha),
   ]);
+  const enrichedChecks = await enrichChecks(
+    repo.name,
+    [...recentCheckPayload, ...currentHeadChecks],
+    recentRuns,
+    shaMetadata,
+    defaultBranch,
+    verifiedForwardFixPolicies,
+  );
   const checks = associateChecksWithPulls(
-    await enrichChecks(
-      repo.name,
-      [...recentCheckPayload, ...currentHeadChecks],
-      recentRuns,
-      shaMetadata,
-      defaultBranch,
-      verifiedForwardFixPolicies,
-    ),
+    enrichedChecks.filter((check) => (
+      check._release_health_current_head === true || releaseHealthCheckRecentActivityTime(check) >= cutoffMs
+    )),
     recentPulls,
   );
   const statuses = enrichCommitStatuses(commitStatuses, shaMetadata, defaultBranch);
@@ -689,7 +883,7 @@ async function inspectRepository(repo) {
     (check) => check.stream_identity,
   );
   const currentChecks = latestChecks.map((check) => {
-    const ageMs = nowMs - recordOccurrenceTime(check);
+    const activeDisposition = releaseHealthActiveCheckDisposition(check, nowMs, stuckMs);
     const conclusion = String(check.conclusion || '');
     const policy = verifiedForwardFixPolicies.get(Number(check.workflow_id));
     const trustedMonitorPolicy = isTrustedMonitorRecoveryPolicy(policy) ? policy : null;
@@ -736,7 +930,21 @@ async function inspectRepository(repo) {
           episode_anchor: checkFailureEpisodeAnchor(check, checks),
         },
       ));
-    } else if (check.status !== 'completed' && ageMs > stuckMs) {
+    } else if (activeDisposition === 'unageable') {
+      failures.push(issue(
+        repo.name,
+        check.name,
+        'current commit check has no verifiable CheckRun lifecycle or associated source-run age evidence',
+        check.details_url,
+        { type: 'unageable-current-check-run', check_run_id: Number(check.id), status: String(check.status || '') },
+        {
+          type: 'unageable-current-check-run',
+          stream_sha256: checkNotificationStreamDigest(check),
+          failure_class: 'missing-age-attestation',
+          episode_anchor: 'check-run:' + Number(check.id),
+        },
+      ));
+    } else if (activeDisposition === 'stuck') {
       failures.push(issue(
         repo.name,
         check.name,
@@ -1289,15 +1497,33 @@ async function collectRecentPullCommits(repoName, pull) {
 async function collectRecentChecks(repoName, shaMetadata) {
   const checks = [];
   await mapLimit([...shaMetadata.keys()], 5, async (sha) => {
+    let totalCount = null;
+    let accumulatedCount = 0;
+    const seenCheckRunIds = new Set();
     for (let page = 1; page <= pageLimits.checks; page += 1) {
       const payload = await api('/repos/' + owner + '/' + repoName + '/commits/' + sha + '/check-runs?filter=all&per_page=100&page=' + page);
-      const batch = Array.isArray(payload.check_runs) ? payload.check_runs : [];
-      checks.push(...batch.filter((check) => recordActivityTime(check) >= cutoffMs));
+      const validated = validateReleaseHealthCheckRunPage(
+        payload,
+        {
+          expectedHeadSha: sha,
+          seenCheckRunIds,
+          priorTotalCount: totalCount,
+          accumulatedCount,
+          page,
+          pageLimit: pageLimits.checks,
+        },
+      );
+      totalCount = validated.totalCount;
+      const batch = validated.checkRuns;
+      accumulatedCount += batch.length;
+      for (const id of validated.checkRunIds) seenCheckRunIds.add(id);
+      checks.push(...batch.map((check) => ({ ...check, _release_health_current_head: false })));
       // Check runs are ordered by creation, while an older run may transition or
       // complete inside the lookback. Enumerate the SHA independently instead of
       // assuming activity timestamps are monotonic across pages.
-      if (batch.length < 100) break;
-      if (page === pageLimits.checks) throw truncationError(repoName, 'check runs for ' + sha, pageLimits.checks);
+      const { disposition } = validated;
+      if (disposition === 'complete') break;
+      if (disposition === 'truncated') throw truncationError(repoName, 'check runs for ' + sha, pageLimits.checks);
     }
   });
   return uniqueById(checks);
@@ -1305,12 +1531,30 @@ async function collectRecentChecks(repoName, shaMetadata) {
 
 async function collectCurrentChecks(repoName, headSha) {
   const checks = [];
+  let totalCount = null;
+  let accumulatedCount = 0;
+  const seenCheckRunIds = new Set();
   for (let page = 1; page <= pageLimits.checks; page += 1) {
     const payload = await api('/repos/' + owner + '/' + repoName + '/commits/' + headSha + '/check-runs?filter=latest&per_page=100&page=' + page);
-    const batch = Array.isArray(payload.check_runs) ? payload.check_runs : [];
-    checks.push(...batch);
-    if (batch.length < 100) break;
-    if (page === pageLimits.checks) throw truncationError(repoName, 'current check runs', pageLimits.checks);
+    const validated = validateReleaseHealthCheckRunPage(
+      payload,
+      {
+        expectedHeadSha: headSha,
+        seenCheckRunIds,
+        priorTotalCount: totalCount,
+        accumulatedCount,
+        page,
+        pageLimit: pageLimits.checks,
+      },
+    );
+    totalCount = validated.totalCount;
+    const batch = validated.checkRuns;
+    accumulatedCount += batch.length;
+    for (const id of validated.checkRunIds) seenCheckRunIds.add(id);
+    checks.push(...batch.map((check) => ({ ...check, _release_health_current_head: true })));
+    const { disposition } = validated;
+    if (disposition === 'complete') break;
+    if (disposition === 'truncated') throw truncationError(repoName, 'current check runs', pageLimits.checks);
   }
   return checks;
 }
@@ -1406,8 +1650,18 @@ async function enrichChecks(repoName, rawChecks, runs, shaMetadata, defaultBranc
   });
 
   return uniqueChecks.map((check) => {
-    const sourceRunId = actionsRunId(check.details_url);
-    const sourceRun = sourceRunId ? runById.get(sourceRunId) : null;
+    const sourceRunId = String(check.app?.slug || '') === 'github-actions'
+      ? actionsRunId(check.details_url)
+      : 0;
+    const sourceRun = sourceRunId
+      ? validateReleaseHealthCheckSourceRun(
+        check,
+        runById.get(sourceRunId),
+        owner + '/' + repoName,
+      )
+      : null;
+    const sourceRunOccurrenceFallback = releaseHealthCheckSourceActivityFallback(check, sourceRun);
+    const sourceRunRecentActivityFallback = releaseHealthCheckSourceRecentActivityFallback(check, sourceRun);
     const auditedOrigin = auditedOriginByCheckId.get(Number(check.id));
     const metadata = shaMetadata.get(String(check.head_sha || ''));
     const branch = sourceRun?.head_branch || authoritativeCheckBranch(check, metadata, defaultBranch);
@@ -1416,6 +1670,15 @@ async function enrichChecks(repoName, rawChecks, runs, shaMetadata, defaultBranc
       || '');
     const enriched = {
       ...check,
+      // CheckRun permits null lifecycle timestamps before a check starts. For
+      // GitHub Actions, bind that state to the associated source run so age and
+      // latest-stream ordering remain evidence-based. Ignore non-schema raw
+      // timestamp aliases rather than allowing them to influence disposition.
+      run_started_at: sourceRunOccurrenceFallback || null,
+      created_at: null,
+      updated_at: null,
+      source_run_occurrence_at: sourceRunOccurrenceFallback || null,
+      source_run_activity_at: sourceRunRecentActivityFallback || sourceRunOccurrenceFallback || null,
       source_run_id: sourceRunId || null,
       source_run_attempt: Number(auditedOrigin?.runAttempt || sourceRun?.run_attempt || 1),
       workflow_id: sourceRun?.workflow_id || null,
@@ -1628,7 +1891,7 @@ function reconcileCheckFailures(repoName, checks, deploymentStatuses, pullByNumb
 }) {
   for (const check of checks.filter((candidate) => candidate.status === 'completed'
     && failedConclusions.has(String(candidate.conclusion || ''))
-    && recordActivityTime(candidate) >= cutoffMs)) {
+    && releaseHealthCheckRecentActivityTime(candidate) >= cutoffMs)) {
     const policy = policies.get(Number(check.workflow_id));
     const trustedMonitorPolicy = isTrustedMonitorRecoveryPolicy(policy) ? policy : null;
     const policyBoundRecovery = findPolicyBoundCheckRecovery(
@@ -3088,6 +3351,34 @@ function commitActivityTime(commit) {
   return timestamps.length > 0 ? Math.max(...timestamps) : 0;
 }
 
+function canonicalGitHubTimestamp(value) {
+  if (typeof value !== 'string') return '';
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?Z$/.exec(value);
+  if (!match) return '';
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return '';
+  const date = new Date(parsed);
+  const calendar = [
+    date.getUTCFullYear(),
+    date.getUTCMonth() + 1,
+    date.getUTCDate(),
+    date.getUTCHours(),
+    date.getUTCMinutes(),
+    date.getUTCSeconds(),
+  ];
+  if (calendar.some((part, index) => part !== Number(match[index + 1]))) return '';
+  return value;
+}
+
+function releaseHealthCheckLifecycleActivityTime(checkRun) {
+  if (!checkRun || typeof checkRun !== 'object' || Array.isArray(checkRun)) return 0;
+  const timestamps = [checkRun.started_at, checkRun.completed_at]
+    .map((value) => canonicalGitHubTimestamp(value))
+    .filter(Boolean)
+    .map((value) => Date.parse(value));
+  return timestamps.length > 0 ? Math.max(...timestamps) : 0;
+}
+
 function safeMarkdownUrl(value) {
   const text = String(value || '');
   return /^https:\/\/[A-Za-z0-9.-]+(?::\d+)?(?:[/?#][^\s()]*)?$/.test(text) ? text : '';
@@ -3178,7 +3469,14 @@ function workflowFailureEpisodeAnchor(run, runs) {
   );
 }
 
-function checkFailureEpisodeAnchor(check, checks) {
+export function checkFailureEpisodeAnchor(check, checks) {
+  if (recordOccurrenceTime(check) <= 0) {
+    const checkRunId = check?.id;
+    if (!Number.isSafeInteger(checkRunId) || checkRunId < 1) {
+      throw new Error('Unageable check failure is missing a valid check-run identity.');
+    }
+    return 'check-run:' + checkRunId;
+  }
   return failureEpisodeAnchor(
     checks,
     check,
