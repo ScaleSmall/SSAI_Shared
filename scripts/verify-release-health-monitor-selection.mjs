@@ -42,6 +42,7 @@ import {
   partitionWorkflowHealth,
   parseReleaseHealthDeliveryIdentity,
   recordActivityTime,
+  recordOccurrenceTime,
   rateHeadroomDecision,
   releaseHealthDeliveryIdentity,
   verifyAuthorizedDisabledWorkflowHold,
@@ -52,6 +53,7 @@ import {
   decodeScheduledIncidentState,
   decodeScheduledIncidentStateOrNull,
   createScheduledIncidentStateRecord,
+  checkFailureEpisodeAnchor,
   durableTrustedMonitorRecoveryChecks,
   durableTrustedMonitorRecoveryRuns,
   evaluateIncidentNotification,
@@ -63,11 +65,19 @@ import {
   isExactManualIncidentRecoveryRun,
   isExactSelfMonitorEnvironmentDeployment,
   notificationStateHmac,
+  releaseHealthActiveCheckDisposition,
+  releaseHealthCheckRecentActivityTime,
+  releaseHealthCheckPageDisposition,
+  releaseHealthCheckSourceActivityFallback,
+  releaseHealthCheckSourceRecentActivityFallback,
+  releaseHealthPageLimits,
   releaseHealthLogPayload,
   renderReleaseHealthStepSummary,
   shouldSetDegradedExitCode,
   scheduledIncidentStateEnabled,
   validateInstallationRepositoryPage,
+  validateReleaseHealthCheckRunPage,
+  validateReleaseHealthCheckSourceRun,
   verifyExpectedInventoryAttestation,
   verifyInstallationRepositoryScope,
   auditedPriorMonitorWorkflowSourceSha256,
@@ -1229,6 +1239,451 @@ const statuses = latestByIdentity([
 assert.equal(statuses.length, 1);
 assert.equal(statuses[0].state, 'success', 'latest commit status must replace an older state for the same context');
 assert.throws(() => latestByIdentity([{}], () => ''), /identity must not be empty/);
+const continuousPageLimits = releaseHealthPageLimits('continuous');
+const incidentPageLimits = releaseHealthPageLimits('incident');
+const checkHeadSha = 'a'.repeat(40);
+const checkRunFixture = (id, overrides = {}) => ({
+  id,
+  head_sha: checkHeadSha,
+  name: `check-${id}`,
+  status: 'completed',
+  conclusion: 'success',
+  started_at: '2026-08-09T12:00:00Z',
+  completed_at: '2026-08-09T12:01:00Z',
+  pull_requests: [],
+  ...overrides,
+});
+const checkRunPageContext = ({
+  seenCheckRunIds = new Set(),
+  priorTotalCount = null,
+  accumulatedCount = 0,
+  page = 1,
+  pageLimit = continuousPageLimits.checks,
+} = {}) => ({
+  expectedHeadSha: checkHeadSha,
+  seenCheckRunIds,
+  priorTotalCount,
+  accumulatedCount,
+  page,
+  pageLimit,
+});
+assert.equal(continuousPageLimits.checks, 10, 'continuous scans must cover more than five pages of long-lived-head check runs');
+assert.equal(incidentPageLimits.checks, 20, 'incident scans must preserve their exhaustive check-run page bound');
+for (const { filter, checkRunCount } of [
+  { filter: 'latest', checkRunCount: 507 },
+  { filter: 'all', checkRunCount: 508 },
+]) {
+  const pageCount = Math.ceil(checkRunCount / 100);
+  let totalCount = null;
+  let accumulatedCount = 0;
+  const seenCheckRunIds = new Set();
+  for (let page = 1; page <= pageCount; page += 1) {
+    const remaining = checkRunCount - ((page - 1) * 100);
+    const batchSize = Math.min(100, remaining);
+    const firstId = ((page - 1) * 100) + 1;
+    const expected = page === pageCount ? 'complete' : 'continue';
+    const validated = validateReleaseHealthCheckRunPage(
+      {
+        total_count: checkRunCount,
+        check_runs: Array.from({ length: batchSize }, (_, offset) => checkRunFixture(firstId + offset)),
+      },
+      checkRunPageContext({ seenCheckRunIds, priorTotalCount: totalCount, accumulatedCount, page }),
+    );
+    assert.equal(
+      validated.disposition,
+      expected,
+      `continuous ${filter} check pagination must cover the observed ${checkRunCount}-run long-lived-head case`,
+    );
+    totalCount = validated.totalCount;
+    accumulatedCount += validated.checkRuns.length;
+    for (const id of validated.checkRunIds) seenCheckRunIds.add(id);
+  }
+  assert.equal(accumulatedCount, checkRunCount, `${filter} check pagination must cover every declared check run`);
+  assert.equal(seenCheckRunIds.size, checkRunCount, `${filter} check pagination must cover distinct check-run identities`);
+}
+const fullTenthPageSeenIds = new Set(Array.from({ length: 900 }, (_, offset) => offset + 1));
+const fullFifthPageSeenIds = new Set(Array.from({ length: 400 }, (_, offset) => offset + 1));
+assert.equal(
+  validateReleaseHealthCheckRunPage(
+    {
+      total_count: 500,
+      check_runs: Array.from({ length: 100 }, (_, offset) => checkRunFixture(401 + offset)),
+    },
+    checkRunPageContext({
+      seenCheckRunIds: fullFifthPageSeenIds,
+      priorTotalCount: 500,
+      accumulatedCount: 400,
+      page: 5,
+    }),
+  ).disposition,
+  'complete',
+  'a full page below the cap must complete when stable total_count proves the exact 500-record boundary',
+);
+assert.equal(
+  validateReleaseHealthCheckRunPage(
+    {
+      total_count: 1000,
+      check_runs: Array.from({ length: 100 }, (_, offset) => checkRunFixture(901 + offset)),
+    },
+    checkRunPageContext({
+      seenCheckRunIds: fullTenthPageSeenIds,
+      priorTotalCount: 1000,
+      accumulatedCount: 900,
+      page: 10,
+    }),
+  ).disposition,
+  'truncated',
+  'a full page at the 1000-result endpoint cap must remain fail-closed even when total_count matches',
+);
+assert.equal(
+  validateReleaseHealthCheckRunPage(
+    {
+      total_count: 1001,
+      check_runs: Array.from({ length: 100 }, (_, offset) => checkRunFixture(901 + offset)),
+    },
+    checkRunPageContext({
+      seenCheckRunIds: fullTenthPageSeenIds,
+      priorTotalCount: 1001,
+      accumulatedCount: 900,
+      page: 10,
+    }),
+  ).disposition,
+  'truncated',
+  'a full tenth page must remain fail-closed when stable total_count proves an eleventh-page record exists',
+);
+assert.throws(
+  () => releaseHealthCheckPageDisposition(11, 1, continuousPageLimits.checks),
+  /check pagination input is invalid/,
+);
+for (const malformedCheckPage of [
+  null,
+  [],
+  {},
+  { total_count: 1 },
+  { total_count: 1, check_runs: null },
+  { total_count: 1, check_runs: {} },
+]) {
+  assert.throws(
+    () => validateReleaseHealthCheckRunPage(malformedCheckPage, checkRunPageContext()),
+    /check-run page returned an invalid response/,
+  );
+}
+const validActiveChecks = validateReleaseHealthCheckRunPage(
+  {
+    total_count: 5,
+    check_runs: [
+      checkRunFixture(1, {
+        status: 'queued',
+        conclusion: null,
+        started_at: null,
+        completed_at: null,
+      }),
+      checkRunFixture(2, {
+        status: 'in_progress',
+        conclusion: null,
+        completed_at: null,
+      }),
+      ...['waiting', 'requested', 'pending'].map((status, offset) => checkRunFixture(3 + offset, {
+        status,
+        conclusion: null,
+        started_at: null,
+        completed_at: null,
+      })),
+    ],
+  },
+  checkRunPageContext(),
+);
+assert.equal(validActiveChecks.disposition, 'complete', 'all five active check-run statuses must remain classifiable');
+assert.deepEqual(validActiveChecks.checkRunIds, [1, 2, 3, 4, 5], 'all five active check-run statuses must retain their validated identities');
+const activeCheckNowMs = Date.parse('2026-08-09T12:30:00Z');
+const freshSourceRunActivityAt = releaseHealthCheckSourceActivityFallback(
+  validActiveChecks.checkRuns[0],
+  { run_started_at: '2026-08-09T12:25:00Z', created_at: '2026-08-09T12:20:00Z' },
+);
+assert.equal(freshSourceRunActivityAt, '2026-08-09T12:25:00Z', 'a source-run start must provide the preferred pre-start age fallback');
+assert.equal(
+  releaseHealthActiveCheckDisposition(
+    { ...validActiveChecks.checkRuns[0], run_started_at: freshSourceRunActivityAt },
+    activeCheckNowMs,
+    45 * 60 * 1000,
+  ),
+  'pending',
+  'a fresh pre-start current check must remain pending instead of becoming instant-stuck',
+);
+const oldSourceRunActivityAt = releaseHealthCheckSourceActivityFallback(
+  validActiveChecks.checkRuns[0],
+  { run_started_at: null, created_at: '2026-08-09T10:00:00Z' },
+);
+assert.equal(oldSourceRunActivityAt, '2026-08-09T10:00:00Z', 'source-run creation must backstop a missing source-run start');
+assert.equal(
+  releaseHealthCheckSourceActivityFallback(
+    { ...validActiveChecks.checkRuns[0], created_at: '2030-01-01T00:00:00Z', updated_at: '2030-01-01T00:00:00Z' },
+    { run_started_at: null, created_at: '2026-08-09T10:00:00Z' },
+  ),
+  '2026-08-09T10:00:00Z',
+  'non-schema raw check timestamps must not suppress authoritative source-run age evidence',
+);
+assert.equal(
+  releaseHealthActiveCheckDisposition(
+    { ...validActiveChecks.checkRuns[0], run_started_at: oldSourceRunActivityAt },
+    activeCheckNowMs,
+    45 * 60 * 1000,
+  ),
+  'stuck',
+  'an old pre-start check must become stuck from its associated source-run age evidence',
+);
+assert.equal(
+  releaseHealthActiveCheckDisposition(validActiveChecks.checkRuns[0], activeCheckNowMs, 45 * 60 * 1000),
+  'unageable',
+  'a schema-valid pre-start check without age evidence must fail its age attestation instead of remaining pending forever',
+);
+const oldStartRecentActivityCheck = validActiveChecks.checkRuns[0];
+const oldStartAt = releaseHealthCheckSourceActivityFallback(
+  oldStartRecentActivityCheck,
+  { run_started_at: '2026-08-09T10:00:00Z', created_at: '2026-08-09T09:59:00Z', updated_at: '2026-08-09T12:25:00Z' },
+);
+const recentActivityAt = releaseHealthCheckSourceRecentActivityFallback(
+  oldStartRecentActivityCheck,
+  { run_started_at: '2026-08-09T10:00:00Z', created_at: '2026-08-09T09:59:00Z', updated_at: '2026-08-09T12:25:00Z' },
+);
+const oldStartRecentActivityEnriched = {
+  ...oldStartRecentActivityCheck,
+  run_started_at: oldStartAt,
+  created_at: null,
+  updated_at: null,
+  source_run_activity_at: recentActivityAt,
+};
+assert.equal(oldStartAt, '2026-08-09T10:00:00Z', 'source occurrence must stay bound to the old run start');
+assert.equal(recentActivityAt, '2026-08-09T12:25:00Z', 'source recent activity must use the later run update');
+assert.equal(releaseHealthCheckRecentActivityTime(oldStartRecentActivityEnriched), Date.parse(recentActivityAt), 'recent filtering must retain a check completed or updated inside the lookback');
+assert.equal(recordOccurrenceTime(oldStartRecentActivityEnriched), Date.parse(oldStartAt), 'recent source activity must not move the check occurrence');
+assert.equal(
+  releaseHealthActiveCheckDisposition(oldStartRecentActivityEnriched, activeCheckNowMs, 45 * 60 * 1000),
+  'stuck',
+  'stuck age must remain bound to the old run occurrence rather than its recent update',
+);
+const completedOldStart = checkRunFixture(20, {
+  started_at: '2026-08-09T04:00:00Z',
+  completed_at: null,
+});
+const completedOldStartRecentSourceUpdate = releaseHealthCheckSourceRecentActivityFallback(
+  completedOldStart,
+  { run_started_at: '2026-08-09T04:00:00Z', created_at: '2026-08-09T03:59:00Z', updated_at: '2026-08-09T12:25:00Z' },
+);
+assert.equal(
+  completedOldStartRecentSourceUpdate,
+  '2026-08-09T12:25:00Z',
+  'a completed check with old start and null completion must retain a later trusted source-run update',
+);
+assert.equal(
+  releaseHealthCheckRecentActivityTime({
+    ...completedOldStart,
+    run_started_at: null,
+    created_at: null,
+    updated_at: null,
+    source_run_activity_at: completedOldStartRecentSourceUpdate,
+  }),
+  Date.parse(completedOldStartRecentSourceUpdate),
+  'post-enrichment lookback filtering must use the later source update instead of dropping the check at its old start',
+);
+const completedNullStartOldCompletion = checkRunFixture(21, {
+  started_at: null,
+  completed_at: '2026-08-09T04:00:00Z',
+});
+const completedNullStartRecentSourceUpdate = releaseHealthCheckSourceRecentActivityFallback(
+  completedNullStartOldCompletion,
+  { run_started_at: null, created_at: '2026-08-09T03:59:00Z', updated_at: '2026-08-09T12:25:00Z' },
+);
+const completedNullStartEnriched = {
+  ...completedNullStartOldCompletion,
+  run_started_at: null,
+  created_at: null,
+  updated_at: null,
+  source_run_activity_at: completedNullStartRecentSourceUpdate,
+};
+assert.equal(
+  recordOccurrenceTime(completedNullStartEnriched),
+  Date.parse('2026-08-09T04:00:00Z'),
+  'source recent activity must not move a completed check occurrence beyond its completion evidence',
+);
+assert.equal(
+  releaseHealthCheckRecentActivityTime(completedNullStartEnriched),
+  Date.parse('2026-08-09T12:25:00Z'),
+  'source recent activity must independently retain an old completed check inside the lookback',
+);
+const githubActionsCheck = checkRunFixture(30, {
+  app: { slug: 'github-actions' },
+  details_url: 'https://github.com/ScaleSmall/SSAI_Test/actions/runs/123/job/456',
+});
+const matchingSourceRun = {
+  id: 123,
+  head_sha: checkHeadSha,
+  repository: { full_name: 'ScaleSmall/SSAI_Test' },
+};
+assert.equal(
+  validateReleaseHealthCheckSourceRun(githubActionsCheck, matchingSourceRun, 'ScaleSmall/SSAI_Test'),
+  matchingSourceRun,
+  'GitHub Actions source evidence must bind the exact run, commit, and repository',
+);
+assert.equal(
+  validateReleaseHealthCheckSourceRun(
+    { ...githubActionsCheck, app: { slug: 'external-ci' } },
+    matchingSourceRun,
+    'ScaleSmall/SSAI_Test',
+  ),
+  null,
+  'a third-party check must not inherit GitHub Actions source-run provenance from a lookalike URL',
+);
+for (const mismatchedSourceRun of [
+  { ...matchingSourceRun, id: 124 },
+  { ...matchingSourceRun, id: '123' },
+  { ...matchingSourceRun, head_sha: 'b'.repeat(40) },
+  { ...matchingSourceRun, repository: { full_name: 'ScaleSmall/SSAI_Other' } },
+]) {
+  assert.throws(
+    () => validateReleaseHealthCheckSourceRun(githubActionsCheck, mismatchedSourceRun, 'ScaleSmall/SSAI_Test'),
+    /failed repository, commit, or identity binding/,
+    'mismatched Actions source evidence must fail closed',
+  );
+}
+const completedWithoutLifecycle = validateReleaseHealthCheckRunPage(
+  {
+    total_count: 1,
+    check_runs: [checkRunFixture(10, {
+      conclusion: 'failure',
+      started_at: null,
+      completed_at: null,
+    })],
+  },
+  checkRunPageContext(),
+);
+assert.equal(completedWithoutLifecycle.disposition, 'complete', 'a completed check with schema-valid null lifecycle timestamps must remain classifiable');
+assert.equal(
+  releaseHealthActiveCheckDisposition(completedWithoutLifecycle.checkRuns[0], activeCheckNowMs, 45 * 60 * 1000),
+  'completed',
+  'a completed failure must remain completed even when its CheckRun lifecycle timestamps are null',
+);
+assert.equal(
+  releaseHealthCheckSourceActivityFallback(
+    completedWithoutLifecycle.checkRuns[0],
+    { run_started_at: '2026-08-09T10:00:00Z', created_at: '2026-08-09T09:59:00Z' },
+  ),
+  '2026-08-09T10:00:00Z',
+  'a completed check with null lifecycle timestamps must inherit source-run activity before recent filtering',
+);
+const noAgeFailureOne = completedWithoutLifecycle.checkRuns[0];
+const noAgeFailureTwo = { ...noAgeFailureOne, id: 11 };
+const noAgeAnchorOne = checkFailureEpisodeAnchor(noAgeFailureOne, [noAgeFailureOne]);
+const noAgeAnchorTwo = checkFailureEpisodeAnchor(noAgeFailureTwo, [noAgeFailureTwo]);
+assert.equal(noAgeAnchorOne, 'check-run:10');
+assert.equal(noAgeAnchorTwo, 'check-run:11');
+const noAgeFingerprint = (checkRun, episodeAnchor) => fingerprintReleaseHealthIncident([{
+  incident_key: {
+    repo: 'SSAI_Test',
+    type: 'current-check-run',
+    check_run_id: checkRun.id,
+    conclusion: checkRun.conclusion,
+  },
+  notification_key: {
+    repo: 'SSAI_Test',
+    type: 'current-check-run',
+    stream_sha256: 'f'.repeat(64),
+    failure_class: checkRun.conclusion,
+    episode_anchor: episodeAnchor,
+  },
+}]).incidentFingerprint;
+assert.notEqual(
+  noAgeFingerprint(noAgeFailureOne, noAgeAnchorOne),
+  noAgeFingerprint(noAgeFailureTwo, noAgeAnchorTwo),
+  'distinct completed no-age failures must not collapse into one suppressible incident fingerprint',
+);
+for (const malformedCheckRun of [
+  null,
+  {},
+  checkRunFixture(1, { head_sha: 'b'.repeat(40) }),
+  checkRunFixture(0),
+  checkRunFixture('1'),
+  checkRunFixture(1, { name: '' }),
+  checkRunFixture(1, { name: ' check-1 ' }),
+  checkRunFixture(1, { status: '' }),
+  checkRunFixture(1, { status: 'unknown' }),
+  checkRunFixture(1, { status: ' completed ' }),
+  checkRunFixture(1, { status: 'in_progress', conclusion: 'success', completed_at: null }),
+  checkRunFixture(1, { status: 'in_progress', conclusion: '', completed_at: null }),
+  (() => {
+    const missingConclusion = checkRunFixture(1, { status: 'in_progress', conclusion: null, completed_at: null });
+    delete missingConclusion.conclusion;
+    return missingConclusion;
+  })(),
+  checkRunFixture(1, { conclusion: ' failure ' }),
+  checkRunFixture(1, { head_sha: ` ${checkHeadSha}` }),
+  checkRunFixture(1, { status: 'queued', conclusion: null, started_at: 'not-a-timestamp', completed_at: null }),
+  checkRunFixture(1, { status: 'queued', conclusion: null, started_at: '', completed_at: null }),
+  checkRunFixture(1, { started_at: '2026-08-09T12:00:00Z', completed_at: '' }),
+  checkRunFixture(1, { started_at: '', completed_at: '' }),
+  checkRunFixture(1, { status: 'queued', conclusion: null, started_at: 'August 9, 2026 12:00 UTC', completed_at: null }),
+  checkRunFixture(1, { status: 'queued', conclusion: null, started_at: '2026-02-30T12:00:00Z', completed_at: null }),
+  checkRunFixture(1, { conclusion: null }),
+  checkRunFixture(1, { pull_requests: null }),
+]) {
+  assert.throws(
+    () => validateReleaseHealthCheckRunPage(
+      { total_count: 1, check_runs: [malformedCheckRun] },
+      checkRunPageContext(),
+    ),
+    /invalid check-run record/,
+  );
+}
+assert.throws(
+  () => validateReleaseHealthCheckRunPage(
+    { total_count: 2, check_runs: [checkRunFixture(1), checkRunFixture(1)] },
+    checkRunPageContext(),
+  ),
+  /duplicate check-run identity/,
+);
+assert.throws(
+  () => validateReleaseHealthCheckRunPage(
+    { total_count: 2, check_runs: [checkRunFixture(1)] },
+    checkRunPageContext({
+      seenCheckRunIds: new Set([1]),
+      priorTotalCount: 2,
+      accumulatedCount: 1,
+      page: 2,
+    }),
+  ),
+  /duplicate check-run identity/,
+);
+assert.throws(
+  () => validateReleaseHealthCheckRunPage(
+    {
+      total_count: 509,
+      check_runs: Array.from({ length: 100 }, (_, offset) => checkRunFixture(101 + offset)),
+    },
+    checkRunPageContext({
+      seenCheckRunIds: new Set(Array.from({ length: 100 }, (_, offset) => offset + 1)),
+      priorTotalCount: 508,
+      accumulatedCount: 100,
+      page: 2,
+    }),
+  ),
+  /check-run total changed during pagination/,
+);
+assert.throws(
+  () => validateReleaseHealthCheckRunPage(
+    {
+      total_count: 508,
+      check_runs: Array.from({ length: 7 }, (_, offset) => checkRunFixture(501 + offset)),
+    },
+    checkRunPageContext({
+      seenCheckRunIds: new Set(Array.from({ length: 500 }, (_, offset) => offset + 1)),
+      priorTotalCount: 508,
+      accumulatedCount: 500,
+      page: 6,
+    }),
+  ),
+  /check-run pagination ended before its declared total count/,
+);
+assert.throws(() => releaseHealthPageLimits('unbounded'), /page-limit mode is invalid/);
 assert.equal(rateHeadroomDecision('continuous', 1600, 1000, 600), 'run');
 assert.equal(rateHeadroomDecision('continuous', 1599, 1000, 600), 'defer', 'continuous monitoring must back off without creating a failure storm');
 assert.equal(rateHeadroomDecision('incident', 3749, 250, 3500), 'fail', 'an explicit incident sweep must fail closed when exhaustive coverage is impossible');
