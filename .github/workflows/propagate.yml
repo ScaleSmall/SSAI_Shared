@@ -1,35 +1,16 @@
 name: Propagate to consumer apps
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src/**'
-      - 'package.json'
-      - 'package-lock.json'
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
-  trigger-rebuilds:
+  retired:
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     steps:
-      - name: Trigger SSAI_Connect rebuild
-        env:
-          GH_TOKEN: ${{ secrets.SCALESMALL_PAT }}
+      - name: Legacy propagation is permanently retired
         run: |
-          gh api repos/ScaleSmall/SSAI_Connect/dispatches \
-            --method POST \
-            -f event_type=shared-updated \
-            -F client_payload[ref]='${{ github.sha }}'
-
-      - name: Trigger SSAI_Dashboard rebuild
-        env:
-          GH_TOKEN: ${{ secrets.SCALESMALL_PAT }}
-        run: |
-          gh api repos/ScaleSmall/SSAI_Dashboard/dispatches \
-            --method POST \
-            -f event_type=shared-updated \
-            -F client_payload[ref]='${{ github.sha }}'
+          echo "::error::Legacy shared propagation is permanently retired."
+          exit 1

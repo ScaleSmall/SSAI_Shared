@@ -59,3 +59,7 @@ Do not reuse the superseded 20-repository digest. Keep
 
 The pinned token action revokes its installation token during job cleanup. Never enable
 `skip-token-revoke`.
+
+The permanent legacy Shared propagation hold is separate from bounded production activation.
+Follow [Shared propagation retirement](./SHARED_PROPAGATION_RETIREMENT.md). Workflow `247016064`
+must remain disabled and has no reactivation or recovery path.

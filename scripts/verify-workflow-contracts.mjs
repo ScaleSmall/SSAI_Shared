@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import path from 'node:path';
@@ -6,9 +6,10 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
+const workflowDirectory = path.join(repoRoot, '.github', 'workflows');
 
 const readWorkflow = async (name) =>
-  (await readFile(path.join(repoRoot, '.github', 'workflows', name), 'utf8')).replace(/\r\n?|\n/g, '\n');
+  (await readFile(path.join(workflowDirectory, name), 'utf8')).replace(/\r\n?|\n/g, '\n');
 
 const readSource = async (...segments) =>
   (await readFile(path.join(repoRoot, ...segments), 'utf8')).replace(/\r\n?|\n/g, '\n');
@@ -39,6 +40,47 @@ const requireRecoveryPolicyBlock = (source, key, expectedFields) => {
 const rejectPattern = (source, pattern, description) => {
   if (pattern.test(source)) {
     throw new Error(`Workflow contract violation: ${description}`);
+  }
+};
+
+const collectWorkflowSources = async () => {
+  const entries = await readdir(workflowDirectory, { withFileTypes: true });
+  const workflowEntries = entries
+    .filter((entry) => /\.ya?ml$/i.test(entry.name))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  if (workflowEntries.length === 0) throw new Error('No GitHub workflow sources were found.');
+
+  const sources = new Map();
+  for (const entry of workflowEntries) {
+    if (!entry.isFile()) {
+      throw new Error(`GitHub workflow source is not a regular file: ${entry.name}`);
+    }
+    const canonicalName = entry.name.toLowerCase();
+    if ([...sources.keys()].some((name) => name.toLowerCase() === canonicalName)) {
+      throw new Error(`Duplicate case-insensitive GitHub workflow source: ${entry.name}`);
+    }
+    sources.set(entry.name, await readWorkflow(entry.name));
+  }
+  return sources;
+};
+
+const requireWorkflowSource = (sources, name) => {
+  const source = sources.get(name);
+  if (typeof source !== 'string') throw new Error(`Missing required GitHub workflow source: ${name}`);
+  return source;
+};
+
+const assertNoLegacyCrossRepositoryPat = (sources) => {
+  if (!(sources instanceof Map) || sources.size === 0) {
+    throw new TypeError('workflow sources must be a non-empty Map');
+  }
+  for (const [name, source] of sources) {
+    if (typeof name !== 'string' || !/^[A-Za-z0-9._-]+\.ya?ml$/i.test(name) || typeof source !== 'string') {
+      throw new TypeError('workflow source inventory contains an invalid entry');
+    }
+    if (/\bSCALESMALL_PAT\b/.test(source)) {
+      throw new Error(`Workflow contract violation: ${name} references the retired SCALESMALL_PAT identifier`);
+    }
   }
 };
 
@@ -81,12 +123,26 @@ const expandCronMinuteField = (field, description) => {
   return minutes;
 };
 
-const validate = await readWorkflow('validate.yml');
-const propagate = await readWorkflow('propagate.yml');
-const releaseHealth = await readWorkflow('release-health-monitor.yml');
+const workflowSources = await collectWorkflowSources();
+const validate = requireWorkflowSource(workflowSources, 'validate.yml');
+const propagate = requireWorkflowSource(workflowSources, 'propagate.yml');
+const releaseHealth = requireWorkflowSource(workflowSources, 'release-health-monitor.yml');
 const releaseHealthVerifier = await readSource('scripts', 'verify-org-release-health.mjs');
 const releaseHealthRunbook = await readSource('docs', 'RELEASE_HEALTH_GITHUB_APP_RUNBOOK.md');
-const combined = `${validate}\n${propagate}\n${releaseHealth}`;
+const propagationRetirementRunbook = await readSource('docs', 'SHARED_PROPAGATION_RETIREMENT.md');
+const combined = [...workflowSources.values()].join('\n');
+
+for (const [name, source] of [
+  ['renamed-cross-repository-delivery.yaml', 'env:\n  GH_TOKEN: ${{ secrets.SCALESMALL_PAT }}\n'],
+  ['future-shared-sync.yml', "env:\n  GH_TOKEN: ${{ secrets['SCALESMALL_PAT'] }}\n"],
+]) {
+  assert.throws(
+    () => assertNoLegacyCrossRepositoryPat(new Map([[name, source]])),
+    new RegExp(`${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} references the retired SCALESMALL_PAT identifier`),
+    `${name} must not bypass the fleet-wide retired credential guard`,
+  );
+}
+assertNoLegacyCrossRepositoryPat(workflowSources);
 
 requireText(validate, 'permissions:\n  contents: read', 'read-only workflow permissions');
 requireText(validate, 'runs-on: ubuntu-24.04', 'pinned validation runner');
@@ -94,32 +150,54 @@ requireText(validate, 'persist-credentials: false', 'checkout credential isolati
 requireText(validate, "node-version: '24'", 'current Node runtime');
 requireText(validate, 'run: npm run check', 'full shared package check');
 
-requireText(propagate, 'workflow_dispatch:', 'manual propagation control');
-requireText(
+const expectedRetiredPropagationSource = [
+  'name: Propagate to consumer apps',
+  '',
+  'on:',
+  '  workflow_dispatch:',
+  '',
+  'permissions: {}',
+  '',
+  'jobs:',
+  '  retired:',
+  '    if: ${{ false }}',
+  '    runs-on: ubuntu-24.04',
+  '    steps:',
+  '      - name: Legacy propagation is permanently retired',
+  '        run: |',
+  '          echo "::error::Legacy shared propagation is permanently retired."',
+  '          exit 1',
+  '',
+].join('\n');
+assert.equal(
   propagate,
-  "    paths:\n      - 'src/**'\n      - 'package.json'\n      - 'package-lock.json'",
-  'package-only automatic propagation scope',
+  expectedRetiredPropagationSource,
+  'the legacy propagation workflow must remain the exact inert identity-preserving tombstone',
 );
-const propagationPathBlocks = [...propagate.matchAll(/^    paths:\n((?:      - [^\n]+\n)+)/gm)];
-if (propagationPathBlocks.length !== 1) {
-  throw new Error(`Expected exactly one automatic propagation path block; found ${propagationPathBlocks.length}`);
-}
-const automaticPropagationPaths = propagationPathBlocks[0][1]
-  .trim()
-  .split('\n')
-  .map((line) => line.replace(/^\s*-\s*/, '').replace(/^['\"]|['\"]$/g, ''));
-const expectedPropagationPaths = ['src/**', 'package.json', 'package-lock.json'];
-if (JSON.stringify(automaticPropagationPaths) !== JSON.stringify(expectedPropagationPaths)) {
-  throw new Error(
-    `Automatic propagation paths must be exactly package-bearing files: ${automaticPropagationPaths.join(', ')}`,
-  );
-}
-requireText(propagate, 'permissions:\n  contents: read', 'read-only propagation permissions');
-requireText(propagate, 'runs-on: ubuntu-24.04', 'pinned propagation runner');
-requireText(propagate, "repos/ScaleSmall/SSAI_Connect/dispatches", 'Connect dispatch target');
-requireText(propagate, "repos/ScaleSmall/SSAI_Dashboard/dispatches", 'Dashboard dispatch target');
-requireText(propagate, 'GH_TOKEN: ${{ secrets.SCALESMALL_PAT }}', 'repository dispatch token source');
-rejectPattern(propagate, /dispatch_connect|TikTok OAuth review|Skip protected Connect propagation/, 'retired TikTok-review propagation gate must stay removed');
+const retiredPropagationSourceSha256 = createHash('sha256').update(propagate).digest('hex');
+assert.equal(
+  retiredPropagationSourceSha256,
+  '28650c6de12cfc94c165b2cb9c3dab1cb6bf1caf8de3815d67cf8bbe6c6b9ba2',
+  'the retired propagation tombstone source digest must remain exact',
+);
+requireText(propagate, 'workflow_dispatch:', 'identity-preserving manual trigger tombstone');
+requireText(propagate, 'permissions: {}', 'empty retired workflow permissions');
+requireText(propagate, 'if: ${{ false }}', 'unconditionally false retired job gate');
+requireText(propagate, 'runs-on: ubuntu-24.04', 'pinned retired workflow runner declaration');
+rejectPattern(propagate, /^  (?:push|pull_request|schedule|repository_dispatch):/m, 'retired propagation event trigger');
+rejectPattern(propagate, /(?:SCALESMALL_PAT|GH_TOKEN|repos\/ScaleSmall\/(?:SSAI_Connect|SSAI_Dashboard)|\/dispatches\b|gh\s+api\b)/, 'retired propagation credential, consumer, or dispatch path');
+requireText(propagationRetirementRunbook, 'workflow identity\n`247016064`', 'retired propagation workflow identity runbook');
+requireText(propagationRetirementRunbook, '`disabled_manually` state', 'permanent disabled-state runbook');
+requireText(propagationRetirementRunbook, retiredPropagationSourceSha256, 'exact retired tombstone digest runbook');
+requireText(propagationRetirementRunbook, 'There is no rollback procedure', 'no-reactivation retirement control');
+requireText(propagationRetirementRunbook, 'Delete the `SCALESMALL_PAT` Actions secret', 'repository credential removal gate');
+requireText(propagationRetirementRunbook, 'Do not create a replacement cross-repository PAT', 'replacement credential prohibition');
+requireText(
+  releaseHealthRunbook,
+  '[Shared propagation retirement](./SHARED_PROPAGATION_RETIREMENT.md)',
+  'release-health runbook pointer to the permanent retired hold',
+);
+rejectPattern(propagationRetirementRunbook, /gh\s+workflow\s+(?:enable|run)|\/actions\/workflows\/247016064\/(?:enable|dispatches)/i, 'retired propagation reactivation command');
 
 requireText(releaseHealth, 'workflow_dispatch:', 'manual release-health control');
 const releaseHealthCron = '3,18,33,48 * * * *';
@@ -257,6 +335,8 @@ requireText(releaseHealthVerifier, 'unresolved_no_history_workflows', 'explicit 
 requireText(releaseHealthVerifier, 'allowed_no_history_evidence', 'auditable no-history evidence summary');
 requireText(releaseHealthVerifier, 'verifyAuthorizedDisabledWorkflowHold(', 'source-hashed authorized disabled workflow hold');
 requireText(releaseHealthVerifier, 'authorized_disabled_workflow_hold_evidence', 'auditable disabled workflow hold summary');
+requireText(releaseHealthVerifier, "if (!isUtf8(source)) throw new Error(repoName + ' workflow source for ' + path + ' is not valid UTF-8.');", 'fail-closed workflow source encoding gate');
+requireText(releaseHealthVerifier, "return Buffer.from(source.toString('utf8').replace(/\\r\\n?/g, '\\n'), 'utf8');", 'runtime LF-normalized workflow source digest');
 requireText(releaseHealthVerifier, 'verifyForwardFixRecoveryPolicy(', 'source-hashed current-main forward-fix policy');
 requireText(releaseHealthVerifier, 'findForwardFixWorkflowRun(', 'bounded cross-trigger workflow forward-fix recovery');
 requireText(releaseHealthVerifier, 'findForwardFixCheck(', 'bounded cross-trigger check forward-fix recovery');
@@ -279,6 +359,30 @@ rejectPattern(
   /failedEvents|recoveryEvents|jobNames|recoveryDisplayTitles|monitorSelfRecovery/,
   'authorized disabled workflow hold carrying recovery semantics',
 );
+const retiredPropagationPolicyFields = [
+  ['workflowId: 247016064', 'workflow identity'],
+  ["name: 'Propagate to consumer apps'", 'workflow name'],
+  ["path: '.github/workflows/propagate.yml'", 'workflow path'],
+  ["state: 'disabled_manually'", 'exact authorized disabled state'],
+  ["sourceSha256: '28650c6de12cfc94c165b2cb9c3dab1cb6bf1caf8de3815d67cf8bbe6c6b9ba2'", 'exact retired tombstone source digest'],
+  ["headRepository: 'ScaleSmall/SSAI_Shared'", 'repository boundary'],
+  ['reason:', 'explicit permanent-retirement rationale'],
+];
+const retiredPropagationPolicyBlock = requireRecoveryPolicyBlock(
+  releaseHealthVerifier,
+  'SSAI_Shared:247016064',
+  retiredPropagationPolicyFields,
+);
+rejectPattern(
+  retiredPropagationPolicyBlock,
+  /failedEvents|recoveryEvents|jobNames|recoveryDisplayTitles|monitorSelfRecovery/,
+  'retired propagation hold carrying recovery semantics',
+);
+assert.equal(
+  (releaseHealthVerifier.match(/SSAI_Shared:247016064/g) || []).length,
+  1,
+  'the retired propagation hold must have exactly one policy definition',
+);
 const forwardFixPolicySection = releaseHealthVerifier.slice(
   releaseHealthVerifier.indexOf('const forwardFixRecoveryPolicies = new Map(['),
 );
@@ -286,6 +390,11 @@ rejectPattern(
   forwardFixPolicySection,
   /SSAI_Production_QA:299211649/,
   'obsolete Production QA forward-fix recovery policy',
+);
+rejectPattern(
+  forwardFixPolicySection,
+  /SSAI_Shared:247016064/,
+  'retired propagation forward-fix recovery policy',
 );
 const rrPolicyFields = [
   ['workflowId: 289080389', 'workflow identity'],
