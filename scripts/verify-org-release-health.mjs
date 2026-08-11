@@ -1,4 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { isUtf8 } from 'node:buffer';
 import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -314,6 +315,15 @@ const authorizedDisabledWorkflowHolds = new Map([
     sourceSha256: '50e5c6f7f01364f2b24c7dc7e3082f60959af9b2f048784c73a697677d179591',
     headRepository: 'ScaleSmall/SSAI_Production_QA',
     reason: 'This bounded production canary remains intentionally disabled until the protected production-readiness activation sequence explicitly enables it. The hold is inventory evidence only and cannot recover or suppress a failed run or check.',
+  }],
+  ['SSAI_Shared:247016064', {
+    workflowId: 247016064,
+    name: 'Propagate to consumer apps',
+    path: '.github/workflows/propagate.yml',
+    state: 'disabled_manually',
+    sourceSha256: '28650c6de12cfc94c165b2cb9c3dab1cb6bf1caf8de3815d67cf8bbe6c6b9ba2',
+    headRepository: 'ScaleSmall/SSAI_Shared',
+    reason: 'The legacy cross-repository propagation workflow is permanently retired as an inert identity-preserving tombstone. The hold is inventory evidence only and cannot recover or suppress a failed run or check.',
   }],
 ]);
 const legacyMonitorTitle = 'Scale Small AI Release Health Monitor';
@@ -1092,7 +1102,10 @@ async function collectWorkflowSource(repoName, workflowPath, ref, allowMissing =
   if (!/^\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml$/.test(path)) {
     throw new Error(repoName + ' no-history policy references an unsafe workflow path.');
   }
-  return collectRepositorySource(repoName, path, ref, allowMissing);
+  const source = await collectRepositorySource(repoName, path, ref, allowMissing);
+  if (source === null) return null;
+  if (!isUtf8(source)) throw new Error(repoName + ' workflow source for ' + path + ' is not valid UTF-8.');
+  return Buffer.from(source.toString('utf8').replace(/\r\n?/g, '\n'), 'utf8');
 }
 
 async function collectMonitorImplementationSource(repoName, sourcePath, ref, allowMissing = false) {
