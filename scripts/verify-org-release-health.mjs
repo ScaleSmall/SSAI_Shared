@@ -102,12 +102,12 @@ export function releaseHealthPageLimits(mode) {
     throw new Error('Release-health page-limit mode is invalid.');
   }
   return Object.freeze(mode === 'incident'
-    ? { workflows: 10, runs: 50, commits: 20, pulls: 10, branches: 10, checks: 20, statuses: 20, deployments: 50, repositories: 10 }
-    // Long-lived heads can accumulate more than 500 check suites even when
-    // they have only a few logical check streams. Ten pages covers the current
-    // bounded 507/508-run cases while the 600-request budget remains the outer
-    // fail-closed limit for the complete continuous scan.
-    : { workflows: 10, runs: 10, commits: 5, pulls: 3, branches: 3, checks: 10, statuses: 5, deployments: 10, repositories: 10 });
+    ? { workflows: 10, runs: 50, commits: 20, pulls: 10, branches: 10, checks: 50, statuses: 20, deployments: 50, repositories: 10 }
+    // Long-lived heads can accumulate thousands of check suites even when
+    // they have only a few logical streams. Fifty pages preserves a bounded
+    // 5,000-record per-SHA safety cap while the existing per-run request budget
+    // and provider-rate reserve remain the outer fail-closed limits.
+    : { workflows: 10, runs: 10, commits: 5, pulls: 3, branches: 3, checks: 50, statuses: 5, deployments: 10, repositories: 10 });
 }
 
 export function releaseHealthCheckPageDisposition(page, batchSize, pageLimit) {
@@ -857,14 +857,13 @@ async function inspectRepository(repo) {
   for (const deployment of deploymentCollection.deployments) addShaMetadata(shaMetadata, deployment.sha, branchLikeRef(deployment.ref), 'deployment', 'deployment', false, baseRepository);
   addShaMetadata(shaMetadata, headSha, defaultBranch, 'push', 'default-branch-head', true, baseRepository);
 
-  const [recentCheckPayload, currentHeadChecks, commitStatuses] = await Promise.all([
-    collectRecentChecks(repo.name, shaMetadata),
-    collectCurrentChecks(repo.name, headSha),
+  const [recentCheckPayload, commitStatuses] = await Promise.all([
+    collectRecentChecks(repo.name, shaMetadata, headSha),
     collectRecentCommitStatuses(repo.name, shaMetadata, headSha),
   ]);
   const enrichedChecks = await enrichChecks(
     repo.name,
-    [...recentCheckPayload, ...currentHeadChecks],
+    recentCheckPayload,
     recentRuns,
     shaMetadata,
     defaultBranch,
@@ -1507,9 +1506,13 @@ async function collectRecentPullCommits(repoName, pull) {
   return commits;
 }
 
-async function collectRecentChecks(repoName, shaMetadata) {
+async function collectRecentChecks(repoName, shaMetadata, currentHeadSha) {
+  if (!/^[a-f0-9]{40}$/.test(String(currentHeadSha || ''))) {
+    throw new Error(repoName + ' current head SHA is invalid for check collection.');
+  }
   const checks = [];
   await mapLimit([...shaMetadata.keys()], 5, async (sha) => {
+    const currentHead = sha === currentHeadSha;
     let totalCount = null;
     let accumulatedCount = 0;
     const seenCheckRunIds = new Set();
@@ -1530,7 +1533,7 @@ async function collectRecentChecks(repoName, shaMetadata) {
       const batch = validated.checkRuns;
       accumulatedCount += batch.length;
       for (const id of validated.checkRunIds) seenCheckRunIds.add(id);
-      checks.push(...batch.map((check) => ({ ...check, _release_health_current_head: false })));
+      checks.push(...batch.map((check) => ({ ...check, _release_health_current_head: currentHead })));
       // Check runs are ordered by creation, while an older run may transition or
       // complete inside the lookback. Enumerate the SHA independently instead of
       // assuming activity timestamps are monotonic across pages.
@@ -1540,36 +1543,6 @@ async function collectRecentChecks(repoName, shaMetadata) {
     }
   });
   return uniqueById(checks);
-}
-
-async function collectCurrentChecks(repoName, headSha) {
-  const checks = [];
-  let totalCount = null;
-  let accumulatedCount = 0;
-  const seenCheckRunIds = new Set();
-  for (let page = 1; page <= pageLimits.checks; page += 1) {
-    const payload = await api('/repos/' + owner + '/' + repoName + '/commits/' + headSha + '/check-runs?filter=latest&per_page=100&page=' + page);
-    const validated = validateReleaseHealthCheckRunPage(
-      payload,
-      {
-        expectedHeadSha: headSha,
-        seenCheckRunIds,
-        priorTotalCount: totalCount,
-        accumulatedCount,
-        page,
-        pageLimit: pageLimits.checks,
-      },
-    );
-    totalCount = validated.totalCount;
-    const batch = validated.checkRuns;
-    accumulatedCount += batch.length;
-    for (const id of validated.checkRunIds) seenCheckRunIds.add(id);
-    checks.push(...batch.map((check) => ({ ...check, _release_health_current_head: true })));
-    const { disposition } = validated;
-    if (disposition === 'complete') break;
-    if (disposition === 'truncated') throw truncationError(repoName, 'current check runs', pageLimits.checks);
-  }
-  return checks;
 }
 
 async function collectRecentCommitStatuses(repoName, shaMetadata, headSha) {
@@ -2357,16 +2330,27 @@ function createConcurrencyGate(limit) {
   });
 }
 
-async function mapLimit(items, limit, worker) {
+export async function mapLimit(items, limit, worker) {
+  if (!Array.isArray(items)
+    || !Number.isSafeInteger(limit) || limit < 1
+    || typeof worker !== 'function') {
+    throw new TypeError('mapLimit inputs are invalid.');
+  }
   const results = new Array(items.length);
   let cursor = 0;
+  let failure = null;
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (cursor < items.length) {
+    while (failure === null && cursor < items.length) {
       const index = cursor;
       cursor += 1;
-      results[index] = await worker(items[index], index);
+      try {
+        results[index] = await worker(items[index], index);
+      } catch (error) {
+        if (failure === null) failure = { error };
+      }
     }
   }));
+  if (failure !== null) throw failure.error;
   return results;
 }
 
