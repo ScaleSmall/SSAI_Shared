@@ -72,6 +72,7 @@ import {
   releaseHealthCheckSourceRecentActivityFallback,
   releaseHealthPageLimits,
   releaseHealthLogPayload,
+  mapLimit,
   renderReleaseHealthStepSummary,
   shouldSetDegradedExitCode,
   scheduledIncidentStateEnabled,
@@ -1267,11 +1268,11 @@ const checkRunPageContext = ({
   page,
   pageLimit,
 });
-assert.equal(continuousPageLimits.checks, 10, 'continuous scans must cover more than five pages of long-lived-head check runs');
-assert.equal(incidentPageLimits.checks, 20, 'incident scans must preserve their exhaustive check-run page bound');
+assert.equal(continuousPageLimits.checks, 50, 'continuous scans must retain a bounded multi-week long-lived-head check-run window');
+assert.equal(incidentPageLimits.checks, 50, 'incident scans must preserve at least the continuous check-run page bound');
 for (const { filter, checkRunCount } of [
-  { filter: 'latest', checkRunCount: 507 },
-  { filter: 'all', checkRunCount: 508 },
+  { filter: 'latest', checkRunCount: 1012 },
+  { filter: 'all', checkRunCount: 1013 },
 ]) {
   const pageCount = Math.ceil(checkRunCount / 100);
   let totalCount = null;
@@ -1292,7 +1293,7 @@ for (const { filter, checkRunCount } of [
     assert.equal(
       validated.disposition,
       expected,
-      `continuous ${filter} check pagination must cover the observed ${checkRunCount}-run long-lived-head case`,
+      `continuous ${filter} check pagination must cover the observed post-rollout ${checkRunCount}-run long-lived-head case`,
     );
     totalCount = validated.totalCount;
     accumulatedCount += validated.checkRuns.length;
@@ -1301,7 +1302,7 @@ for (const { filter, checkRunCount } of [
   assert.equal(accumulatedCount, checkRunCount, `${filter} check pagination must cover every declared check run`);
   assert.equal(seenCheckRunIds.size, checkRunCount, `${filter} check pagination must cover distinct check-run identities`);
 }
-const fullTenthPageSeenIds = new Set(Array.from({ length: 900 }, (_, offset) => offset + 1));
+const fullFiftiethPageSeenIds = new Set(Array.from({ length: 4900 }, (_, offset) => offset + 1));
 const fullFifthPageSeenIds = new Set(Array.from({ length: 400 }, (_, offset) => offset + 1));
 assert.equal(
   validateReleaseHealthCheckRunPage(
@@ -1322,39 +1323,57 @@ assert.equal(
 assert.equal(
   validateReleaseHealthCheckRunPage(
     {
-      total_count: 1000,
-      check_runs: Array.from({ length: 100 }, (_, offset) => checkRunFixture(901 + offset)),
+      total_count: 5000,
+      check_runs: Array.from({ length: 100 }, (_, offset) => checkRunFixture(4901 + offset)),
     },
     checkRunPageContext({
-      seenCheckRunIds: fullTenthPageSeenIds,
-      priorTotalCount: 1000,
-      accumulatedCount: 900,
-      page: 10,
+      seenCheckRunIds: fullFiftiethPageSeenIds,
+      priorTotalCount: 5000,
+      accumulatedCount: 4900,
+      page: 50,
     }),
   ).disposition,
   'truncated',
-  'a full page at the 1000-result endpoint cap must remain fail-closed even when total_count matches',
+  'a full page at the configured 5000-record safety cap must remain fail-closed even when total_count matches',
 );
 assert.equal(
   validateReleaseHealthCheckRunPage(
     {
-      total_count: 1001,
-      check_runs: Array.from({ length: 100 }, (_, offset) => checkRunFixture(901 + offset)),
+      total_count: 5001,
+      check_runs: Array.from({ length: 100 }, (_, offset) => checkRunFixture(4901 + offset)),
     },
     checkRunPageContext({
-      seenCheckRunIds: fullTenthPageSeenIds,
-      priorTotalCount: 1001,
-      accumulatedCount: 900,
-      page: 10,
+      seenCheckRunIds: fullFiftiethPageSeenIds,
+      priorTotalCount: 5001,
+      accumulatedCount: 4900,
+      page: 50,
     }),
   ).disposition,
   'truncated',
-  'a full tenth page must remain fail-closed when stable total_count proves an eleventh-page record exists',
+  'a full fiftieth page must remain fail-closed when stable total_count proves another record exists',
 );
 assert.throws(
-  () => releaseHealthCheckPageDisposition(11, 1, continuousPageLimits.checks),
+  () => releaseHealthCheckPageDisposition(51, 1, continuousPageLimits.checks),
   /check pagination input is invalid/,
 );
+
+{
+  const started = [];
+  await assert.rejects(
+    mapLimit([0, 1, 2, 3, 4, 5], 2, async (value) => {
+      started.push(value);
+      if (value === 0) throw new Error('first worker failed');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return value;
+    }),
+    /first worker failed/,
+  );
+  assert.deepEqual(
+    started,
+    [0, 1],
+    'a fatal worker error must stop mapLimit from dequeuing more API-producing work',
+  );
+}
 for (const malformedCheckPage of [
   null,
   [],

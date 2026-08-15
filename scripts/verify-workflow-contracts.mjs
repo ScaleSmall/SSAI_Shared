@@ -521,10 +521,14 @@ requireText(releaseHealthVerifier, 'validateReleaseHealthCheckSourceRun(', 'sour
 requireText(releaseHealthVerifier, "String(check.app?.slug || '') === 'github-actions'", 'GitHub Actions-only source-run provenance');
 requireText(releaseHealthVerifier, 'sourceRun.repository?.full_name !== expectedRepository', 'source-run repository binding');
 requireText(releaseHealthVerifier, 'check._release_health_current_head === true', 'post-enrichment current-head retention');
-requireText(releaseHealthVerifier, 'checks.push(...batch.map((check) => ({ ...check, _release_health_current_head: false })))', 'unfiltered bounded recent-check enrichment input');
+requireText(releaseHealthVerifier, 'const currentHead = sha === currentHeadSha;', 'single-pass current-head check classification');
+requireText(releaseHealthVerifier, '_release_health_current_head: currentHead', 'unfiltered bounded current-head retention evidence');
+assert.ok(
+  !releaseHealthVerifier.includes('async function collectCurrentChecks('),
+  'current-head checks must not be fetched a second time after the complete all-check pass',
+);
 requireText(releaseHealthVerifier, "return 'check-run:' + checkRunId", 'unageable failure episode identity');
-requireText(releaseHealthVerifier, 'checks: 10', 'continuous 507/508 check-run pagination coverage');
-requireText(releaseHealthVerifier, 'checks: 20', 'incident check-run pagination coverage');
+requireText(releaseHealthVerifier, 'checks: 50', 'bounded 1012+ check-run pagination coverage');
 requireText(releaseHealthVerifier, 'fingerprintReleaseHealthIncident(', 'typed immutable incident fingerprinting');
 requireText(releaseHealthVerifier, 'decodeScheduledIncidentState(', 'cache-key/content integrity validation');
 requireText(releaseHealthVerifier, 'evaluateIncidentNotification(', 'scheduled-only incident notification policy');
