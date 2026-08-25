@@ -290,6 +290,109 @@ export function validateReleaseHealthCheckRunPage(
   });
 }
 
+export function releaseHealthActionsRunHydrationMode(missingRunCount, remainingPageCount = null) {
+  if (!Number.isSafeInteger(missingRunCount) || missingRunCount < 0
+    || (remainingPageCount !== null
+      && (!Number.isSafeInteger(remainingPageCount) || remainingPageCount < 0))) {
+    throw new Error('GitHub Actions source-run hydration input is invalid.');
+  }
+  if (missingRunCount === 0) return 'complete';
+  if (remainingPageCount === null) return missingRunCount === 1 ? 'direct' : 'paginate';
+  return missingRunCount < remainingPageCount ? 'direct' : 'paginate';
+}
+
+export function releaseHealthActionsRunHydrationGroups(checks, knownRunIds = new Set()) {
+  if (!Array.isArray(checks) || !(knownRunIds instanceof Set)
+    || [...knownRunIds].some((id) => !Number.isSafeInteger(id) || id < 1)) {
+    throw new Error('GitHub Actions source-run hydration grouping input is invalid.');
+  }
+  const headShaByRunId = new Map();
+  const missingByHeadSha = new Map();
+  for (const check of checks) {
+    if (String(check?.app?.slug || '') !== 'github-actions') continue;
+    const runId = actionsRunId(check?.details_url);
+    if (!runId || knownRunIds.has(runId)) continue;
+    const headSha = String(check?.head_sha || '');
+    if (!/^[a-f0-9]{40}$/.test(headSha)) {
+      throw new Error('Check source SHA is invalid for Actions-run hydration.');
+    }
+    const priorHeadSha = headShaByRunId.get(runId);
+    if (priorHeadSha && priorHeadSha !== headSha) {
+      throw new Error('GitHub Actions source-run identity was associated with multiple commits.');
+    }
+    headShaByRunId.set(runId, headSha);
+    if (!missingByHeadSha.has(headSha)) missingByHeadSha.set(headSha, new Set());
+    missingByHeadSha.get(headSha).add(runId);
+  }
+  return Object.freeze([...missingByHeadSha.entries()].map(([headSha, runIds]) => Object.freeze({
+    headSha,
+    runIds: Object.freeze([...runIds]),
+  })));
+}
+
+export function validateReleaseHealthActionsRunPage(
+  payload,
+  {
+    expectedHeadSha,
+    expectedRepository,
+    seenRunIds,
+    priorTotalCount,
+    accumulatedCount,
+    page,
+    pageLimit,
+  },
+) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+    || !Number.isSafeInteger(payload.total_count) || payload.total_count < 0
+    || !Array.isArray(payload.workflow_runs) || payload.workflow_runs.length > 100) {
+    throw new Error('GitHub Actions source-run page returned an invalid response.');
+  }
+  if (!/^[a-f0-9]{40}$/.test(String(expectedHeadSha || ''))
+    || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(expectedRepository || ''))
+    || !(seenRunIds instanceof Set)
+    || [...seenRunIds].some((id) => !Number.isSafeInteger(id) || id < 1)
+    || !Number.isSafeInteger(accumulatedCount) || accumulatedCount < 0
+    || !Number.isSafeInteger(page) || page < 1
+    || !Number.isSafeInteger(pageLimit) || pageLimit < 1 || page > pageLimit) {
+    throw new Error('GitHub Actions source-run pagination context is invalid.');
+  }
+  if (priorTotalCount !== null
+    && (!Number.isSafeInteger(priorTotalCount) || priorTotalCount < 0
+      || payload.total_count !== priorTotalCount)) {
+    throw new Error('GitHub Actions source-run total changed during pagination.');
+  }
+  if (accumulatedCount + payload.workflow_runs.length > payload.total_count) {
+    throw new Error('GitHub Actions source-run pagination exceeded its declared total count.');
+  }
+  const pageRunIds = [];
+  const pageRunIdSet = new Set();
+  for (const run of payload.workflow_runs) {
+    const id = run?.id;
+    if (!run || typeof run !== 'object' || Array.isArray(run)
+      || !Number.isSafeInteger(id) || id < 1
+      || run.head_sha !== expectedHeadSha
+      || run.repository?.full_name !== expectedRepository) {
+      throw new Error('GitHub Actions source-run page returned an invalid run record.');
+    }
+    if (seenRunIds.has(id) || pageRunIdSet.has(id)) {
+      throw new Error('GitHub Actions source-run pagination returned a duplicate run identity.');
+    }
+    pageRunIds.push(id);
+    pageRunIdSet.add(id);
+  }
+  const nextAccumulatedCount = accumulatedCount + payload.workflow_runs.length;
+  const complete = nextAccumulatedCount === payload.total_count;
+  if (!complete && payload.workflow_runs.length < 100) {
+    throw new Error('GitHub Actions source-run pagination ended before its declared total count.');
+  }
+  return Object.freeze({
+    runs: payload.workflow_runs,
+    runIds: Object.freeze(pageRunIds),
+    totalCount: payload.total_count,
+    disposition: complete ? 'complete' : page === pageLimit ? 'truncated' : 'continue',
+  });
+}
+
 const pageLimits = releaseHealthPageLimits(scanMode);
 
 const noHistoryPolicies = new Map([
@@ -1626,14 +1729,7 @@ async function enrichChecks(repoName, rawChecks, runs, shaMetadata, defaultBranc
     runById.set(Number(run.id), run);
   }
   const uniqueChecks = uniqueById(rawChecks);
-  const missingRunIds = [...new Set(uniqueChecks
-    .filter((check) => String(check.app?.slug || '') === 'github-actions')
-    .map((check) => actionsRunId(check.details_url))
-    .filter((runId) => runId && !runById.has(runId)))];
-  await mapLimit(missingRunIds, 4, async (runId) => {
-    const run = await api('/repos/' + owner + '/' + repoName + '/actions/runs/' + runId);
-    runById.set(runId, run);
-  });
+  await collectMissingActionsSourceRuns(repoName, uniqueChecks, runById);
 
   return uniqueChecks.map((check) => {
     const sourceRunId = String(check.app?.slug || '') === 'github-actions'
@@ -1676,6 +1772,58 @@ async function enrichChecks(repoName, rawChecks, runs, shaMetadata, defaultBranc
     };
     enriched.stream_identity = checkStreamIdentity(enriched);
     return enriched;
+  });
+}
+
+async function collectMissingActionsSourceRuns(repoName, checks, runById) {
+  const expectedRepository = owner + '/' + repoName;
+  const hydrationGroups = releaseHealthActionsRunHydrationGroups(checks, new Set(runById.keys()));
+
+  const hydrateDirectly = async (runIds) => {
+    ensureAdditionalRequestBudget(runIds.size, repoName + ' Actions source-run hydration');
+    await mapLimit([...runIds], 4, async (runId) => {
+      const run = await api('/repos/' + owner + '/' + repoName + '/actions/runs/' + runId);
+      runById.set(runId, run);
+    });
+  };
+
+  await mapLimit(hydrationGroups, 2, async ({ headSha, runIds }) => {
+    const missingRunIds = new Set(runIds);
+    if (releaseHealthActionsRunHydrationMode(missingRunIds.size) === 'direct') {
+      await hydrateDirectly(missingRunIds);
+      return;
+    }
+    let totalCount = null;
+    let accumulatedCount = 0;
+    const seenRunIds = new Set();
+    for (let page = 1; page <= pageLimits.runs; page += 1) {
+      const payload = await api('/repos/' + owner + '/' + repoName
+        + '/actions/runs?head_sha=' + headSha + '&per_page=100&page=' + page);
+      const validated = validateReleaseHealthActionsRunPage(payload, {
+        expectedHeadSha: headSha,
+        expectedRepository,
+        seenRunIds,
+        priorTotalCount: totalCount,
+        accumulatedCount,
+        page,
+        pageLimit: pageLimits.runs,
+      });
+      totalCount = validated.totalCount;
+      accumulatedCount += validated.runs.length;
+      for (const run of validated.runs) {
+        seenRunIds.add(run.id);
+        if (missingRunIds.delete(run.id)) runById.set(run.id, run);
+      }
+      if (missingRunIds.size === 0) return;
+      if (validated.disposition !== 'continue') {
+        throw new Error(repoName + ' Actions source-run batch did not contain every required run identity.');
+      }
+      const remainingPages = Math.ceil((validated.totalCount - accumulatedCount) / 100);
+      if (releaseHealthActionsRunHydrationMode(missingRunIds.size, remainingPages) === 'direct') {
+        await hydrateDirectly(missingRunIds);
+        return;
+      }
+    }
   });
 }
 
