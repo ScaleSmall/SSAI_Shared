@@ -518,6 +518,9 @@ requireText(releaseHealthVerifier, 'source_run_occurrence_at:', 'source-run occu
 requireText(releaseHealthVerifier, 'source_run_activity_at:', 'source-run recent-activity fallback evidence');
 requireText(releaseHealthVerifier, 'releaseHealthCheckRecentActivityTime(check)', 'source-run activity separated from occurrence ordering');
 requireText(releaseHealthVerifier, 'validateReleaseHealthCheckSourceRun(', 'source-run repository, commit, and identity binding');
+requireText(releaseHealthVerifier, 'validateReleaseHealthActionsRunPage(', 'bounded SHA-batched source-run hydration validation');
+requireText(releaseHealthVerifier, "'/actions/runs?head_sha='", 'bounded SHA-batched Actions source-run collection');
+requireText(releaseHealthVerifier, 'releaseHealthActionsRunHydrationMode(', 'request-minimizing source-run hydration strategy');
 requireText(releaseHealthVerifier, "String(check.app?.slug || '') === 'github-actions'", 'GitHub Actions-only source-run provenance');
 requireText(releaseHealthVerifier, 'sourceRun.repository?.full_name !== expectedRepository', 'source-run repository binding');
 requireText(releaseHealthVerifier, 'check._release_health_current_head === true', 'post-enrichment current-head retention');

@@ -66,6 +66,8 @@ import {
   isExactSelfMonitorEnvironmentDeployment,
   notificationStateHmac,
   releaseHealthActiveCheckDisposition,
+  releaseHealthActionsRunHydrationGroups,
+  releaseHealthActionsRunHydrationMode,
   releaseHealthCheckRecentActivityTime,
   releaseHealthCheckPageDisposition,
   releaseHealthCheckSourceActivityFallback,
@@ -77,6 +79,7 @@ import {
   shouldSetDegradedExitCode,
   scheduledIncidentStateEnabled,
   validateInstallationRepositoryPage,
+  validateReleaseHealthActionsRunPage,
   validateReleaseHealthCheckRunPage,
   validateReleaseHealthCheckSourceRun,
   verifyExpectedInventoryAttestation,
@@ -1355,6 +1358,106 @@ assert.equal(
 assert.throws(
   () => releaseHealthCheckPageDisposition(51, 1, continuousPageLimits.checks),
   /check pagination input is invalid/,
+);
+
+assert.equal(releaseHealthActionsRunHydrationMode(0), 'complete');
+assert.equal(releaseHealthActionsRunHydrationMode(1), 'direct');
+assert.equal(releaseHealthActionsRunHydrationMode(2), 'paginate');
+assert.equal(
+  releaseHealthActionsRunHydrationMode(439),
+  'paginate',
+  'a long-lived head must hydrate source runs through bounded SHA pages instead of one request per check run',
+);
+assert.equal(releaseHealthActionsRunHydrationMode(3, 4), 'direct');
+assert.equal(releaseHealthActionsRunHydrationMode(4, 4), 'paginate', 'equal request costs must retain bounded batch mode');
+assert.equal(releaseHealthActionsRunHydrationMode(339, 4), 'paginate');
+assert.throws(() => releaseHealthActionsRunHydrationMode(-1), /hydration input is invalid/);
+
+const actionsRunFixture = (id, overrides = {}) => ({
+  id,
+  head_sha: checkHeadSha,
+  repository: { full_name: 'ScaleSmall/SSAI_Test' },
+  ...overrides,
+});
+const actionsCheckFixture = (runId, overrides = {}) => checkRunFixture(runId, {
+  app: { slug: 'github-actions' },
+  details_url: `https://github.com/ScaleSmall/SSAI_Test/actions/runs/${runId}/job/${runId + 1000}`,
+  ...overrides,
+});
+assert.deepEqual(
+  releaseHealthActionsRunHydrationGroups([
+    actionsCheckFixture(1),
+    actionsCheckFixture(2),
+    actionsCheckFixture(3, { app: { slug: 'external-ci' } }),
+    actionsCheckFixture(4, { details_url: 'https://example.invalid/no-run/4' }),
+  ], new Set([2])),
+  [{ headSha: checkHeadSha, runIds: [1] }],
+  'hydration grouping must omit known, third-party, and malformed source-run identities',
+);
+assert.throws(
+  () => releaseHealthActionsRunHydrationGroups([
+    actionsCheckFixture(1),
+    actionsCheckFixture(1, { head_sha: 'b'.repeat(40) }),
+  ]),
+  /associated with multiple commits/,
+  'one Actions run identity must not hydrate checks from multiple commits',
+);
+const actionsRunPageContext = (overrides = {}) => ({
+  expectedHeadSha: checkHeadSha,
+  expectedRepository: 'ScaleSmall/SSAI_Test',
+  seenRunIds: new Set(),
+  priorTotalCount: null,
+  accumulatedCount: 0,
+  page: 1,
+  pageLimit: continuousPageLimits.runs,
+  ...overrides,
+});
+const firstActionsRunPage = validateReleaseHealthActionsRunPage(
+  {
+    total_count: 439,
+    workflow_runs: Array.from({ length: 100 }, (_, offset) => actionsRunFixture(offset + 1)),
+  },
+  actionsRunPageContext(),
+);
+assert.equal(firstActionsRunPage.disposition, 'continue');
+assert.equal(firstActionsRunPage.runIds.length, 100);
+assert.equal(
+  validateReleaseHealthActionsRunPage(
+    {
+      total_count: 439,
+      workflow_runs: Array.from({ length: 39 }, (_, offset) => actionsRunFixture(401 + offset)),
+    },
+    actionsRunPageContext({
+      seenRunIds: new Set(Array.from({ length: 400 }, (_, offset) => offset + 1)),
+      priorTotalCount: 439,
+      accumulatedCount: 400,
+      page: 5,
+    }),
+  ).disposition,
+  'complete',
+  'the observed 439-run long-lived head must complete in five bounded list requests',
+);
+for (const invalidRun of [
+  actionsRunFixture(1, { head_sha: 'b'.repeat(40) }),
+  actionsRunFixture(1, { repository: { full_name: 'ScaleSmall/SSAI_Other' } }),
+  actionsRunFixture('1'),
+]) {
+  assert.throws(
+    () => validateReleaseHealthActionsRunPage(
+      { total_count: 1, workflow_runs: [invalidRun] },
+      actionsRunPageContext(),
+    ),
+    /invalid run record/,
+    'batched source-run hydration must fail closed on repository, commit, or identity drift',
+  );
+}
+assert.throws(
+  () => validateReleaseHealthActionsRunPage(
+    { total_count: 2, workflow_runs: [actionsRunFixture(1)] },
+    actionsRunPageContext(),
+  ),
+  /ended before its declared total count/,
+  'a premature short Actions-run page must fail closed',
 );
 
 {
