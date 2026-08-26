@@ -36,16 +36,11 @@ function oauthPlatformFor(platform) {
   return platform === 'gbp' ? 'google' : platform;
 }
 
-export default function ConnectPanel({ clientId, supabaseUrl, businessName, services, getToken, className, allowPublisherProxyConfig = false }) {
-  const { sortedPlatforms, connectors, counts, uploadPostStatus, error, loading, refresh, disconnectPlatform, connectorStatusUrl, oauthStatusUrl } = useConnect(clientId, supabaseUrl, getToken);
+export default function ConnectPanel({ clientId, supabaseUrl, businessName, services, getToken, className }) {
+  const { sortedPlatforms, connectors, counts, error, loading, refresh, disconnectPlatform, connectorStatusUrl } = useConnect(clientId, supabaseUrl, getToken);
   const hasRR = services && (services.includes('repeat_referral') || services.includes('customer_intelligence'));
   const [oauthBusy, setOauthBusy] = useState(false);
   const [oauthError, setOauthError] = useState(null);
-  const [uploadPostInput, setUploadPostInput] = useState('');
-  const [uploadPostUserInput, setUploadPostUserInput] = useState('');
-  const [showUploadPostForm, setShowUploadPostForm] = useState(false);
-  const [uploadPostBusy, setUploadPostBusy] = useState(false);
-  const [uploadPostError, setUploadPostError] = useState(null);
 
   const crmConnectors = useMemo(
     () => (connectors || []).filter(isCustomerDataConnector),
@@ -104,38 +99,6 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
     }
   }, [authHeaders, clientId, refresh, supabaseUrl]);
 
-  const saveUploadPostKey = useCallback(async (clear = false) => {
-    const key = clear ? '' : uploadPostInput.trim();
-    const uploadPostUser = clear ? '' : uploadPostUserInput.trim();
-    if (!clear && !key) { setUploadPostError('Enter your UploadPost API key'); return; }
-    if (!clear && !uploadPostUser) { setUploadPostError('Enter your UploadPost user/account'); return; }
-    setUploadPostBusy(true);
-    setUploadPostError(null);
-    try {
-      const res = await fetch(oauthStatusUrl, {
-        method: 'POST',
-        headers: await authHeaders(),
-        body: JSON.stringify({
-          client_id: clientId,
-          action: 'set_upload_post_key',
-          api_key: key,
-          upload_post_user: uploadPostUser,
-          request_id: crypto.randomUUID(),
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || data.error) throw new Error(data.error || `Failed to save (${res.status})`);
-      setUploadPostInput('');
-      setUploadPostUserInput('');
-      setShowUploadPostForm(false);
-      refresh();
-    } catch (err) {
-      setUploadPostError(err.message || 'Failed to save UploadPost credentials.');
-    } finally {
-      setUploadPostBusy(false);
-    }
-  }, [authHeaders, clientId, oauthStatusUrl, refresh, uploadPostInput, uploadPostUserInput]);
-
   // Detect oauth_success query param (set by oauth-callback redirect)
   // If this is a popup window, auto-close it. Either way, refresh statuses.
   useEffect(() => {
@@ -185,67 +148,6 @@ export default function ConnectPanel({ clientId, supabaseUrl, businessName, serv
             <PlatformRow key={p.platform} p={p} clientId={clientId} supabaseUrl={supabaseUrl} businessName={businessName} i={i} onDisconnect={disconnectPlatform} onRefresh={refresh} onStartOAuth={startOAuth} oauthBusy={oauthBusy} />
           ))}
         </div>
-
-        {/* API Posting Proxy */}
-        {allowPublisherProxyConfig && (
-          <>
-            <div className="sc-section-label" style={{ marginTop: 24 }}>API Posting Proxy</div>
-            <p className="sc-subtitle">UploadPost enables temporary proxy posting to Facebook, Instagram, and TikTok.</p>
-            <div className="sc-list">
-              <div className={`sc-row ${uploadPostStatus.ready ? 'sc-row-connected' : ''}`}>
-                <div className="sc-row-main">
-                  <div className="sc-icon sc-icon-connector"><ConnectorIcon type="uploadpost" /></div>
-                  <div className="sc-info">
-                    <div className="sc-name">UploadPost</div>
-                    <div className="sc-note">Covers Facebook, Instagram, and TikTok</div>
-                  </div>
-                  <div className="sc-actions">
-                    <span className={`sc-badge ${uploadPostStatus.ready ? 'sc-badge-green' : 'sc-badge-red'}`}>
-                      {uploadPostStatus.ready ? 'Active' : 'Not configured'}
-                    </span>
-                    {uploadPostStatus.ready && (
-                      <>
-                        <button className="sc-btn sc-btn-ghost" onClick={() => setShowUploadPostForm(v => !v)} disabled={uploadPostBusy}>
-                          {showUploadPostForm ? 'Cancel' : 'Update'}
-                        </button>
-                        <button className="sc-btn sc-btn-ghost" onClick={() => saveUploadPostKey(true)} disabled={uploadPostBusy}>Remove</button>
-                      </>
-                    )}
-                  </div>
-                </div>
-                {(!uploadPostStatus.ready || showUploadPostForm) && (
-                  <div className="sc-token-row sc-row-support-form">
-                    <input
-                      className="sc-input"
-                      type="password"
-                      placeholder="UploadPost API key"
-                      value={uploadPostInput}
-                      onChange={e => setUploadPostInput(e.target.value)}
-                      onKeyDown={e => e.key === 'Enter' && saveUploadPostKey(false)}
-                    />
-                    <input
-                      className="sc-input"
-                      type="text"
-                      placeholder="UploadPost user/account"
-                      value={uploadPostUserInput}
-                      onChange={e => setUploadPostUserInput(e.target.value)}
-                      onKeyDown={e => e.key === 'Enter' && saveUploadPostKey(false)}
-                    />
-                    <button className="sc-btn sc-btn-primary" onClick={() => saveUploadPostKey(false)} disabled={uploadPostBusy || !uploadPostInput || !uploadPostUserInput}>
-                      {uploadPostBusy ? 'Saving...' : uploadPostStatus.ready ? 'Update' : 'Save'}
-                    </button>
-                  </div>
-                )}
-                {!uploadPostStatus.ready && !showUploadPostForm && (
-                  <div className="sc-note sc-row-support-note">
-                    Missing: {[!uploadPostStatus.hasKey && 'API key', !uploadPostStatus.hasUser && 'user/account'].filter(Boolean).join(', ')}
-                  </div>
-                )}
-                {uploadPostError && <div className="sc-row-error sc-row-support-note">{uploadPostError}</div>}
-              </div>
-            </div>
-          </>
-        )}
 
         {/* Photo Feed Sources */}
         {photoConnectors.length > 0 && <>
