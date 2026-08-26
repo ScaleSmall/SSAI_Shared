@@ -40,7 +40,6 @@ const emailIdentity = await load('src/components/EmailIdentity.jsx');
 
 includesAll(panel, [
   "new Set(['hubspot', 'gohighlevel', 'salesforce'])",
-  'API Posting Proxy',
   'Photo Feed Sources',
   'Customer Data Sources',
   'format: \'json\'',
@@ -48,8 +47,6 @@ includesAll(panel, [
   'Authorization: `Bearer ${token}`',
   'onStartOAuth(c.connector_type)',
   'Connect ${c.display_name}',
-  'allowPublisherProxyConfig = false',
-  "action: 'set_upload_post_key'",
   'formatPlatformAccountLabel',
   'currentLinkedInOrgName',
   "accountNote || 'Connected'",
@@ -80,7 +77,6 @@ excludesAll(emailIdentity, [
 
 appearsInOrder(panel, [
   'Social Platforms',
-  'API Posting Proxy',
   'Photo Feed Sources',
   'Customer Data Sources',
 ], 'ConnectPanel group order contract');
@@ -90,8 +86,14 @@ includesAll(hook, [
   'Authorization: `Bearer ${token}`',
   'encodeURIComponent(clientId)',
   'request_id: crypto.randomUUID()',
-  'has_upload_post_ready',
 ], 'useConnect authenticated status contract');
+
+excludesAll(`${panel}\n${hook}`, [
+  'allowPublisherProxyConfig',
+  'API Posting Proxy',
+  'set_upload_post_key',
+  'has_upload_post_ready',
+], 'Shared connect surface must use native platform OAuth only');
 
 includesAll(styles, [
   '.sc-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }',

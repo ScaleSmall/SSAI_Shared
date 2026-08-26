@@ -430,8 +430,8 @@ for (const [label, repository] of [
     archived: false,
   }],
   ['wrong prefix', {
-    name: 'hillcosite',
-    full_name: 'ScaleSmall/hillcosite',
+    name: 'tenant-site-fixture',
+    full_name: 'ScaleSmall/tenant-site-fixture',
     owner: { login: 'ScaleSmall' },
     archived: false,
   }],
