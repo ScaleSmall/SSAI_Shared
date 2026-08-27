@@ -1,0 +1,39 @@
+name: Scale Small AI Release Health Scheduler Identity Canary
+run-name: Release health scheduler identity canary [natural]
+
+on:
+  schedule:
+    - cron: '1,16,31,46 * * * *'
+
+concurrency:
+  group: scale-small-ai-release-health-monitor-v3-canary
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  prove-natural-delivery:
+    name: Prove natural scheduler delivery
+    if: ${{ github.event_name == 'schedule' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Verify immutable natural-schedule context
+        shell: bash
+        env:
+          ACTUAL_EVENT: ${{ github.event_name }}
+          ACTUAL_REF: ${{ github.ref }}
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          ACTUAL_SHA: ${{ github.sha }}
+          EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}
+          EXPECTED_REPOSITORY: ScaleSmall/SSAI_Shared
+        run: |
+          set -euo pipefail
+          if [ "$ACTUAL_EVENT" != 'schedule' ] || [ "$ACTUAL_REPOSITORY" != "$EXPECTED_REPOSITORY" ] || [ "$ACTUAL_REF" != "$EXPECTED_REF" ] || ! [[ "$ACTUAL_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Scheduler identity canary received an invalid execution context."
+            exit 1
+          fi
+          printf 'natural_schedule_delivery=verified\n'
+          printf 'repository=%s\n' "$ACTUAL_REPOSITORY"
+          printf 'ref=%s\n' "$ACTUAL_REF"
+          printf 'sha=%s\n' "$ACTUAL_SHA"
