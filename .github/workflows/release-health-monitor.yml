@@ -21,25 +21,38 @@ on:
     - cron: '9,24,39,54 * * * *'
 
 concurrency:
-  # v2 isolates the protected scheduler from the immutable orphaned v1 run.
+  # Preserve every pending native or future fallback writer and serialize all
+  # incident-state mutations through one non-cancelling repository queue.
   group: scale-small-ai-release-health-monitor-v2
+  queue: max
   cancel-in-progress: false
 
-permissions:
-  contents: read
-  issues: write
+permissions: {}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  verify:
+  scan:
+    # Keep the canonical check name stable across the workflow-identity cutover
+    # so historical failures and self-deployment exclusions retain one stream.
     name: Verify current organization release health
-    if: ${{ github.event_name != 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    permissions:
+      contents: read
     environment:
       name: release-health-monitor
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ inputs.scan_mode == 'incident' && 45 || 12 }}
+    outputs:
+      scan_completed: ${{ steps.reconcile.outputs.scan_completed }}
+      health_degraded: ${{ steps.reconcile.outputs.health_degraded }}
+      incident_state_changed: ${{ steps.reconcile.outputs.incident_state_changed }}
+      state_persistence_required: ${{ steps.reconcile.outputs.state_persistence_required }}
+      incident_state: ${{ steps.reconcile.outputs.incident_state }}
+      notification_outcome: ${{ steps.reconcile.outputs.notification_outcome }}
+      notification_reconciliation_required: ${{ steps.reconcile.outputs.notification_reconciliation_required }}
+      incident_delivery_identity: ${{ steps.reconcile.outputs.incident_delivery_identity }}
     env:
       SSAI_RELEASE_MONITOR_STATE_HMAC_EPOCH: v1
       SSAI_RELEASE_MONITOR_STUCK_MINUTES: '45'
@@ -51,7 +64,27 @@ jobs:
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
+
+      - name: Verify exact protected workflow context
+        shell: bash
+        env:
+          ACTUAL_EVENT: ${{ github.event_name }}
+          ACTUAL_REF: ${{ github.ref }}
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          ACTUAL_SHA: ${{ github.sha }}
+          ACTUAL_WORKFLOW_REF: ${{ github.workflow_ref }}
+          EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}
+          EXPECTED_REPOSITORY: ScaleSmall/SSAI_Shared
+          EXPECTED_WORKFLOW_REF: ScaleSmall/SSAI_Shared/.github/workflows/release-health-monitor.yml@refs/heads/${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          checked_out_sha="$(git rev-parse HEAD)"
+          if ! [[ "$ACTUAL_EVENT" =~ ^(schedule|workflow_dispatch)$ ]] || [ "$ACTUAL_REPOSITORY" != "$EXPECTED_REPOSITORY" ] || [ "$ACTUAL_REF" != "$EXPECTED_REF" ] || [ "$ACTUAL_WORKFLOW_REF" != "$EXPECTED_WORKFLOW_REF" ] || ! [[ "$ACTUAL_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$checked_out_sha" != "$ACTUAL_SHA" ]; then
+            echo "::error::Release-health monitor failed exact protected workflow admission."
+            exit 1
+          fi
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
@@ -78,8 +111,9 @@ jobs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ${{ runner.temp }}/ssai-release-health-monitor/state.json
-          key: ssai-release-health-state-v4-v1-lookup
+          key: ssai-release-health-state-v6-v1-lookup
           restore-keys: |
+            ssai-release-health-state-v6-v1-
             ssai-release-health-state-v4-v1-
             ssai-release-health-state-v3-v1-
             ssai-release-health-state-v2-v1-
@@ -105,11 +139,11 @@ jobs:
           SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256: ${{ secrets.SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256 }}
           SSAI_RELEASE_MONITOR_STATE_HMAC_KEY: ${{ secrets.SSAI_RELEASE_MONITOR_STATE_HMAC_KEY }}
           SSAI_RELEASE_MONITOR_STATE_CACHE_MATCHED_KEY: ${{ steps.restore_release_health_state.outputs.cache-matched-key }}
-          SSAI_RELEASE_MONITOR_STATE_CACHE_PREFIX: ssai-release-health-state-v4-v1-
+          SSAI_RELEASE_MONITOR_STATE_CACHE_PREFIX: ssai-release-health-state-v6-v1-
           SSAI_RELEASE_MONITOR_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           SSAI_RELEASE_MONITOR_STATE_PATH: ${{ runner.temp }}/ssai-release-health-monitor/state.json
           # A completed scheduled scan must first persist and deliver its exact
-          # incident state. A later step restores the degraded job conclusion.
+          # incident state. A later job restores the degraded conclusion.
           SSAI_RELEASE_MONITOR_DEFER_DEGRADED_EXIT: ${{ github.event_name == 'schedule' }}
         shell: bash
         run: |
@@ -128,16 +162,16 @@ jobs:
           }
           NODE
 
-      - name: Persist changed scheduled-incident state
-        if: ${{ always() && github.event_name == 'schedule' && steps.reconcile.outputs.incident_state_changed == 'true' }}
+      - name: Persist required scheduled-incident state
+        if: ${{ always() && github.event_name == 'schedule' && steps.reconcile.outputs.state_persistence_required == 'true' }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ${{ runner.temp }}/ssai-release-health-monitor/state.json
           key: ${{ steps.reconcile.outputs.incident_state_cache_key }}
 
-      - name: Verify changed scheduled-incident state is visible
+      - name: Verify required scheduled-incident state is visible
         id: verify_release_health_state
-        if: ${{ always() && github.event_name == 'schedule' && steps.reconcile.outputs.incident_state_changed == 'true' }}
+        if: ${{ always() && github.event_name == 'schedule' && steps.reconcile.outputs.state_persistence_required == 'true' }}
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ${{ runner.temp }}/ssai-release-health-monitor/state.json
@@ -145,9 +179,9 @@ jobs:
           lookup-only: true
           fail-on-cache-miss: true
 
-      - name: Require changed scheduled-incident state persistence
+      - name: Require scheduled-incident state persistence
         id: require_release_health_state
-        if: ${{ always() && github.event_name == 'schedule' && steps.reconcile.outputs.incident_state_changed == 'true' }}
+        if: ${{ always() && github.event_name == 'schedule' && steps.reconcile.outputs.state_persistence_required == 'true' }}
         shell: bash
         env:
           EXPECTED_STATE_KEY: ${{ steps.reconcile.outputs.incident_state_cache_key }}
@@ -160,19 +194,58 @@ jobs:
             exit 1
           fi
 
+  deliver:
+    name: Deliver managed incident and conclude
+    needs: scan
+    if: ${{ always() && github.event_name == 'schedule' && needs.scan.result == 'success' && needs.scan.outputs.scan_completed == 'true' }}
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24'
+
+      - name: Verify exact protected delivery context
+        shell: bash
+        env:
+          ACTUAL_EVENT: ${{ github.event_name }}
+          ACTUAL_REF: ${{ github.ref }}
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          ACTUAL_SHA: ${{ github.sha }}
+          ACTUAL_WORKFLOW_REF: ${{ github.workflow_ref }}
+          EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}
+          EXPECTED_REPOSITORY: ScaleSmall/SSAI_Shared
+          EXPECTED_WORKFLOW_REF: ScaleSmall/SSAI_Shared/.github/workflows/release-health-monitor.yml@refs/heads/${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          checked_out_sha="$(git rev-parse HEAD)"
+          if [ "$ACTUAL_EVENT" != 'schedule' ] || [ "$ACTUAL_REPOSITORY" != "$EXPECTED_REPOSITORY" ] || [ "$ACTUAL_REF" != "$EXPECTED_REF" ] || [ "$ACTUAL_WORKFLOW_REF" != "$EXPECTED_WORKFLOW_REF" ] || ! [[ "$ACTUAL_SHA" =~ ^[0-9a-f]{40}$ ]] || [ "$checked_out_sha" != "$ACTUAL_SHA" ]; then
+            echo "::error::Release-health delivery failed exact protected workflow admission."
+            exit 1
+          fi
+
       - name: Reconcile the managed GitHub incident issue
         id: reconcile_managed_incident
-        if: ${{ always() && github.event_name == 'schedule' && steps.reconcile.outcome == 'success' && steps.reconcile.outputs.scan_completed == 'true' && steps.reconcile.outputs.notification_reconciliation_required == 'true' && (steps.reconcile.outputs.incident_state_changed != 'true' || (steps.verify_release_health_state.outcome == 'success' && steps.require_release_health_state.outcome == 'success')) }}
+        if: ${{ needs.scan.outputs.notification_reconciliation_required == 'true' }}
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          SSAI_RELEASE_MONITOR_INCIDENT_STATE: ${{ steps.reconcile.outputs.incident_state }}
-          SSAI_RELEASE_MONITOR_NOTIFICATION_OUTCOME: ${{ steps.reconcile.outputs.notification_outcome }}
-          SSAI_RELEASE_MONITOR_DELIVERY_IDENTITY: ${{ steps.reconcile.outputs.incident_delivery_identity }}
+          SSAI_RELEASE_MONITOR_INCIDENT_STATE: ${{ needs.scan.outputs.incident_state }}
+          SSAI_RELEASE_MONITOR_NOTIFICATION_OUTCOME: ${{ needs.scan.outputs.notification_outcome }}
+          SSAI_RELEASE_MONITOR_DELIVERY_IDENTITY: ${{ needs.scan.outputs.incident_delivery_identity }}
         run: node scripts/sync-release-health-incident-issue.mjs
 
       - name: Restore degraded release-health conclusion after delivery
-        if: ${{ always() && github.event_name == 'schedule' && steps.reconcile.outcome == 'success' && steps.reconcile.outputs.scan_completed == 'true' && steps.reconcile.outputs.health_degraded == 'true' }}
+        if: ${{ always() && needs.scan.outputs.health_degraded == 'true' }}
         shell: bash
         run: |
           echo "::error::The completed release-health scan found a new or worsened incident"

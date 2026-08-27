@@ -1,6 +1,64 @@
 import { createHash } from 'node:crypto';
 
 const releaseHealthDeliveryIdentityPattern = /^run-([1-9][0-9]{0,19})-attempt-([1-9][0-9]{0,9})$/;
+const authoritativeNativeWorkflowIdentity = Object.freeze({
+  workflowId: 315630665,
+  path: '.github/workflows/release-health-monitor.yml',
+});
+const schedulerCanaryWorkflowIdentity = Object.freeze({
+  workflowId: 344135917,
+  path: '.github/workflows/release-health-monitor-v3.yml',
+});
+const fallbackWorkflowIdentity = Object.freeze({
+  workflowId: 344170407,
+  path: '.github/workflows/release-health-monitor-fallback.yml',
+});
+export const releaseHealthMonitorWorkflowIdentities = Object.freeze({
+  active: authoritativeNativeWorkflowIdentity,
+  predecessor: schedulerCanaryWorkflowIdentity,
+  canary: schedulerCanaryWorkflowIdentity,
+  fallback: fallbackWorkflowIdentity,
+});
+export const releaseHealthIncidentProducerPolicies = Object.freeze({
+  nativeSchedule: Object.freeze({
+    kind: 'github-actions-workflow-run',
+    policy: 'native-schedule-v1',
+    workflowId: authoritativeNativeWorkflowIdentity.workflowId,
+    path: authoritativeNativeWorkflowIdentity.path,
+    events: Object.freeze(['schedule']),
+  }),
+});
+export const releaseHealthMonitorJobNames = Object.freeze({
+  scan: 'Verify current organization release health',
+  delivery: 'Deliver managed incident and conclude',
+});
+const trustedMonitorWorkflowIdentities = Object.freeze([
+  releaseHealthMonitorWorkflowIdentities.active,
+  releaseHealthMonitorWorkflowIdentities.predecessor,
+]);
+
+export function resolveReleaseHealthIncidentProducer({ workflowId, path, event }) {
+  const normalizedWorkflowId = Number(workflowId);
+  const normalizedPath = String(path || '').trim();
+  const normalizedEvent = String(event || '').trim();
+  if (!Number.isSafeInteger(normalizedWorkflowId) || normalizedWorkflowId < 1
+    || !/^\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml$/.test(normalizedPath)
+    || !normalizedEvent) return null;
+  for (const policy of Object.values(releaseHealthIncidentProducerPolicies)) {
+    if (policy.workflowId === normalizedWorkflowId
+      && policy.path === normalizedPath
+      && policy.events.includes(normalizedEvent)) {
+      return Object.freeze({
+        kind: policy.kind,
+        policy: policy.policy,
+        workflowId: policy.workflowId,
+        path: policy.path,
+        event: normalizedEvent,
+      });
+    }
+  }
+  return null;
+}
 
 export function releaseHealthDeliveryIdentity(runId, runAttempt) {
   const normalizedRunId = String(runId || '').trim();
@@ -445,7 +503,12 @@ export function isControlledDisabledMonitorRecoveryWorkflow({
   const observedRunAttempt = Number(currentRun?.run_attempt);
   return workflow.state === 'disabled_manually'
     && policy.monitorSelfRecoveryContract === 'release-health-monitor-v1'
-    && expectedPath === '.github/workflows/release-health-monitor.yml'
+    && expectedPath === trustedMonitorWorkflowIdentities[0].path
+    && verifyTrustedMonitorWorkflowIdentities(
+      policy.monitorWorkflowIdentities,
+      expectedWorkflowId,
+      expectedPath,
+    ) !== null
     && Number.isSafeInteger(expectedWorkflowId) && expectedWorkflowId > 0
     && Number(workflow.id) === expectedWorkflowId
     && String(workflow.path || '') === expectedPath
@@ -492,7 +555,17 @@ export function verifyForwardFixRecoveryPolicy({
   const monitorSelfRecoveryEvents = monitorSelfRecoveryConfigured
     ? exactNonEmptyStringSet(policy.monitorSelfRecoveryEvents)
     : null;
-  const auditedMonitorOrigins = verifyAuditedMonitorOrigins(policy.auditedMonitorOrigins);
+  const monitorWorkflowIdentities = monitorSelfRecoveryConfigured
+    ? verifyTrustedMonitorWorkflowIdentities(
+      policy.monitorWorkflowIdentities,
+      expectedWorkflowId,
+      expectedPath,
+    )
+    : policy.monitorWorkflowIdentities === undefined ? Object.freeze([]) : null;
+  const auditedMonitorOrigins = verifyAuditedMonitorOrigins(
+    policy.auditedMonitorOrigins,
+    monitorWorkflowIdentities,
+  );
   const expectedSourceSha256 = String(policy.sourceSha256 || '').trim().toLowerCase();
   const sourceBytes = normalizeSourceBytes(workflowSource);
   const normalizedCurrentHeadSha = String(currentHeadSha || '').trim().toLowerCase();
@@ -515,7 +588,8 @@ export function verifyForwardFixRecoveryPolicy({
     || (workflow.state !== 'active' && !controlledDisabledMonitor)
     || String(workflow.path || '') !== expectedPath
     || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(expectedRepository)
-    || !failedEvents || !recoveryEvents || !jobNames || !recoveryDisplayTitles || !auditedMonitorOrigins
+    || !failedEvents || !recoveryEvents || !jobNames || !recoveryDisplayTitles
+    || !monitorWorkflowIdentities || !auditedMonitorOrigins
     || (monitorSelfRecoveryConfigured
       && (monitorSelfRecoveryContract !== 'release-health-monitor-v1' || !monitorSelfRecoveryEvents))
     || (!monitorSelfRecoveryConfigured && auditedMonitorOrigins.length > 0)
@@ -552,6 +626,7 @@ export function verifyForwardFixRecoveryPolicy({
     recoveryDisplayTitles,
     monitorSelfRecoveryContract,
     monitorSelfRecoveryEvents,
+    monitorWorkflowIdentities,
     auditedMonitorOrigins,
     monitorImplementationIdentity,
     controlledDisabledMonitor,
@@ -568,6 +643,11 @@ export function isTrustedMonitorRecoveryPolicy(policy) {
     && policy.monitorSelfRecoveryContract === 'release-health-monitor-v1'
     && policy.monitorSelfRecoveryEvents instanceof Set
     && policy.monitorSelfRecoveryEvents.size > 0
+    && verifyTrustedMonitorWorkflowIdentities(
+      policy.monitorWorkflowIdentities,
+      policy.workflowId,
+      policy.path,
+    ) !== null
     && Array.isArray(policy.auditedMonitorOrigins)
     && /^(?:[a-f0-9]{64}:){3}[a-f0-9]{64}$/.test(String(policy.monitorImplementationIdentity || ''))
     && /^[a-f0-9]{40}$/.test(String(policy.currentMonitorHeadSha || ''))
@@ -1174,7 +1254,11 @@ function validateTrustedMonitorSearch(policy, currentHeadSha, defaultBranch, def
 function isEligibleTrustedMonitorOrigin(record, policy, currentHeadSha, defaultBranch, defaultCommitShas) {
   const failedSha = String(record?.head_sha || '');
   const headRepository = String(record?.head_repository?.full_name || record?.head_repository || '');
-  return Number(record?.workflow_id) === policy.workflowId
+  const auditedOrigin = findAuditedMonitorOrigin(record, policy);
+  const workflowIdentityMatches = auditedOrigin
+    ? Number(record?.workflow_id) === auditedOrigin.workflowId
+    : Number(record?.workflow_id) === policy.workflowId;
+  return workflowIdentityMatches
     && record?.head_branch === defaultBranch
     && headRepository === policy.headRepository
     && policy.monitorSelfRecoveryEvents.has(String(record?.event || ''))
@@ -1296,18 +1380,7 @@ function trustedMonitorNominalCoverageDominates(candidateRecord, failedCoverage)
 }
 
 function trustedMonitorOriginCoverage(record, policy) {
-  const runId = Number(record?.source_run_id ?? record?.id);
-  const runAttempt = Number(record?.source_run_attempt ?? record?.run_attempt ?? 1);
-  const headSha = String(record?.head_sha || '').toLowerCase();
-  const event = String(record?.event || '');
-  const displayTitle = String(record?.source_run_display_title || record?.display_title || '');
-  const isCheckRun = record?.source_run_id !== undefined;
-  const audited = policy.auditedMonitorOrigins.find((candidate) => candidate.runId === runId
-    && candidate.runAttempt === runAttempt
-    && (!isCheckRun || candidate.checkRunId === Number(record?.id))
-    && candidate.headSha === headSha
-    && candidate.event === event
-    && candidate.displayTitle === displayTitle);
+  const audited = findAuditedMonitorOrigin(record, policy);
   if (audited) {
     return {
       mode: audited.coverageMode,
@@ -1354,9 +1427,12 @@ function exactNonEmptyStringSet(value) {
   return new Set(normalized);
 }
 
-function verifyAuditedMonitorOrigins(value) {
+function verifyAuditedMonitorOrigins(value, workflowIdentities) {
   if (value === undefined) return Object.freeze([]);
-  if (!Array.isArray(value) || value.length > 100) return null;
+  if (!Array.isArray(value) || value.length > 100 || !Array.isArray(workflowIdentities)) return null;
+  const workflowIdentityKeys = new Set(workflowIdentities.map((identity) => (
+    identity.workflowId + ':' + identity.path
+  )));
   const seen = new Set();
   const verified = [];
   for (const item of value) {
@@ -1381,8 +1457,11 @@ function verifyAuditedMonitorOrigins(value) {
     const deliverySourceSha256 = item.deliverySourceSha256 === null
       ? null
       : String(item.deliverySourceSha256 || '').trim().toLowerCase();
-    const identity = runId + ':' + runAttempt;
-    if (!Number.isSafeInteger(runId) || runId < 1
+    const workflowId = Number(item.workflowId);
+    const workflowPath = String(item.workflowPath || '').trim();
+    const identity = workflowId + ':' + runId + ':' + runAttempt;
+    if (!workflowIdentityKeys.has(workflowId + ':' + workflowPath)
+      || !Number.isSafeInteger(runId) || runId < 1
       || !Number.isSafeInteger(runAttempt) || runAttempt < 1 || runAttempt > 100
       || !Number.isSafeInteger(checkRunId) || checkRunId < 1
       || !/^[a-f0-9]{40}$/.test(headSha)
@@ -1401,6 +1480,8 @@ function verifyAuditedMonitorOrigins(value) {
       || seen.has(identity)) return null;
     seen.add(identity);
     verified.push(Object.freeze({
+      workflowId,
+      workflowPath,
       runId,
       runAttempt,
       checkRunId,
@@ -1418,6 +1499,41 @@ function verifyAuditedMonitorOrigins(value) {
     }));
   }
   return Object.freeze(verified);
+}
+
+function verifyTrustedMonitorWorkflowIdentities(value, activeWorkflowId, activePath) {
+  if (!Array.isArray(value) || value.length !== trustedMonitorWorkflowIdentities.length) return null;
+  const normalized = [];
+  for (let index = 0; index < trustedMonitorWorkflowIdentities.length; index += 1) {
+    const identity = value[index];
+    const expected = trustedMonitorWorkflowIdentities[index];
+    if (!identity || typeof identity !== 'object' || Array.isArray(identity)
+      || JSON.stringify(Object.keys(identity).sort()) !== JSON.stringify(['path', 'workflowId'])
+      || Number(identity.workflowId) !== expected.workflowId
+      || String(identity.path || '').trim() !== expected.path) return null;
+    normalized.push(Object.freeze({ workflowId: expected.workflowId, path: expected.path }));
+  }
+  if (Number(activeWorkflowId) !== normalized[0].workflowId
+    || String(activePath || '').trim() !== normalized[0].path
+    || new Set(normalized.map((identity) => identity.workflowId)).size !== normalized.length
+    || new Set(normalized.map((identity) => identity.path)).size !== normalized.length) return null;
+  return Object.freeze(normalized);
+}
+
+function findAuditedMonitorOrigin(record, policy) {
+  const runId = Number(record?.source_run_id ?? record?.id);
+  const runAttempt = Number(record?.source_run_attempt ?? record?.run_attempt ?? 1);
+  const headSha = String(record?.head_sha || '').toLowerCase();
+  const event = String(record?.event || '');
+  const displayTitle = String(record?.source_run_display_title || record?.display_title || '');
+  const isCheckRun = record?.source_run_id !== undefined;
+  return policy.auditedMonitorOrigins.find((candidate) => candidate.workflowId === Number(record?.workflow_id)
+    && candidate.runId === runId
+    && candidate.runAttempt === runAttempt
+    && (!isCheckRun || candidate.checkRunId === Number(record?.id))
+    && candidate.headSha === headSha
+    && candidate.event === event
+    && candidate.displayTitle === displayTitle) || null;
 }
 
 function sourceDigestMatches(source, expectedSha256) {

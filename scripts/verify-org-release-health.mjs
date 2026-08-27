@@ -39,6 +39,10 @@ import {
   recordActivityTime,
   recordOccurrenceTime,
   releaseHealthDeliveryIdentity,
+  releaseHealthIncidentProducerPolicies,
+  releaseHealthMonitorJobNames,
+  releaseHealthMonitorWorkflowIdentities,
+  resolveReleaseHealthIncidentProducer,
   verifyAuthorizedDisabledWorkflowHold,
   verifyForwardFixRecoveryPolicy,
   workflowStreamIdentity,
@@ -73,11 +77,12 @@ const maxMonitorImplementationAttestations = 32;
 const maxRecoveryAncestorComparisons = 64;
 const maxIncidentFingerprintIssues = 2048;
 const maxIncidentStateBytes = 192 * 1024;
-const incidentStateSchema = 4;
+const incidentStateSchema = 6;
+const predecessorIncidentStateSchema = 4;
 const previousIncidentStateSchema = 3;
 const legacyIncidentStateSchema = 2;
 const persistedNotificationClusterTokenCount = maxIncidentFingerprintIssues;
-const incidentStateWorkflowId = 315630665;
+const incidentStateWorkflowId = releaseHealthIncidentProducerPolicies.nativeSchedule.workflowId;
 
 class ScheduledIncidentStateReinitializationError extends Error {
   constructor() {
@@ -97,6 +102,8 @@ const currentRepository = String(process.env.GITHUB_REPOSITORY || '');
 const currentRepoName = currentRepository.startsWith(owner + '/') ? currentRepository.slice(owner.length + 1) : '';
 const currentRunId = numericIdentifier(process.env.GITHUB_RUN_ID);
 const currentRunAttempt = numericIdentifier(process.env.GITHUB_RUN_ATTEMPT);
+const currentTriggerEvent = String(process.env.GITHUB_EVENT_NAME || '').trim();
+const currentWorkflowHeadSha = String(process.env.GITHUB_SHA || '').trim().toLowerCase();
 export function releaseHealthPageLimits(mode) {
   if (!['continuous', 'incident'].includes(mode)) {
     throw new Error('Release-health page-limit mode is invalid.');
@@ -433,7 +440,7 @@ const legacyMonitorTitle = 'Scale Small AI Release Health Monitor';
 const legacySnapshotWorkflowSourceSha256 = '0faccc93dd783cd0c76ecd837bcd5bb6cbb046b2670a0f7f41d039e433c49b04';
 const legacyBoundedWorkflowSourceSha256 = '1adbb7b1738f9562968a644b8854bf7fc04496eea976809cae83429204f14858';
 export const auditedPriorMonitorWorkflowSourceSha256 = '3672ed17290279e20d75336e810d9327a59786c16a77332aa5be2f4adb0238a1';
-export const currentMonitorWorkflowSourceSha256 = 'bd79fba783a2c5b7aeb6cbe645153ab4f932bf86fd4da159162b552065059be3';
+export const currentMonitorWorkflowSourceSha256 = 'cc8371a32d055c7c515afd9dc947e486fc11d5e23fb609c1a4d74ff62048e1a2';
 const auditedMonitorSourceEvidence = new Map([
   ['82fc98124d0b5412e3591c9357da76ba7f324737', {
     workflowSourceSha256: legacySnapshotWorkflowSourceSha256,
@@ -493,6 +500,8 @@ const auditedMonitorOrigin = (
     throw new Error('Audited monitor source evidence is missing or inconsistent for ' + headSha + '.');
   }
   return {
+    workflowId: releaseHealthMonitorWorkflowIdentities.active.workflowId,
+    workflowPath: releaseHealthMonitorWorkflowIdentities.active.path,
     runId,
     runAttempt,
     checkRunId,
@@ -506,6 +515,8 @@ const auditedMonitorOrigin = (
     ...(coverageStartedAt ? { coverageStartedAt } : {}),
   };
 };
+const activeReleaseHealthPolicyKey = 'SSAI_Shared:'
+  + releaseHealthMonitorWorkflowIdentities.active.workflowId;
 const forwardFixRecoveryPolicies = new Map([
   // The automatic R&R deployment failed before deployment on the pre-fix main
   // commit. The exact current-main manual run completed the same release path.
@@ -529,17 +540,24 @@ const forwardFixRecoveryPolicies = new Map([
     jobNames: ['verify-production'],
     recoveryDisplayTitles: ['Production n8n workflow exactness'],
   }],
-  ['SSAI_Shared:315630665', {
-    workflowId: 315630665,
-    path: '.github/workflows/release-health-monitor.yml',
+  [activeReleaseHealthPolicyKey, {
+    workflowId: releaseHealthMonitorWorkflowIdentities.active.workflowId,
+    path: releaseHealthMonitorWorkflowIdentities.active.path,
     sourceSha256: currentMonitorWorkflowSourceSha256,
     headRepository: 'ScaleSmall/SSAI_Shared',
     failedEvents: ['schedule'],
     recoveryEvents: ['workflow_dispatch'],
-    jobNames: ['Verify current organization release health'],
+    jobNames: [
+      releaseHealthMonitorJobNames.scan,
+      releaseHealthMonitorJobNames.delivery,
+    ],
     recoveryDisplayTitles: ['Release health monitor [incident:168h]'],
     monitorSelfRecoveryContract: 'release-health-monitor-v1',
     monitorSelfRecoveryEvents: ['schedule', 'workflow_dispatch'],
+    monitorWorkflowIdentities: Object.freeze([
+      releaseHealthMonitorWorkflowIdentities.active,
+      releaseHealthMonitorWorkflowIdentities.predecessor,
+    ]),
     // Exact, immutable attempts whose pre-run-name coverage and failure
     // predicates were reconstructed from GitHub metadata, logs, and the source
     // at each default-branch commit. No unlisted generic title is trusted.
@@ -624,7 +642,7 @@ if (stateHmacEpoch !== 'v1') throw new Error('SSAI_RELEASE_MONITOR_STATE_HMAC_EP
 if (!/^[a-f0-9]{64}$/.test(expectedInventorySha256)) {
   throw new Error('SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256 must be an exact lowercase SHA-256 digest.');
 }
-const triggerEvent = String(process.env.GITHUB_EVENT_NAME || '').trim();
+const triggerEvent = currentTriggerEvent;
 const scheduledStateEnabled = scheduledIncidentStateEnabled(scanMode, triggerEvent);
 const previousIncidentState = scheduledStateEnabled ? await loadScheduledIncidentState() : null;
 
@@ -751,10 +769,15 @@ const summary = {
   warnings,
 };
 
+const stateProducers = rows.map((row) => row.incident_state_producer).filter(Boolean);
+if (scheduledStateEnabled && stateProducers.length !== 1) {
+  throw new Error('Scheduled incident state requires exactly one provider-attested producer run.');
+}
 const notificationState = await applyScheduledIncidentState({
   enabled: scheduledStateEnabled,
   previous: previousIncidentState,
   failures,
+  producer: stateProducers[0] || null,
 });
 Object.assign(summary, notificationState.summary);
 if (notificationState.suppressed) {
@@ -801,6 +824,19 @@ async function inspectRepository(repo) {
   const recentBranchCommits = branchCommitGroups.flat();
   const recentPullCommits = pullCommitGroups.flat();
   const recentRuns = associateWorkflowRunsWithPulls(rawRecentRuns, recentPullCommits);
+  const incidentStateProducer = repo.name === currentRepoName && currentTriggerEvent === 'schedule'
+    ? validateScheduledIncidentProducerRun(
+      recentRuns.find((run) => Number(run.id) === currentRunId
+        && Number(run.run_attempt) === currentRunAttempt),
+      {
+        repository: currentRepository,
+        defaultBranch,
+        headSha: currentWorkflowHeadSha,
+        runId: currentRunId,
+        runAttempt: currentRunAttempt,
+      },
+    )
+    : null;
 
   const workflows = allWorkflows.filter((workflow) => workflow.state === 'active');
   const verifiedAuthorizedDisabledHolds = await resolveAuthorizedDisabledWorkflowHolds(
@@ -997,7 +1033,7 @@ async function inspectRepository(repo) {
   const currentChecks = latestChecks.map((check) => {
     const activeDisposition = releaseHealthActiveCheckDisposition(check, nowMs, stuckMs);
     const conclusion = String(check.conclusion || '');
-    const policy = verifiedForwardFixPolicies.get(Number(check.workflow_id));
+    const policy = recoveryPolicyForWorkflowIdentity(verifiedForwardFixPolicies, check.workflow_id);
     const trustedMonitorPolicy = isTrustedMonitorRecoveryPolicy(policy) ? policy : null;
     const trustedMonitorRecovery = !trustedMonitorPolicy ? null : findTrustedMonitorCheckRecovery(
       check,
@@ -1123,6 +1159,7 @@ async function inspectRepository(repo) {
     repo: repo.name,
     default_branch: defaultBranch,
     head_sha: headSha,
+    incident_state_producer: incidentStateProducer,
     workflows: workflowHealth,
     authorized_disabled_workflow_holds: verifiedAuthorizedDisabledHolds,
     checks: currentChecks,
@@ -1373,7 +1410,7 @@ async function resolveForwardFixRecoveryPolicies(repoName, workflows, headSha, {
     await mapLimit(auditedHeads, 2, async (originHeadSha) => {
       const origin = policy.auditedMonitorOrigins.find((candidate) => candidate.headSha === originHeadSha);
       const [originWorkflowSource, scriptSource, utilsSource, deliverySource] = await Promise.all([
-        collectWorkflowSource(repoName, policy.path, originHeadSha),
+        collectWorkflowSource(repoName, origin.workflowPath, originHeadSha),
         collectMonitorImplementationSource(repoName, 'scripts/verify-org-release-health.mjs', originHeadSha),
         collectMonitorImplementationSource(
           repoName,
@@ -1435,6 +1472,22 @@ async function resolveForwardFixRecoveryPolicies(repoName, workflows, headSha, {
   return verified;
 }
 
+function recoveryPolicyForWorkflowIdentity(policies, workflowId) {
+  if (!(policies instanceof Map)) throw new TypeError('recovery policies must be a Map');
+  const normalizedWorkflowId = Number(workflowId);
+  if (!Number.isSafeInteger(normalizedWorkflowId) || normalizedWorkflowId < 1) return null;
+  const direct = policies.get(normalizedWorkflowId);
+  if (direct) return direct;
+  const matches = [...policies.values()].filter((policy) => (
+    isTrustedMonitorRecoveryPolicy(policy)
+    && policy.monitorWorkflowIdentities.some((identity) => identity.workflowId === normalizedWorkflowId)
+  ));
+  if (matches.length > 1) {
+    throw new Error('Multiple recovery policies claim workflow identity ' + normalizedWorkflowId + '.');
+  }
+  return matches[0] || null;
+}
+
 async function addVerifiedForwardFixOriginShas({
   repoName,
   runs,
@@ -1445,7 +1498,7 @@ async function addVerifiedForwardFixOriginShas({
 }) {
   const candidates = [...new Set(runs
     .filter((run) => {
-      const policy = policies.get(Number(run.workflow_id));
+      const policy = recoveryPolicyForWorkflowIdentity(policies, run.workflow_id);
       const eligibleOriginEvents = policy
         ? new Set([...policy.failedEvents, ...(policy.monitorSelfRecoveryEvents || [])])
         : null;
@@ -1489,7 +1542,7 @@ async function attestTrustedMonitorRecoverySuccesses({
 }) {
   const candidates = new Map();
   for (const run of runs) {
-    const policy = policies.get(Number(run.workflow_id));
+    const policy = recoveryPolicyForWorkflowIdentity(policies, run.workflow_id);
     const headSha = String(run.head_sha || '').toLowerCase();
     if (headSha === String(currentHeadSha || '').toLowerCase()
       || !isExactManualIncidentRecoveryRun(run, policy, defaultBranch)
@@ -1903,7 +1956,7 @@ export function isExactManualIncidentRecoveryCheck(check, policy, defaultBranch)
     && check?.event === 'workflow_dispatch'
     && check?.status === 'completed'
     && check?.conclusion === 'success'
-    && check?.name === 'Verify current organization release health'
+    && check?.name === releaseHealthMonitorJobNames.scan
     && check?.source_run_display_title === 'Release health monitor [incident:168h]';
 }
 
@@ -1917,7 +1970,7 @@ function reconcileWorkflowFailures(repoName, runs, {
   for (const run of runs.filter((candidate) => candidate.status === 'completed'
     && failedConclusions.has(String(candidate.conclusion || ''))
     && recordActivityTime(candidate) >= cutoffMs)) {
-    const policy = policies.get(Number(run.workflow_id));
+    const policy = recoveryPolicyForWorkflowIdentity(policies, run.workflow_id);
     const trustedMonitorPolicy = isTrustedMonitorRecoveryPolicy(policy) ? policy : null;
     const policyBoundRecovery = findPolicyBoundWorkflowRecovery(
       run,
@@ -2026,7 +2079,7 @@ function reconcileCheckFailures(repoName, checks, deploymentStatuses, pullByNumb
   for (const check of checks.filter((candidate) => candidate.status === 'completed'
     && failedConclusions.has(String(candidate.conclusion || ''))
     && releaseHealthCheckRecentActivityTime(candidate) >= cutoffMs)) {
-    const policy = policies.get(Number(check.workflow_id));
+    const policy = recoveryPolicyForWorkflowIdentity(policies, check.workflow_id);
     const trustedMonitorPolicy = isTrustedMonitorRecoveryPolicy(policy) ? policy : null;
     const policyBoundRecovery = findPolicyBoundCheckRecovery(
       check,
@@ -2583,7 +2636,14 @@ export function evaluateScheduledIncidentTransition(previous, current) {
   return Object.freeze({ changed, improved, suppressed });
 }
 
-export function evaluateIncidentNotification(mode, event, previous, currentFailures, authenticationKey = '') {
+export function evaluateIncidentNotification(
+  mode,
+  event,
+  previous,
+  currentFailures,
+  authenticationKey = '',
+  producer = null,
+) {
   const current = fingerprintReleaseHealthIncident(currentFailures);
   if (!scheduledIncidentStateEnabled(mode, event)) {
     return Object.freeze({
@@ -2592,7 +2652,34 @@ export function evaluateIncidentNotification(mode, event, previous, currentFailu
       changed: false,
       improved: false,
       suppressed: false,
+      stateMigrationRequired: false,
+      statePersistenceRequired: false,
       stateWriteRequired: false,
+      notificationReconciliationRequired: false,
+      staleProducerSuppressed: false,
+      producerAuthorityAdvanced: false,
+    });
+  }
+  if (producer !== null) {
+    normalizedScheduledIncidentProducerAuthority(
+      producer,
+      'Current scheduled incident producer authority',
+    );
+  }
+  if (producer !== null && previous?.producerAuthority
+    && compareScheduledIncidentProducerAuthority(producer, previous.producerAuthority) <= 0) {
+    return Object.freeze({
+      enabled: true,
+      current,
+      changed: false,
+      improved: false,
+      suppressed: current.status === 'incident',
+      stateMigrationRequired: false,
+      statePersistenceRequired: false,
+      stateWriteRequired: false,
+      notificationReconciliationRequired: false,
+      staleProducerSuppressed: true,
+      producerAuthorityAdvanced: false,
     });
   }
   if (previous?.notificationStateHmac) {
@@ -2609,13 +2696,21 @@ export function evaluateIncidentNotification(mode, event, previous, currentFailu
     const improved = hasClusterComparison && !exact && current.status === 'incident'
       ? persistedStateContainsEveryCurrentCluster(previous, current, authenticationKey)
       : false;
+    const stateMigrationRequired = previous.requiresMigration === true;
+    const producerAuthorityAdvanced = Boolean(producer !== null && previous?.producerAuthority);
+    const statePersistenceRequired = stateMigrationRequired || changed || producerAuthorityAdvanced;
     return Object.freeze({
       enabled: true,
       current,
       changed,
       improved,
       suppressed: current.status === 'incident' && (exact || improved),
-      stateWriteRequired: previous.requiresMigration === true || changed,
+      stateMigrationRequired,
+      statePersistenceRequired,
+      stateWriteRequired: statePersistenceRequired,
+      notificationReconciliationRequired: true,
+      staleProducerSuppressed: false,
+      producerAuthorityAdvanced,
     });
   }
   const transition = evaluateScheduledIncidentTransition(previous, current);
@@ -2623,7 +2718,12 @@ export function evaluateIncidentNotification(mode, event, previous, currentFailu
     enabled: true,
     current,
     ...transition,
+    stateMigrationRequired: false,
+    statePersistenceRequired: transition.changed,
     stateWriteRequired: transition.changed,
+    notificationReconciliationRequired: true,
+    staleProducerSuppressed: false,
+    producerAuthorityAdvanced: false,
   });
 }
 
@@ -2644,6 +2744,78 @@ export function notificationStateHmac(snapshot, authenticationKey, createdAt = '
       ? 'release-health-notification-state-v2\n' + salt + '\n' + canonical
       : 'release-health-notification-state-v1\n' + canonical)
     .digest('hex');
+}
+
+export function validateScheduledIncidentProducerRun(run, expected) {
+  if (!run || typeof run !== 'object' || Array.isArray(run)
+    || !expected || typeof expected !== 'object' || Array.isArray(expected)) {
+    throw new Error('Scheduled incident producer run evidence is missing.');
+  }
+  const runId = String(run.id ?? '').trim();
+  const runAttempt = Number(run.run_attempt);
+  const workflowId = Number(run.workflow_id);
+  const event = String(run.event || '').trim();
+  const repository = String(run.repository?.full_name || '').trim();
+  const headBranch = String(run.head_branch || '').trim();
+  const headSha = String(run.head_sha || '').trim().toLowerCase();
+  const createdAt = canonicalGitHubTimestamp(run.created_at);
+  const producer = resolveReleaseHealthIncidentProducer({
+    workflowId,
+    path: releaseHealthIncidentProducerPolicies.nativeSchedule.path,
+    event,
+  });
+  if (!producer
+    || !/^[1-9][0-9]{0,19}$/.test(runId)
+    || runId !== String(expected.runId || '')
+    || !Number.isSafeInteger(runAttempt) || runAttempt < 1
+    || runAttempt !== Number(expected.runAttempt)
+    || repository !== expected.repository
+    || headBranch !== expected.defaultBranch
+    || !/^[a-f0-9]{40}$/.test(headSha)
+    || headSha !== String(expected.headSha || '').toLowerCase()
+    || !createdAt) {
+    throw new Error('Scheduled incident producer run failed provider provenance validation.');
+  }
+  return Object.freeze({
+    ...producer,
+    runId,
+    runAttempt,
+    headSha,
+    createdAt,
+  });
+}
+
+function normalizedScheduledIncidentProducerAuthority(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(label + ' is missing.');
+  }
+  const createdAt = canonicalGitHubTimestamp(value.createdAt);
+  const runId = String(value.runId || '').trim();
+  const runAttempt = Number(value.runAttempt);
+  if (!createdAt
+    || !/^[1-9][0-9]{0,19}$/.test(runId)
+    || !Number.isSafeInteger(runAttempt) || runAttempt < 1) {
+    throw new Error(label + ' is invalid.');
+  }
+  return Object.freeze({ createdAt, runId, runAttempt });
+}
+
+export function compareScheduledIncidentProducerAuthority(candidate, prior) {
+  const exactCandidate = normalizedScheduledIncidentProducerAuthority(
+    candidate,
+    'Candidate scheduled incident producer authority',
+  );
+  const exactPrior = normalizedScheduledIncidentProducerAuthority(
+    prior,
+    'Prior scheduled incident producer authority',
+  );
+  const createdDelta = Date.parse(exactCandidate.createdAt) - Date.parse(exactPrior.createdAt);
+  if (createdDelta !== 0) return createdDelta < 0 ? -1 : 1;
+  const candidateRunId = BigInt(exactCandidate.runId);
+  const priorRunId = BigInt(exactPrior.runId);
+  if (candidateRunId !== priorRunId) return candidateRunId < priorRunId ? -1 : 1;
+  if (exactCandidate.runAttempt === exactPrior.runAttempt) return 0;
+  return exactCandidate.runAttempt < exactPrior.runAttempt ? -1 : 1;
 }
 
 async function loadScheduledIncidentState() {
@@ -2670,8 +2842,6 @@ export function decodeScheduledIncidentStateOrNull(bytes, matchedKey, context, a
   if (!context || typeof context !== 'object' || !String(context.cachePrefix || '')) {
     throw new Error('Scheduled incident state context is missing.');
   }
-  const cacheKey = String(matchedKey || '');
-  scheduledIncidentCacheSource(cacheKey, context);
   try {
     return decodeScheduledIncidentState(bytes, matchedKey, context, authenticationKey);
   } catch {
@@ -2682,6 +2852,7 @@ export function decodeScheduledIncidentStateOrNull(bytes, matchedKey, context, a
 function scheduledIncidentCacheSource(cacheKey, context) {
   const sources = [
     { version: 'current', prefix: String(context.cachePrefix || '') },
+    { version: 'predecessor', prefix: String(context.predecessorCachePrefix || '') },
     { version: 'previous', prefix: String(context.previousCachePrefix || '') },
     { version: 'legacy', prefix: String(context.legacyCachePrefix || '') },
   ];
@@ -2697,6 +2868,7 @@ export function decodeScheduledIncidentState(bytes, matchedKey, context, authent
   if (!context || typeof context !== 'object' || !String(context.cachePrefix || '')) {
     throw new Error('Scheduled incident state context is missing.');
   }
+  validateScheduledIncidentStateIdentityContext(context);
   const cacheKey = String(matchedKey || '');
   const cacheSource = scheduledIncidentCacheSource(cacheKey, context);
   const identityMatch = /^at-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)$/
@@ -2730,23 +2902,39 @@ export function decodeScheduledIncidentState(bytes, matchedKey, context, authent
       requiresMigration: true,
     });
   }
+  if (cacheSource.version === 'predecessor') {
+    validatePredecessorPersistedIncidentState(state, context, identityMatch[1], authenticationKey);
+    return Object.freeze({
+      notificationStateHmac: state.notification_state_hmac_sha256,
+      notificationClusterTokens: Object.freeze([...state.notification_cluster_hmac_tokens]),
+      incidentDeliveryIdentity: state.delivery_identity,
+      createdAt: state.created_at,
+      requiresMigration: true,
+    });
+  }
   validatePersistedIncidentState(state, context, identityMatch[1], authenticationKey);
   return Object.freeze({
     notificationStateHmac: state.notification_state_hmac_sha256,
     notificationClusterTokens: Object.freeze([...state.notification_cluster_hmac_tokens]),
     incidentDeliveryIdentity: state.delivery_identity,
+    producerAuthority: Object.freeze({
+      createdAt: state.producer_created_at,
+      runId: String(state.producer_run_id),
+      runAttempt: Number(state.producer_run_attempt),
+    }),
     createdAt: state.created_at,
     requiresMigration: false,
   });
 }
 
-async function applyScheduledIncidentState({ enabled, previous, failures: currentFailures }) {
+async function applyScheduledIncidentState({ enabled, previous, failures: currentFailures, producer }) {
   const decision = evaluateIncidentNotification(
     scanMode,
     enabled ? 'schedule' : String(process.env.GITHUB_EVENT_NAME || '').trim(),
     previous,
     currentFailures,
     enabled ? stateHmacKey : '',
+    enabled ? producer : null,
   );
   const { current } = decision;
   if (!decision.enabled) {
@@ -2758,31 +2946,72 @@ async function applyScheduledIncidentState({ enabled, previous, failures: curren
   }
 
   let cacheKey = '';
-  // Issue delivery happens only after this state is durably saved. Reuse the
-  // persisted identity so a later suppressed scan can repair a failed write.
-  let incidentDeliveryIdentity = previous?.incidentDeliveryIdentity || '';
-  if (decision.stateWriteRequired) {
-    ({ cacheKey, incidentDeliveryIdentity } = await persistScheduledIncidentState(current));
+  if (!producer || typeof producer !== 'object') {
+    throw new Error('Scheduled incident state persistence requires provider-attested producer evidence.');
   }
-  incidentDeliveryIdentity = parseReleaseHealthDeliveryIdentity(incidentDeliveryIdentity).identity;
+  const currentDeliveryIdentity = releaseHealthDeliveryIdentity(currentRunId, currentRunAttempt);
+  // Issue delivery happens only after this state is durably saved. An unchanged,
+  // authenticated predecessor preserves its delivery identity across the schema
+  // rewrite; every semantic state change is bound to this run and attempt. The
+  // reconciliation candidate output remains bound to the current run regardless.
+  const persistedStateDeliveryIdentity = scheduledIncidentPersistenceDeliveryIdentity(
+    decision,
+    previous,
+    currentDeliveryIdentity,
+  );
+  if (decision.statePersistenceRequired) {
+    ({ cacheKey } = await persistScheduledIncidentState(
+      current,
+      persistedStateDeliveryIdentity,
+      producer,
+    ));
+  }
+  const incidentDeliveryIdentity = parseReleaseHealthDeliveryIdentity(currentDeliveryIdentity).identity;
   const summary = incidentStateSummary(
-    'deduplicate-unchanged-and-improving-scheduled-incident',
+    decision.staleProducerSuppressed
+      ? 'suppress-non-authoritative-scheduled-producer'
+      : 'deduplicate-unchanged-and-improving-scheduled-incident',
     current,
     decision.changed,
     decision.suppressed,
     decision.improved,
   );
   await writeIncidentStateOutputs(
-    decision.stateWriteRequired,
+    decision.changed,
+    decision.statePersistenceRequired,
     cacheKey,
     incidentDeliveryIdentity,
     summary,
+    decision.notificationReconciliationRequired,
   );
   return {
     suppressed: decision.suppressed,
     improved: decision.improved,
     summary,
   };
+}
+
+export function scheduledIncidentPersistenceDeliveryIdentity(
+  decision,
+  previous,
+  currentDeliveryIdentity,
+) {
+  if (!decision || typeof decision !== 'object'
+    || typeof decision.changed !== 'boolean'
+    || typeof decision.stateMigrationRequired !== 'boolean'
+    || typeof decision.statePersistenceRequired !== 'boolean'
+    || typeof decision.producerAuthorityAdvanced !== 'boolean'
+    || decision.statePersistenceRequired !== (
+      decision.changed || decision.stateMigrationRequired || decision.producerAuthorityAdvanced
+    )) {
+    throw new Error('Scheduled incident persistence decision is invalid.');
+  }
+  const exactCurrentIdentity = parseReleaseHealthDeliveryIdentity(currentDeliveryIdentity).identity;
+  const previousIdentity = previous?.incidentDeliveryIdentity
+    ? parseReleaseHealthDeliveryIdentity(previous.incidentDeliveryIdentity).identity
+    : '';
+  if (!decision.changed && previousIdentity) return previousIdentity;
+  return exactCurrentIdentity;
 }
 
 function incidentStateSummary(policy, current, changed, suppressed, improved) {
@@ -2804,23 +3033,23 @@ function incidentStateSummary(policy, current, changed, suppressed, improved) {
   };
 }
 
-async function persistScheduledIncidentState(current) {
-  const context = scheduledIncidentStateContext();
+async function persistScheduledIncidentState(current, incidentDeliveryIdentity, producer) {
+  const context = scheduledIncidentStateContext(producer);
   const createdAt = new Date().toISOString();
-  const incidentDeliveryIdentity = releaseHealthDeliveryIdentity(currentRunId, currentRunAttempt);
+  const exactIncidentDeliveryIdentity = parseReleaseHealthDeliveryIdentity(incidentDeliveryIdentity).identity;
   const state = createScheduledIncidentStateRecord(
     current,
     context,
     stateHmacKey,
     createdAt,
-    incidentDeliveryIdentity,
+    exactIncidentDeliveryIdentity,
   );
   const bytes = Buffer.from(JSON.stringify(state, null, 2) + '\n', 'utf8');
   if (bytes.length > maxIncidentStateBytes) throw new Error('Scheduled incident state exceeds its write-size bound.');
   const cacheKey = context.cachePrefix + 'at-' + createdAt.replace(/[:.]/g, '-');
   await mkdir(dirname(context.statePath), { recursive: true, mode: 0o700 });
   await writeFile(context.statePath, bytes, { mode: 0o600 });
-  return Object.freeze({ cacheKey, incidentDeliveryIdentity });
+  return Object.freeze({ cacheKey, incidentDeliveryIdentity: exactIncidentDeliveryIdentity });
 }
 
 export function createScheduledIncidentStateRecord(
@@ -2832,10 +3061,12 @@ export function createScheduledIncidentStateRecord(
 ) {
   validateIncidentSnapshot(current, 'current scheduled incident state');
   if (!context || typeof context !== 'object' || !Number.isSafeInteger(context.repositoryId)
-    || context.repositoryId < 1 || !context.repository || !context.workflowRef || !context.ref
-    || context.hmacEpoch !== 'v1') {
+    || context.repositoryId < 1 || context.hmacEpoch !== 'v1') {
     throw new Error('Scheduled incident state record context is invalid.');
   }
+  validateScheduledIncidentStateIdentityContext(context);
+  const expectedProducer = resolveReleaseHealthIncidentProducer(context.producer);
+  const producerExecution = validateScheduledIncidentProducerExecution(context.producer, expectedProducer);
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(String(createdAt || ''))) {
     throw new Error('Scheduled incident state record timestamp is invalid.');
   }
@@ -2844,7 +3075,17 @@ export function createScheduledIncidentStateRecord(
     schema: incidentStateSchema,
     repository_id: context.repositoryId,
     repository: context.repository,
+    workflow_id: context.workflowId,
     workflow_ref: context.workflowRef,
+    producer_policy: producerExecution.policy,
+    producer_kind: producerExecution.kind,
+    producer_workflow_id: producerExecution.workflowId,
+    producer_workflow_path: producerExecution.path,
+    producer_event: producerExecution.event,
+    producer_run_id: producerExecution.runId,
+    producer_run_attempt: producerExecution.runAttempt,
+    producer_head_sha: producerExecution.headSha,
+    producer_created_at: producerExecution.createdAt,
     ref: context.ref,
     notification_state_hmac_sha256: notificationStateHmac(current, authenticationKey, createdAt),
     notification_cluster_hmac_tokens: persistedNotificationClusterTokens(
@@ -2856,7 +3097,7 @@ export function createScheduledIncidentStateRecord(
     state_hmac_epoch: context.hmacEpoch,
     created_at: createdAt,
     scan_mode: 'continuous',
-    trigger_event: 'schedule',
+    trigger_event: producerExecution.event,
   };
   return Object.freeze({
     ...unsignedState,
@@ -2864,23 +3105,41 @@ export function createScheduledIncidentStateRecord(
   });
 }
 
-async function writeIncidentStateOutputs(stateWriteRequired, cacheKey, incidentDeliveryIdentity, summary) {
+async function writeIncidentStateOutputs(
+  stateChanged,
+  statePersistenceRequired,
+  cacheKey,
+  incidentDeliveryIdentity,
+  summary,
+  notificationReconciliationRequired = true,
+) {
   const outputPath = process.env.GITHUB_OUTPUT;
   if (!outputPath) return;
   const lines = incidentStateOutputLines(
-    stateWriteRequired,
+    stateChanged,
+    statePersistenceRequired,
     cacheKey,
     incidentDeliveryIdentity,
     summary,
+    notificationReconciliationRequired,
   );
   await appendFile(outputPath, lines.join('\n') + '\n', 'utf8');
 }
 
-export function incidentStateOutputLines(stateWriteRequired, cacheKey, incidentDeliveryIdentity, summary) {
-  if (typeof stateWriteRequired !== 'boolean') {
+export function incidentStateOutputLines(
+  stateChanged,
+  statePersistenceRequired,
+  cacheKey,
+  incidentDeliveryIdentity,
+  summary,
+  notificationReconciliationRequired = true,
+) {
+  if (typeof stateChanged !== 'boolean' || typeof statePersistenceRequired !== 'boolean'
+    || (stateChanged && !statePersistenceRequired)) {
     throw new Error('Scheduled incident state-change output is invalid.');
   }
-  if (!summary || !['healthy', 'incident'].includes(summary.incident_state)
+  if (typeof notificationReconciliationRequired !== 'boolean'
+    || !summary || !['healthy', 'incident'].includes(summary.incident_state)
     || !['known-incident-suppressed', 'incident-improved-suppressed', 'new-or-worsened-incident', 'healthy']
       .includes(summary.notification_outcome)) {
     throw new Error('Scheduled incident delivery output is invalid.');
@@ -2889,14 +3148,15 @@ export function incidentStateOutputLines(stateWriteRequired, cacheKey, incidentD
   const lines = [
     'scan_completed=true',
     'health_degraded=' + (summary.notification_outcome === 'new-or-worsened-incident' ? 'true' : 'false'),
-    'incident_state_changed=' + (stateWriteRequired ? 'true' : 'false'),
+    'incident_state_changed=' + (stateChanged ? 'true' : 'false'),
+    'state_persistence_required=' + (statePersistenceRequired ? 'true' : 'false'),
     'incident_state=' + summary.incident_state,
     'notification_outcome=' + summary.notification_outcome,
-    'notification_reconciliation_required=true',
+    'notification_reconciliation_required=' + (notificationReconciliationRequired ? 'true' : 'false'),
     'incident_delivery_identity=' + exactIncidentDeliveryIdentity,
   ];
-  if (stateWriteRequired) {
-    if (!/^ssai-release-health-state-v4-v1-at-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/.test(cacheKey)) {
+  if (statePersistenceRequired) {
+    if (!/^ssai-release-health-state-v6-v1-at-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/.test(cacheKey)) {
       throw new Error('Scheduled incident state cache key is unsafe for workflow output.');
     }
     lines.push('incident_state_cache_key=' + cacheKey);
@@ -2906,7 +3166,7 @@ export function incidentStateOutputLines(stateWriteRequired, cacheKey, incidentD
   return Object.freeze(lines);
 }
 
-function scheduledIncidentStateContext() {
+function scheduledIncidentStateContext(producerExecution = null) {
   const repositoryId = numericIdentifier(process.env.GITHUB_REPOSITORY_ID);
   if (!repositoryId) throw new Error('GITHUB_REPOSITORY_ID is required for scheduled incident state isolation.');
   if (!currentRepository || currentRepoName !== 'SSAI_Shared') {
@@ -2922,11 +3182,24 @@ function scheduledIncidentStateContext() {
   if (!/^[A-Za-z0-9._/-]+$/.test(defaultBranch) || ref !== 'refs/heads/' + defaultBranch) {
     throw new Error('Scheduled incident state is restricted to the repository default branch.');
   }
-  const expectedWorkflowRef = currentRepository + '/.github/workflows/release-health-monitor.yml@' + ref;
+  const event = String(process.env.GITHUB_EVENT_NAME || '').trim();
+  const producer = resolveReleaseHealthIncidentProducer({
+    workflowId: releaseHealthIncidentProducerPolicies.nativeSchedule.workflowId,
+    path: releaseHealthIncidentProducerPolicies.nativeSchedule.path,
+    event,
+  });
+  if (!producer) {
+    throw new Error('Scheduled incident state producer is not authorized.');
+  }
+  const exactProducer = producerExecution === null
+    ? producer
+    : validateScheduledIncidentProducerExecution(producerExecution, producer);
+  const expectedWorkflowRef = currentRepository + '/' + producer.path + '@' + ref;
   if (!/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(ref) || workflowRef !== expectedWorkflowRef) {
     throw new Error('Scheduled incident state workflow/ref provenance is invalid.');
   }
-  const expectedCachePrefix = 'ssai-release-health-state-v4-' + hmacEpoch + '-';
+  const expectedCachePrefix = 'ssai-release-health-state-v6-' + hmacEpoch + '-';
+  const predecessorCachePrefix = 'ssai-release-health-state-v4-' + hmacEpoch + '-';
   const previousCachePrefix = 'ssai-release-health-state-v3-' + hmacEpoch + '-';
   const legacyCachePrefix = 'ssai-release-health-state-v2-' + hmacEpoch + '-';
   const cachePrefix = String(process.env.SSAI_RELEASE_MONITOR_STATE_CACHE_PREFIX || '').trim();
@@ -2942,9 +3215,14 @@ function scheduledIncidentStateContext() {
   return {
     repositoryId,
     repository: currentRepository,
+    workflowId: producer.workflowId,
     workflowRef,
+    producer: exactProducer,
+    predecessorWorkflowRef: currentRepository + '/'
+      + releaseHealthIncidentProducerPolicies.nativeSchedule.path + '@' + ref,
     ref,
     cachePrefix,
+    predecessorCachePrefix,
     previousCachePrefix,
     legacyCachePrefix,
     statePath,
@@ -2955,8 +3233,10 @@ function scheduledIncidentStateContext() {
 function validatePersistedIncidentState(state, context, cacheTimestamp, authenticationKey) {
   validateScheduledIncidentStateFields(state, [
     'created_at', 'delivery_identity', 'notification_cluster_hmac_tokens', 'notification_state_hmac_sha256',
-    'ref', 'repository', 'repository_id', 'scan_mode', 'schema', 'state_hmac_epoch', 'state_hmac_sha256',
-    'trigger_event', 'workflow_ref',
+    'producer_created_at', 'producer_event', 'producer_head_sha', 'producer_kind', 'producer_policy',
+    'producer_run_attempt', 'producer_run_id', 'producer_workflow_id', 'producer_workflow_path', 'ref', 'repository',
+    'repository_id', 'scan_mode', 'schema', 'state_hmac_epoch', 'state_hmac_sha256', 'trigger_event',
+    'workflow_id', 'workflow_ref',
   ], 'Scheduled incident state');
   let incidentDeliveryIdentity = '';
   try {
@@ -2964,7 +3244,39 @@ function validatePersistedIncidentState(state, context, cacheTimestamp, authenti
   } catch {
     throw new Error('Scheduled incident state failed provenance validation.');
   }
-  if (state.delivery_identity !== incidentDeliveryIdentity) {
+  const producer = resolveReleaseHealthIncidentProducer({
+    workflowId: state.producer_workflow_id,
+    path: state.producer_workflow_path,
+    event: state.producer_event,
+  });
+  let producerRunIdentity;
+  try {
+    producerRunIdentity = releaseHealthDeliveryIdentity(
+      state.producer_run_id,
+      state.producer_run_attempt,
+    );
+  } catch {
+    throw new Error('Scheduled incident state failed provenance validation.');
+  }
+  const producerCreatedAtMs = Date.parse(String(state.producer_created_at || ''));
+  const stateCreatedAtMs = Date.parse(String(state.created_at || ''));
+  if (state.delivery_identity !== incidentDeliveryIdentity
+    || !producer
+    || state.producer_kind !== producer.kind
+    || state.producer_policy !== producer.policy
+    || state.workflow_id !== producer.workflowId
+    || state.workflow_ref !== context.repository + '/' + producer.path + '@' + context.ref
+    || state.trigger_event !== producer.event
+    || producerRunIdentity !== 'run-' + String(state.producer_run_id)
+      + '-attempt-' + String(state.producer_run_attempt)
+    || !/^[a-f0-9]{40}$/.test(String(state.producer_head_sha || ''))
+    || !canonicalGitHubTimestamp(state.producer_created_at)
+    || !Number.isFinite(producerCreatedAtMs)
+    || !Number.isFinite(stateCreatedAtMs)
+    || producerCreatedAtMs > stateCreatedAtMs
+    || producer.workflowId !== context.producer.workflowId
+    || producer.path !== context.producer.path
+    || producer.event !== context.producer.event) {
     throw new Error('Scheduled incident state failed provenance validation.');
   }
   validatePersistedNotificationClusterTokens(state, 'Scheduled incident state');
@@ -2974,7 +3286,37 @@ function validatePersistedIncidentState(state, context, cacheTimestamp, authenti
     cacheTimestamp,
     authenticationKey,
     incidentStateSchema,
+    context.workflowRef,
+    context.producer.event,
     'Scheduled incident state',
+  );
+}
+
+function validatePredecessorPersistedIncidentState(state, context, cacheTimestamp, authenticationKey) {
+  validateScheduledIncidentStateFields(state, [
+    'created_at', 'delivery_identity', 'notification_cluster_hmac_tokens', 'notification_state_hmac_sha256',
+    'ref', 'repository', 'repository_id', 'scan_mode', 'schema', 'state_hmac_epoch', 'state_hmac_sha256',
+    'trigger_event', 'workflow_ref',
+  ], 'Predecessor scheduled incident state');
+  let incidentDeliveryIdentity = '';
+  try {
+    incidentDeliveryIdentity = parseReleaseHealthDeliveryIdentity(state.delivery_identity).identity;
+  } catch {
+    throw new Error('Predecessor scheduled incident state failed provenance validation.');
+  }
+  if (state.delivery_identity !== incidentDeliveryIdentity) {
+    throw new Error('Predecessor scheduled incident state failed provenance validation.');
+  }
+  validatePersistedNotificationClusterTokens(state, 'Predecessor scheduled incident state');
+  validateAuthenticatedIncidentState(
+    state,
+    context,
+    cacheTimestamp,
+    authenticationKey,
+    predecessorIncidentStateSchema,
+    context.predecessorWorkflowRef,
+    'schedule',
+    'Predecessor scheduled incident state',
   );
 }
 
@@ -2990,6 +3332,8 @@ function validatePreviousPersistedIncidentState(state, context, cacheTimestamp, 
     cacheTimestamp,
     authenticationKey,
     previousIncidentStateSchema,
+    context.predecessorWorkflowRef,
+    'schedule',
     'Previous scheduled incident state',
   );
 }
@@ -3012,6 +3356,8 @@ function validateLegacyPersistedIncidentState(state, context, cacheTimestamp, au
     cacheTimestamp,
     authenticationKey,
     legacyIncidentStateSchema,
+    context.predecessorWorkflowRef,
+    'schedule',
     'Legacy scheduled incident state',
   );
 }
@@ -3042,18 +3388,20 @@ function validateAuthenticatedIncidentState(
   cacheTimestamp,
   authenticationKey,
   expectedSchema,
+  expectedWorkflowRef,
+  expectedTriggerEvent,
   label,
 ) {
   const createdAtMs = Date.parse(String(state.created_at || ''));
   if (state.schema !== expectedSchema
     || state.repository_id !== context.repositoryId
     || state.repository !== context.repository
-    || state.workflow_ref !== context.workflowRef
+    || state.workflow_ref !== expectedWorkflowRef
     || state.ref !== context.ref
     || !/^[a-f0-9]{64}$/.test(String(state.notification_state_hmac_sha256 || ''))
     || !Number.isFinite(createdAtMs) || createdAtMs > Date.now() + 5 * 60_000
     || state.scan_mode !== 'continuous'
-    || state.trigger_event !== 'schedule'
+    || state.trigger_event !== expectedTriggerEvent
     || state.created_at.replace(/[:.]/g, '-') !== cacheTimestamp) {
     throw new Error(label + ' failed provenance validation.');
   }
@@ -3068,6 +3416,54 @@ function validateAuthenticatedIncidentState(
     || !timingSafeEqual(Buffer.from(suppliedHmac, 'hex'), Buffer.from(expectedHmac, 'hex'))) {
     throw new ScheduledIncidentStateReinitializationError();
   }
+}
+
+function validateScheduledIncidentStateIdentityContext(context) {
+  const expectedRepository = 'ScaleSmall/SSAI_Shared';
+  const ref = String(context?.ref || '');
+  const hmacEpoch = String(context?.hmacEpoch || '');
+  const expectedProducer = resolveReleaseHealthIncidentProducer(context?.producer || {});
+  const expectedActiveRef = expectedRepository + '/'
+    + releaseHealthIncidentProducerPolicies.nativeSchedule.path + '@' + ref;
+  const expectedPredecessorRef = expectedActiveRef;
+  if (context?.repository !== expectedRepository
+    || !/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(ref)
+    || !expectedProducer
+    || expectedProducer.policy !== releaseHealthIncidentProducerPolicies.nativeSchedule.policy
+    || context.workflowId !== releaseHealthIncidentProducerPolicies.nativeSchedule.workflowId
+    || context.workflowRef !== expectedActiveRef
+    || context.predecessorWorkflowRef !== expectedPredecessorRef
+    || hmacEpoch !== 'v1'
+    || context.cachePrefix !== 'ssai-release-health-state-v6-' + hmacEpoch + '-'
+    || context.predecessorCachePrefix !== 'ssai-release-health-state-v4-' + hmacEpoch + '-'
+    || context.previousCachePrefix !== 'ssai-release-health-state-v3-' + hmacEpoch + '-'
+    || context.legacyCachePrefix !== 'ssai-release-health-state-v2-' + hmacEpoch + '-') {
+    throw new Error('Scheduled incident state workflow identity context is invalid.');
+  }
+}
+
+function validateScheduledIncidentProducerExecution(execution, expectedProducer) {
+  if (!execution || typeof execution !== 'object' || Array.isArray(execution)) {
+    throw new Error('Scheduled incident producer execution is invalid.');
+  }
+  const resolved = resolveReleaseHealthIncidentProducer(execution);
+  const runId = String(execution.runId || '').trim();
+  const runAttempt = Number(execution.runAttempt);
+  const headSha = String(execution.headSha || '').trim().toLowerCase();
+  const createdAt = canonicalGitHubTimestamp(execution.createdAt);
+  if (!resolved
+    || resolved.kind !== expectedProducer.kind
+    || resolved.policy !== expectedProducer.policy
+    || resolved.workflowId !== expectedProducer.workflowId
+    || resolved.path !== expectedProducer.path
+    || resolved.event !== expectedProducer.event
+    || !/^[1-9][0-9]{0,19}$/.test(runId)
+    || !Number.isSafeInteger(runAttempt) || runAttempt < 1
+    || !/^[a-f0-9]{40}$/.test(headSha)
+    || !createdAt) {
+    throw new Error('Scheduled incident producer execution is invalid.');
+  }
+  return Object.freeze({ ...resolved, runId, runAttempt, headSha, createdAt });
 }
 
 function notificationClusterToken(clusterDigest, authenticationKey, createdAt) {
@@ -3588,7 +3984,7 @@ export function isExactSelfMonitorEnvironmentDeployment(repoName, status, defaul
     && status?.source_head_repository === 'ScaleSmall/SSAI_Shared'
     && status?.source_head_branch === defaultBranch
     && ['schedule', 'workflow_dispatch'].includes(String(status?.source_event || ''))
-    && status?.source_check_name === 'Verify current organization release health'
+    && status?.source_check_name === releaseHealthMonitorJobNames.scan
     && /^Release health monitor \[(?:continuous:\d+h|incident:168h)\]$/.test(String(status?.source_run_display_title || ''));
 }
 

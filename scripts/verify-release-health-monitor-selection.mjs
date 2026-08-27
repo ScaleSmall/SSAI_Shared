@@ -45,6 +45,10 @@ import {
   recordOccurrenceTime,
   rateHeadroomDecision,
   releaseHealthDeliveryIdentity,
+  releaseHealthIncidentProducerPolicies,
+  releaseHealthMonitorJobNames,
+  releaseHealthMonitorWorkflowIdentities,
+  resolveReleaseHealthIncidentProducer,
   verifyAuthorizedDisabledWorkflowHold,
   verifyForwardFixRecoveryPolicy,
   workflowStreamIdentity,
@@ -52,6 +56,7 @@ import {
 import {
   decodeScheduledIncidentState,
   decodeScheduledIncidentStateOrNull,
+  compareScheduledIncidentProducerAuthority,
   createScheduledIncidentStateRecord,
   checkFailureEpisodeAnchor,
   durableTrustedMonitorRecoveryChecks,
@@ -77,7 +82,9 @@ import {
   mapLimit,
   renderReleaseHealthStepSummary,
   shouldSetDegradedExitCode,
+  scheduledIncidentPersistenceDeliveryIdentity,
   scheduledIncidentStateEnabled,
+  validateScheduledIncidentProducerRun,
   validateInstallationRepositoryPage,
   validateReleaseHealthActionsRunPage,
   validateReleaseHealthCheckRunPage,
@@ -126,7 +133,8 @@ assert.notEqual(
 assert.deepEqual(
   incidentStateOutputLines(
     true,
-    'ssai-release-health-state-v4-v1-at-2026-08-01T01-02-03-004Z',
+    true,
+    'ssai-release-health-state-v6-v1-at-2026-08-01T01-02-03-004Z',
     incidentDeliveryIdentity,
     {
       incident_state: 'incident',
@@ -137,16 +145,17 @@ assert.deepEqual(
     'scan_completed=true',
     'health_degraded=true',
     'incident_state_changed=true',
+    'state_persistence_required=true',
     'incident_state=incident',
     'notification_outcome=new-or-worsened-incident',
     'notification_reconciliation_required=true',
     'incident_delivery_identity=' + incidentDeliveryIdentity,
-    'incident_state_cache_key=ssai-release-health-state-v4-v1-at-2026-08-01T01-02-03-004Z',
+    'incident_state_cache_key=ssai-release-health-state-v6-v1-at-2026-08-01T01-02-03-004Z',
   ],
   'a durable new-or-worsened state must require delivery and bind the exact cache key',
 );
 assert.deepEqual(
-  incidentStateOutputLines(false, '', incidentDeliveryIdentity, {
+  incidentStateOutputLines(false, false, '', incidentDeliveryIdentity, {
     incident_state: 'incident',
     notification_outcome: 'known-incident-suppressed',
   }),
@@ -154,6 +163,7 @@ assert.deepEqual(
     'scan_completed=true',
     'health_degraded=false',
     'incident_state_changed=false',
+    'state_persistence_required=false',
     'incident_state=incident',
     'notification_outcome=known-incident-suppressed',
     'notification_reconciliation_required=true',
@@ -161,8 +171,32 @@ assert.deepEqual(
   ],
   'an unchanged known incident must still reconcile the managed issue idempotently',
 );
+assert.deepEqual(
+  incidentStateOutputLines(
+    false,
+    true,
+    'ssai-release-health-state-v6-v1-at-2026-08-01T01-02-03-004Z',
+    incidentDeliveryIdentity,
+    {
+      incident_state: 'incident',
+      notification_outcome: 'known-incident-suppressed',
+    },
+  ),
+  [
+    'scan_completed=true',
+    'health_degraded=false',
+    'incident_state_changed=false',
+    'state_persistence_required=true',
+    'incident_state=incident',
+    'notification_outcome=known-incident-suppressed',
+    'notification_reconciliation_required=true',
+    'incident_delivery_identity=' + incidentDeliveryIdentity,
+    'incident_state_cache_key=ssai-release-health-state-v6-v1-at-2026-08-01T01-02-03-004Z',
+  ],
+  'an unchanged predecessor migration must request persistence without reporting a semantic incident change',
+);
 assert.throws(
-  () => incidentStateOutputLines(false, 'unexpected-cache-key', incidentDeliveryIdentity, {
+  () => incidentStateOutputLines(false, false, 'unexpected-cache-key', incidentDeliveryIdentity, {
     incident_state: 'healthy',
     notification_outcome: 'healthy',
   }),
@@ -268,13 +302,13 @@ assert.notEqual(
 );
 const policyFailureAtHeadA = {
   repo: 'SSAI_Shared',
-  owner: '.github/workflows/release-health-monitor.yml',
+  owner: releaseHealthMonitorWorkflowIdentities.active.path,
   problem: 'configured recovery policy workflow is missing or inactive',
   incident_key: {
     repo: 'SSAI_Shared',
     type: 'recovery-policy-workflow-missing',
-    workflow_id: 315630665,
-    workflow_path: '.github/workflows/release-health-monitor.yml',
+    workflow_id: releaseHealthMonitorWorkflowIdentities.active.workflowId,
+    workflow_path: releaseHealthMonitorWorkflowIdentities.active.path,
     head_sha: 'a'.repeat(40),
   },
   notification_key: {
@@ -818,13 +852,13 @@ const selfMonitorDeployment = {
   environment: 'release-health-monitor',
   task: 'deploy',
   identity_source: 'github-actions-job',
-  source_workflow_id: 315630665,
+  source_workflow_id: releaseHealthMonitorWorkflowIdentities.active.workflowId,
   source_run_id: 29799900001,
   source_check_run_id: 88999000001,
   source_head_repository: 'ScaleSmall/SSAI_Shared',
   source_head_branch: 'main',
   source_event: 'schedule',
-  source_check_name: 'Verify current organization release health',
+  source_check_name: releaseHealthMonitorJobNames.scan,
   source_run_display_title: 'Release health monitor [continuous:6h]',
 };
 assert.equal(
@@ -856,9 +890,24 @@ assert.equal(
 const stateContext = {
   repositoryId: 123,
   repository: 'ScaleSmall/SSAI_Shared',
-  workflowRef: 'ScaleSmall/SSAI_Shared/.github/workflows/release-health-monitor.yml@refs/heads/main',
+  workflowId: releaseHealthMonitorWorkflowIdentities.active.workflowId,
+  workflowRef: 'ScaleSmall/SSAI_Shared/' + releaseHealthMonitorWorkflowIdentities.active.path + '@refs/heads/main',
+  producer: {
+    kind: releaseHealthIncidentProducerPolicies.nativeSchedule.kind,
+    policy: releaseHealthIncidentProducerPolicies.nativeSchedule.policy,
+    workflowId: releaseHealthMonitorWorkflowIdentities.active.workflowId,
+    path: releaseHealthMonitorWorkflowIdentities.active.path,
+    event: 'schedule',
+    runId: '30264003709',
+    runAttempt: 1,
+    headSha: 'a'.repeat(40),
+    createdAt: '2026-07-21T17:59:00Z',
+  },
+  predecessorWorkflowRef: 'ScaleSmall/SSAI_Shared/'
+    + releaseHealthMonitorWorkflowIdentities.active.path + '@refs/heads/main',
   ref: 'refs/heads/main',
-  cachePrefix: 'ssai-release-health-state-v4-v1-',
+  cachePrefix: 'ssai-release-health-state-v6-v1-',
+  predecessorCachePrefix: 'ssai-release-health-state-v4-v1-',
   previousCachePrefix: 'ssai-release-health-state-v3-v1-',
   legacyCachePrefix: 'ssai-release-health-state-v2-v1-',
   hmacEpoch: 'v1',
@@ -866,6 +915,81 @@ const stateContext = {
 const stateAuthenticationKey = 'state-hmac-key-'.repeat(4);
 const laterIncidentDeliveryIdentity = 'run-30264003710-attempt-1';
 const worsenedIncidentDeliveryIdentity = 'run-30264003711-attempt-1';
+assert.deepEqual(
+  resolveReleaseHealthIncidentProducer({
+    workflowId: releaseHealthMonitorWorkflowIdentities.active.workflowId,
+    path: releaseHealthMonitorWorkflowIdentities.active.path,
+    event: 'schedule',
+  }),
+  {
+    kind: stateContext.producer.kind,
+    policy: stateContext.producer.policy,
+    workflowId: stateContext.producer.workflowId,
+    path: stateContext.producer.path,
+    event: stateContext.producer.event,
+  },
+  'F2a must authorize only the exact authoritative native schedule producer',
+);
+const providerRunFixture = {
+  id: Number(stateContext.producer.runId),
+  run_attempt: stateContext.producer.runAttempt,
+  workflow_id: stateContext.producer.workflowId,
+  event: stateContext.producer.event,
+  repository: { full_name: stateContext.repository },
+  head_branch: 'main',
+  head_sha: stateContext.producer.headSha,
+  created_at: stateContext.producer.createdAt,
+};
+const providerRunExpected = {
+  repository: stateContext.repository,
+  defaultBranch: 'main',
+  headSha: stateContext.producer.headSha,
+  runId: Number(stateContext.producer.runId),
+  runAttempt: stateContext.producer.runAttempt,
+};
+assert.deepEqual(
+  validateScheduledIncidentProducerRun(providerRunFixture, providerRunExpected),
+  stateContext.producer,
+  'v6 producer metadata must come from the exact provider run record',
+);
+const advancedDefaultBranchHeadSha = 'b'.repeat(40);
+assert.notEqual(
+  advancedDefaultBranchHeadSha,
+  providerRunExpected.headSha,
+  'the moving default-branch tip fixture must differ from the immutable workflow SHA',
+);
+assert.deepEqual(
+  validateScheduledIncidentProducerRun(providerRunFixture, {
+    ...providerRunExpected,
+    defaultBranchHeadSha: advancedDefaultBranchHeadSha,
+  }),
+  stateContext.producer,
+  'a valid scheduled run must remain accepted when main advances after the immutable workflow SHA was selected',
+);
+for (const [label, mutation] of [
+  ['canary workflow', { workflow_id: releaseHealthMonitorWorkflowIdentities.canary.workflowId }],
+  ['fallback workflow', { workflow_id: releaseHealthMonitorWorkflowIdentities.fallback.workflowId, event: 'workflow_dispatch' }],
+  ['wrong run ID', { id: Number(stateContext.producer.runId) + 1 }],
+  ['wrong attempt', { run_attempt: 2 }],
+  ['wrong head SHA', { head_sha: 'b'.repeat(40) }],
+  ['missing creation time', { created_at: '' }],
+]) {
+  assert.throws(
+    () => validateScheduledIncidentProducerRun({ ...providerRunFixture, ...mutation }, providerRunExpected),
+    /provider provenance validation/,
+    label + ' must fail provider producer selection',
+  );
+}
+for (const rejectedProducer of [
+  { ...releaseHealthMonitorWorkflowIdentities.canary, event: 'schedule' },
+  { ...releaseHealthMonitorWorkflowIdentities.fallback, event: 'workflow_dispatch' },
+]) {
+  assert.equal(
+    resolveReleaseHealthIncidentProducer(rejectedProducer),
+    null,
+    'F2a must reject the reserved canary and fallback producer identities',
+  );
+}
 const stateRecord = createScheduledIncidentStateRecord(
   fingerprintA,
   stateContext,
@@ -875,8 +999,14 @@ const stateRecord = createScheduledIncidentStateRecord(
 );
 const stateBytes = Buffer.from(JSON.stringify(stateRecord, null, 2) + '\n');
 const stateKey = stateContext.cachePrefix + 'at-2026-07-21T18-00-00-000Z';
+const decodedState = decodeScheduledIncidentState(
+  stateBytes,
+  stateKey,
+  stateContext,
+  stateAuthenticationKey,
+);
 assert.equal(
-  decodeScheduledIncidentState(stateBytes, stateKey, stateContext, stateAuthenticationKey).notificationStateHmac,
+  decodedState.notificationStateHmac,
   notificationStateHmac(fingerprintA, stateAuthenticationKey, '2026-07-21T18:00:00.000Z'),
   'valid authenticated state must restore exactly',
 );
@@ -898,11 +1028,261 @@ assert.equal(
   incidentDeliveryIdentity,
   'valid authenticated state must restore its stable non-sensitive delivery identity',
 );
+assert.deepEqual(
+  decodedState.producerAuthority,
+  {
+    createdAt: stateContext.producer.createdAt,
+    runId: stateContext.producer.runId,
+    runAttempt: stateContext.producer.runAttempt,
+  },
+  'decoded v6 state must preserve the authenticated prior producer authority tuple',
+);
+const newerProducer = Object.freeze({
+  ...stateContext.producer,
+  runId: '30264003712',
+  runAttempt: 1,
+  headSha: 'c'.repeat(40),
+  createdAt: '2026-07-21T18:02:00Z',
+});
+const newerStateContext = { ...stateContext, producer: newerProducer };
+const newerUnchangedDecision = evaluateIncidentNotification(
+  'continuous',
+  'schedule',
+  decodedState,
+  [incidentFailureA],
+  stateAuthenticationKey,
+  newerProducer,
+);
+assert.deepEqual(
+  {
+    changed: newerUnchangedDecision.changed,
+    stateMigrationRequired: newerUnchangedDecision.stateMigrationRequired,
+    statePersistenceRequired: newerUnchangedDecision.statePersistenceRequired,
+    producerAuthorityAdvanced: newerUnchangedDecision.producerAuthorityAdvanced,
+  },
+  {
+    changed: false,
+    stateMigrationRequired: false,
+    statePersistenceRequired: true,
+    producerAuthorityAdvanced: true,
+  },
+  'a strictly newer authenticated producer must advance the authority watermark even without semantic change',
+);
+const preservedNewerDeliveryIdentity = scheduledIncidentPersistenceDeliveryIdentity(
+  newerUnchangedDecision,
+  decodedState,
+  releaseHealthDeliveryIdentity(newerProducer.runId, newerProducer.runAttempt),
+);
+assert.equal(
+  preservedNewerDeliveryIdentity,
+  incidentDeliveryIdentity,
+  'an authority-only persistence must preserve the semantic delivery identity',
+);
+const newerStateRecord = createScheduledIncidentStateRecord(
+  fingerprintA,
+  newerStateContext,
+  stateAuthenticationKey,
+  '2026-07-21T18:03:00.000Z',
+  preservedNewerDeliveryIdentity,
+);
+const newerStateKey = stateContext.cachePrefix + 'at-2026-07-21T18-03-00-000Z';
+const newerDecodedState = decodeScheduledIncidentState(
+  Buffer.from(JSON.stringify(newerStateRecord) + '\n'),
+  newerStateKey,
+  stateContext,
+  stateAuthenticationKey,
+);
+const olderRerunProducer = Object.freeze({
+  ...stateContext.producer,
+  runId: '30264003711',
+  runAttempt: 2,
+  headSha: 'd'.repeat(40),
+  createdAt: '2026-07-21T18:01:00Z',
+});
+assert.equal(
+  compareScheduledIncidentProducerAuthority(olderRerunProducer, newerDecodedState.producerAuthority),
+  -1,
+  'provider creation time must order an older rerun before newer authenticated state',
+);
+const staleChangedIncident = evaluateIncidentNotification(
+  'continuous',
+  'schedule',
+  newerDecodedState,
+  [incidentFailureA, incidentFailureB],
+  stateAuthenticationKey,
+  olderRerunProducer,
+);
+assert.deepEqual(
+  {
+    changed: staleChangedIncident.changed,
+    suppressed: staleChangedIncident.suppressed,
+    stateMigrationRequired: staleChangedIncident.stateMigrationRequired,
+    statePersistenceRequired: staleChangedIncident.statePersistenceRequired,
+    notificationReconciliationRequired: staleChangedIncident.notificationReconciliationRequired,
+    staleProducerSuppressed: staleChangedIncident.staleProducerSuppressed,
+  },
+  {
+    changed: false,
+    suppressed: true,
+    stateMigrationRequired: false,
+    statePersistenceRequired: false,
+    notificationReconciliationRequired: false,
+    staleProducerSuppressed: true,
+  },
+  'an older rerun finding a changed incident must not persist, migrate, deliver, or poison suppression',
+);
+assert.equal(
+  compareScheduledIncidentProducerAuthority(newerProducer, newerDecodedState.producerAuthority),
+  0,
+  'equal producer authority must compare exactly equal',
+);
+assert.equal(
+  compareScheduledIncidentProducerAuthority(
+    { ...newerProducer, runId: '30264003713' },
+    { ...newerDecodedState.producerAuthority, runId: '30264003712' },
+  ),
+  1,
+  'numeric run ID must break equal provider creation times',
+);
+assert.equal(
+  compareScheduledIncidentProducerAuthority(
+    { ...newerProducer, runAttempt: 2 },
+    { ...newerDecodedState.producerAuthority, runAttempt: 1 },
+  ),
+  1,
+  'numeric run attempt must break equal creation time and run ID',
+);
+const predecessorStateUnsigned = {
+  schema: 4,
+  repository_id: stateContext.repositoryId,
+  repository: stateContext.repository,
+  workflow_ref: stateContext.predecessorWorkflowRef,
+  ref: stateContext.ref,
+  notification_state_hmac_sha256: stateRecord.notification_state_hmac_sha256,
+  notification_cluster_hmac_tokens: stateRecord.notification_cluster_hmac_tokens,
+  delivery_identity: incidentDeliveryIdentity,
+  state_hmac_epoch: stateContext.hmacEpoch,
+  created_at: stateRecord.created_at,
+  scan_mode: 'continuous',
+  trigger_event: 'schedule',
+};
+const predecessorStateRecord = {
+  ...predecessorStateUnsigned,
+  state_hmac_sha256: createHmac('sha256', stateAuthenticationKey)
+    .update('release-health-state-record-v1\n' + JSON.stringify(predecessorStateUnsigned))
+    .digest('hex'),
+};
+const predecessorStateKey = stateContext.predecessorCachePrefix + 'at-'
+  + stateRecord.created_at.replace(/[:.]/g, '-');
+const predecessorState = decodeScheduledIncidentState(
+  Buffer.from(JSON.stringify(predecessorStateRecord) + '\n'),
+  predecessorStateKey,
+  stateContext,
+  stateAuthenticationKey,
+);
+assert.deepEqual(
+  {
+    requiresMigration: predecessorState.requiresMigration,
+    incidentDeliveryIdentity: predecessorState.incidentDeliveryIdentity,
+  },
+  { requiresMigration: true, incidentDeliveryIdentity },
+  'an authenticated v4 predecessor state must retain its delivery identity and require v6 migration',
+);
+const exactPredecessorMigration = evaluateIncidentNotification(
+  'continuous',
+  'schedule',
+  predecessorState,
+  [incidentFailureA],
+  stateAuthenticationKey,
+);
+assert.deepEqual(
+  {
+    changed: exactPredecessorMigration.changed,
+    stateMigrationRequired: exactPredecessorMigration.stateMigrationRequired,
+    statePersistenceRequired: exactPredecessorMigration.statePersistenceRequired,
+  },
+  { changed: false, stateMigrationRequired: true, statePersistenceRequired: true },
+  'an unchanged authenticated v4 state must persist a v6 migration without reporting an incident change',
+);
+assert.equal(
+  scheduledIncidentPersistenceDeliveryIdentity(
+    exactPredecessorMigration,
+    predecessorState,
+    laterIncidentDeliveryIdentity,
+  ),
+  incidentDeliveryIdentity,
+  'an unchanged v4 migration must preserve the authenticated delivery identity',
+);
+const changedPredecessorMigration = evaluateIncidentNotification(
+  'continuous',
+  'schedule',
+  predecessorState,
+  [incidentFailureA, incidentFailureB],
+  stateAuthenticationKey,
+);
+assert.equal(
+  scheduledIncidentPersistenceDeliveryIdentity(
+    changedPredecessorMigration,
+    predecessorState,
+    worsenedIncidentDeliveryIdentity,
+  ),
+  worsenedIncidentDeliveryIdentity,
+  'a changed v4 state must mint the current run delivery identity',
+);
+const migratedV6State = createScheduledIncidentStateRecord(
+  fingerprintA,
+  stateContext,
+  stateAuthenticationKey,
+  '2026-07-21T18:00:30.000Z',
+  scheduledIncidentPersistenceDeliveryIdentity(
+    exactPredecessorMigration,
+    predecessorState,
+    laterIncidentDeliveryIdentity,
+  ),
+);
+assert.deepEqual(
+  {
+    schema: migratedV6State.schema,
+    workflowId: migratedV6State.workflow_id,
+    workflowRef: migratedV6State.workflow_ref,
+    producerKind: migratedV6State.producer_kind,
+    producerPolicy: migratedV6State.producer_policy,
+    producerWorkflowId: migratedV6State.producer_workflow_id,
+    producerWorkflowPath: migratedV6State.producer_workflow_path,
+    producerEvent: migratedV6State.producer_event,
+    producerRunId: migratedV6State.producer_run_id,
+    producerRunAttempt: migratedV6State.producer_run_attempt,
+    producerHeadSha: migratedV6State.producer_head_sha,
+    producerCreatedAt: migratedV6State.producer_created_at,
+    deliveryIdentity: decodeScheduledIncidentState(
+      Buffer.from(JSON.stringify(migratedV6State) + '\n'),
+      stateContext.cachePrefix + 'at-' + migratedV6State.created_at.replace(/[:.]/g, '-'),
+      stateContext,
+      stateAuthenticationKey,
+    ).incidentDeliveryIdentity,
+  },
+  {
+    schema: 6,
+    workflowId: releaseHealthMonitorWorkflowIdentities.active.workflowId,
+    workflowRef: stateContext.workflowRef,
+    producerKind: releaseHealthIncidentProducerPolicies.nativeSchedule.kind,
+    producerPolicy: releaseHealthIncidentProducerPolicies.nativeSchedule.policy,
+    producerWorkflowId: releaseHealthMonitorWorkflowIdentities.active.workflowId,
+    producerWorkflowPath: releaseHealthMonitorWorkflowIdentities.active.path,
+    producerEvent: 'schedule',
+    producerRunId: stateContext.producer.runId,
+    producerRunAttempt: stateContext.producer.runAttempt,
+    producerHeadSha: stateContext.producer.headSha,
+    producerCreatedAt: stateContext.producer.createdAt,
+    deliveryIdentity: incidentDeliveryIdentity,
+  },
+  'the migration rewrite must produce an authenticated v6 record bound to the exact producer identity',
+);
 const previousStateUnsigned = {
   schema: 3,
   repository_id: stateContext.repositoryId,
   repository: stateContext.repository,
-  workflow_ref: stateContext.workflowRef,
+  workflow_ref: stateContext.predecessorWorkflowRef,
   ref: stateContext.ref,
   notification_state_hmac_sha256: stateRecord.notification_state_hmac_sha256,
   notification_cluster_hmac_tokens: stateRecord.notification_cluster_hmac_tokens,
@@ -943,7 +1323,16 @@ assert.deepEqual(
     stateWriteRequired: exactPreviousMigration.stateWriteRequired,
   },
   { changed: false, improved: false, suppressed: true, stateWriteRequired: true },
-  'an exact authenticated v3 state must migrate to v4 without producing another red run',
+  'an exact authenticated v3 state must migrate to v6 without producing another red run',
+);
+assert.equal(
+  scheduledIncidentPersistenceDeliveryIdentity(
+    exactPreviousMigration,
+    previousState,
+    laterIncidentDeliveryIdentity,
+  ),
+  laterIncidentDeliveryIdentity,
+  'a v3 migration without an authenticated delivery identity must bind persistence to the current run',
 );
 assert.equal(
   decodeScheduledIncidentState(
@@ -953,7 +1342,7 @@ assert.equal(
     stateAuthenticationKey,
   ).incidentDeliveryIdentity,
   laterIncidentDeliveryIdentity,
-  'the v4 rewrite must authenticate and restore the fresh delivery identity',
+  'the v6 rewrite must authenticate and restore the fresh delivery identity',
 );
 assert.notEqual(
   laterStateRecord.notification_state_hmac_sha256,
@@ -1025,7 +1414,7 @@ const legacyUnsignedState = {
   schema: 2,
   repository_id: stateContext.repositoryId,
   repository: stateContext.repository,
-  workflow_ref: stateContext.workflowRef,
+  workflow_ref: stateContext.predecessorWorkflowRef,
   ref: stateContext.ref,
   notification_state_hmac_sha256: notificationStateHmac(fingerprintA, stateAuthenticationKey),
   state_hmac_epoch: stateContext.hmacEpoch,
@@ -1046,6 +1435,197 @@ const legacyState = decodeScheduledIncidentState(
   stateContext,
   stateAuthenticationKey,
 );
+const scheduledIncidentStateFixtures = Object.freeze([
+  Object.freeze({ version: 'v2', record: legacyStateRecord, key: legacyStateKey, prefix: stateContext.legacyCachePrefix }),
+  Object.freeze({ version: 'v3', record: previousStateRecord, key: previousStateKey, prefix: stateContext.previousCachePrefix }),
+  Object.freeze({ version: 'v4', record: predecessorStateRecord, key: predecessorStateKey, prefix: stateContext.predecessorCachePrefix }),
+  Object.freeze({ version: 'v6', record: stateRecord, key: stateKey, prefix: stateContext.cachePrefix }),
+]);
+const cloneScheduledIncidentStateRecord = (record) => JSON.parse(JSON.stringify(record));
+const authenticallySignScheduledIncidentState = (record) => {
+  const unsignedRecord = { ...record };
+  delete unsignedRecord.state_hmac_sha256;
+  return {
+    ...unsignedRecord,
+    state_hmac_sha256: createHmac('sha256', stateAuthenticationKey)
+      .update('release-health-state-record-v1\n' + JSON.stringify(unsignedRecord))
+      .digest('hex'),
+  };
+};
+const authenticatedV6ProducerNegativeCases = Object.freeze([
+  Object.freeze({
+    label: 'producer kind',
+    mutate: (record) => ({ ...record, producer_kind: 'unregistered-producer-kind' }),
+  }),
+  Object.freeze({
+    label: 'producer policy',
+    mutate: (record) => ({ ...record, producer_policy: 'unregistered-producer-policy' }),
+  }),
+  Object.freeze({
+    label: 'canary workflow identity',
+    mutate: (record) => ({
+      ...record,
+      producer_workflow_id: releaseHealthMonitorWorkflowIdentities.canary.workflowId,
+      producer_workflow_path: releaseHealthMonitorWorkflowIdentities.canary.path,
+    }),
+  }),
+  Object.freeze({
+    label: 'fallback workflow identity',
+    mutate: (record) => ({
+      ...record,
+      producer_workflow_id: releaseHealthMonitorWorkflowIdentities.fallback.workflowId,
+      producer_workflow_path: releaseHealthMonitorWorkflowIdentities.fallback.path,
+      producer_event: 'workflow_dispatch',
+      trigger_event: 'workflow_dispatch',
+    }),
+  }),
+  Object.freeze({
+    label: 'producer event',
+    mutate: (record) => ({ ...record, producer_event: 'workflow_dispatch' }),
+  }),
+  Object.freeze({
+    label: 'producer run ID',
+    mutate: (record) => ({ ...record, producer_run_id: '0' }),
+  }),
+  Object.freeze({
+    label: 'producer run attempt',
+    mutate: (record) => ({ ...record, producer_run_attempt: 0 }),
+  }),
+  Object.freeze({
+    label: 'producer head SHA',
+    mutate: (record) => ({ ...record, producer_head_sha: 'not-a-full-sha' }),
+  }),
+  Object.freeze({
+    label: 'producer creation time',
+    mutate: (record) => ({ ...record, producer_created_at: 'not-a-github-timestamp' }),
+  }),
+  Object.freeze({
+    label: 'producer creation time after state creation',
+    mutate: (record) => ({ ...record, producer_created_at: '2026-07-21T18:01:00Z' }),
+  }),
+  Object.freeze({
+    label: 'trigger event mismatch',
+    mutate: (record) => ({ ...record, trigger_event: 'workflow_dispatch' }),
+  }),
+]);
+for (const negativeCase of authenticatedV6ProducerNegativeCases) {
+  const candidateRecord = authenticallySignScheduledIncidentState(
+    negativeCase.mutate(cloneScheduledIncidentStateRecord(stateRecord)),
+  );
+  const candidateBytes = Buffer.from(JSON.stringify(candidateRecord) + '\n');
+  assert.throws(
+    () => decodeScheduledIncidentState(
+      candidateBytes,
+      stateKey,
+      stateContext,
+      stateAuthenticationKey,
+    ),
+    /failed provenance validation/,
+    'an authentically signed v6 state must reject invalid ' + negativeCase.label,
+  );
+  assert.equal(
+    decodeScheduledIncidentStateOrNull(
+      candidateBytes,
+      stateKey,
+      stateContext,
+      stateAuthenticationKey,
+    ),
+    null,
+    'an authentically signed v6 state with invalid ' + negativeCase.label + ' must reinitialize safely',
+  );
+}
+const scheduledIncidentStateNegativeCases = Object.freeze([
+  Object.freeze({
+    label: 'invalid HMAC',
+    mutateRecord: (record) => ({ ...record, state_hmac_sha256: '0'.repeat(64) }),
+    expectedError: /requires safe reinitialization/,
+  }),
+  Object.freeze({
+    label: 'schema mismatch with an authentic signature',
+    mutateRecord: (record) => ({ ...record, schema: 999 }),
+    resign: true,
+    expectedError: /failed provenance validation/,
+  }),
+  Object.freeze({
+    label: 'missing exact field with an authentic signature',
+    mutateRecord: (record) => {
+      delete record.scan_mode;
+      return record;
+    },
+    resign: true,
+    expectedError: /contains missing or unexpected fields/,
+  }),
+  Object.freeze({
+    label: 'unexpected exact field with an authentic signature',
+    mutateRecord: (record) => ({ ...record, unexpected_field: true }),
+    resign: true,
+    expectedError: /contains missing or unexpected fields/,
+  }),
+  Object.freeze({
+    label: 'workflow path provenance with an authentic signature',
+    mutateRecord: (record) => ({
+      ...record,
+      workflow_ref: 'ScaleSmall/SSAI_Shared/.github/workflows/unregistered.yml@refs/heads/main',
+    }),
+    resign: true,
+    expectedError: /failed provenance validation/,
+  }),
+  Object.freeze({
+    label: 'branch ref provenance with an authentic signature',
+    mutateRecord: (record) => ({ ...record, ref: 'refs/heads/release' }),
+    resign: true,
+    expectedError: /failed provenance validation/,
+  }),
+  Object.freeze({
+    label: 'workflow identity context',
+    mutateContext: (context) => ({
+      ...context,
+      workflowId: releaseHealthMonitorWorkflowIdentities.predecessor.workflowId,
+    }),
+    expectedError: /workflow identity context is invalid/,
+  }),
+  Object.freeze({
+    label: 'cache-prefix boundary',
+    mutateKey: (fixture) => fixture.key.replace(
+      fixture.prefix,
+      fixture.prefix.slice(0, -1) + 'x-',
+    ),
+    expectedError: /cache key does not match the repository\/workflow boundary/,
+  }),
+]);
+for (const fixture of scheduledIncidentStateFixtures) {
+  for (const negativeCase of scheduledIncidentStateNegativeCases) {
+    let candidateRecord = cloneScheduledIncidentStateRecord(fixture.record);
+    if (negativeCase.mutateRecord) candidateRecord = negativeCase.mutateRecord(candidateRecord);
+    if (negativeCase.resign) candidateRecord = authenticallySignScheduledIncidentState(candidateRecord);
+    const candidateBytes = Buffer.from(JSON.stringify(candidateRecord) + '\n');
+    const candidateKey = negativeCase.mutateKey ? negativeCase.mutateKey(fixture) : fixture.key;
+    const candidateContext = negativeCase.mutateContext
+      ? negativeCase.mutateContext(stateContext)
+      : stateContext;
+    const assertionLabel = fixture.version + ' ' + negativeCase.label;
+    assert.throws(
+      () => decodeScheduledIncidentState(
+        candidateBytes,
+        candidateKey,
+        candidateContext,
+        stateAuthenticationKey,
+      ),
+      negativeCase.expectedError,
+      assertionLabel + ' must reach its direct decoder guard',
+    );
+    assert.equal(
+      decodeScheduledIncidentStateOrNull(
+        candidateBytes,
+        candidateKey,
+        candidateContext,
+        stateAuthenticationKey,
+      ),
+      null,
+      assertionLabel + ' must safely reinitialize through the null wrapper',
+    );
+  }
+}
 const exactLegacyMigration = evaluateIncidentNotification(
   'continuous',
   'schedule',
@@ -1061,7 +1641,16 @@ assert.deepEqual(
     stateWriteRequired: exactLegacyMigration.stateWriteRequired,
   },
   { changed: false, improved: false, suppressed: true, stateWriteRequired: true },
-  'an exact authenticated v2 state must migrate to v4 without producing another red run',
+  'an exact authenticated v2 state must migrate to v6 without producing another red run',
+);
+assert.equal(
+  scheduledIncidentPersistenceDeliveryIdentity(
+    exactLegacyMigration,
+    legacyState,
+    laterIncidentDeliveryIdentity,
+  ),
+  laterIncidentDeliveryIdentity,
+  'a v2 migration without an authenticated delivery identity must bind persistence to the current run',
 );
 const changedLegacyMigration = evaluateIncidentNotification(
   'continuous',
@@ -1130,8 +1719,10 @@ assert.deepEqual(
   Object.keys(stateRecord).sort(),
   [
     'created_at', 'delivery_identity', 'notification_cluster_hmac_tokens', 'notification_state_hmac_sha256',
-    'ref', 'repository', 'repository_id', 'scan_mode', 'schema', 'state_hmac_epoch', 'state_hmac_sha256',
-    'trigger_event', 'workflow_ref',
+    'producer_created_at', 'producer_event', 'producer_head_sha', 'producer_kind', 'producer_policy',
+    'producer_run_attempt', 'producer_run_id', 'producer_workflow_id', 'producer_workflow_path', 'ref', 'repository',
+    'repository_id', 'scan_mode', 'schema', 'state_hmac_epoch', 'state_hmac_sha256', 'trigger_event',
+    'workflow_id', 'workflow_ref',
   ],
   'cache state must have a fixed public-provenance plus padded opaque-HMAC shape',
 );
@@ -1219,6 +1810,138 @@ assert.equal(
   decodeScheduledIncidentStateOrNull(stateBytes, stateKey, { ...stateContext, hmacEpoch: 'v2' }, stateAuthenticationKey),
   null,
   'HMAC epoch rotation must safely reinitialize instead of suppressing',
+);
+assert.equal(
+  decodeScheduledIncidentStateOrNull(
+    stateBytes,
+    'ssai-release-health-state-v5-v1-at-2026-07-21T18-00-00-000Z',
+    stateContext,
+    stateAuthenticationKey,
+  ),
+  null,
+  'an unregistered cache prefix must safely reinitialize',
+);
+const authenticallyWrongWorkflowIdUnsigned = { ...stateRecord };
+delete authenticallyWrongWorkflowIdUnsigned.state_hmac_sha256;
+authenticallyWrongWorkflowIdUnsigned.workflow_id = releaseHealthMonitorWorkflowIdentities.predecessor.workflowId;
+const authenticallyWrongWorkflowId = {
+  ...authenticallyWrongWorkflowIdUnsigned,
+  state_hmac_sha256: createHmac('sha256', stateAuthenticationKey)
+    .update('release-health-state-record-v1\n' + JSON.stringify(authenticallyWrongWorkflowIdUnsigned))
+    .digest('hex'),
+};
+assert.equal(
+  decodeScheduledIncidentStateOrNull(
+    Buffer.from(JSON.stringify(authenticallyWrongWorkflowId) + '\n'),
+    stateKey,
+    stateContext,
+    stateAuthenticationKey,
+  ),
+  null,
+  'an authenticated v6 state for the canary workflow ID must safely reinitialize',
+);
+for (const rejectedProducer of [
+  {
+    policy: 'native-schedule-v1',
+    workflowId: releaseHealthMonitorWorkflowIdentities.canary.workflowId,
+    path: releaseHealthMonitorWorkflowIdentities.canary.path,
+    event: 'schedule',
+  },
+  {
+    policy: 'external-fallback-v1',
+    workflowId: releaseHealthMonitorWorkflowIdentities.fallback.workflowId,
+    path: releaseHealthMonitorWorkflowIdentities.fallback.path,
+    event: 'workflow_dispatch',
+  },
+]) {
+  const rejectedUnsigned = {
+    ...stateRecord,
+    workflow_id: rejectedProducer.workflowId,
+    workflow_ref: stateContext.repository + '/' + rejectedProducer.path + '@' + stateContext.ref,
+    producer_policy: rejectedProducer.policy,
+    producer_workflow_id: rejectedProducer.workflowId,
+    producer_workflow_path: rejectedProducer.path,
+    producer_event: rejectedProducer.event,
+    trigger_event: rejectedProducer.event,
+  };
+  delete rejectedUnsigned.state_hmac_sha256;
+  const rejectedRecord = {
+    ...rejectedUnsigned,
+    state_hmac_sha256: createHmac('sha256', stateAuthenticationKey)
+      .update('release-health-state-record-v1\n' + JSON.stringify(rejectedUnsigned))
+      .digest('hex'),
+  };
+  assert.throws(
+    () => decodeScheduledIncidentState(
+      Buffer.from(JSON.stringify(rejectedRecord) + '\n'),
+      stateKey,
+      stateContext,
+      stateAuthenticationKey,
+    ),
+    /failed provenance validation/,
+    'an authenticated reserved producer must fail the direct v6 decoder',
+  );
+  assert.equal(
+    decodeScheduledIncidentStateOrNull(
+      Buffer.from(JSON.stringify(rejectedRecord) + '\n'),
+      stateKey,
+      stateContext,
+      stateAuthenticationKey,
+    ),
+    null,
+    'an authenticated reserved producer must safely reinitialize instead of suppressing',
+  );
+}
+const authenticallyWrongWorkflowRefUnsigned = { ...stateRecord };
+delete authenticallyWrongWorkflowRefUnsigned.state_hmac_sha256;
+authenticallyWrongWorkflowRefUnsigned.workflow_ref = 'ScaleSmall/SSAI_Shared/'
+  + releaseHealthMonitorWorkflowIdentities.canary.path + '@refs/heads/main';
+const authenticallyWrongWorkflowRef = {
+  ...authenticallyWrongWorkflowRefUnsigned,
+  state_hmac_sha256: createHmac('sha256', stateAuthenticationKey)
+    .update('release-health-state-record-v1\n' + JSON.stringify(authenticallyWrongWorkflowRefUnsigned))
+    .digest('hex'),
+};
+assert.equal(
+  decodeScheduledIncidentStateOrNull(
+    Buffer.from(JSON.stringify(authenticallyWrongWorkflowRef) + '\n'),
+    stateKey,
+    stateContext,
+    stateAuthenticationKey,
+  ),
+  null,
+  'an authenticated v6 state for the canary workflow path must safely reinitialize',
+);
+const authenticallyWrongPredecessorRefUnsigned = {
+  ...predecessorStateRecord,
+  workflow_ref: 'ScaleSmall/SSAI_Shared/.github/workflows/untrusted.yml@refs/heads/main',
+};
+delete authenticallyWrongPredecessorRefUnsigned.state_hmac_sha256;
+const authenticallyWrongPredecessorRef = {
+  ...authenticallyWrongPredecessorRefUnsigned,
+  state_hmac_sha256: createHmac('sha256', stateAuthenticationKey)
+    .update('release-health-state-record-v1\n' + JSON.stringify(authenticallyWrongPredecessorRefUnsigned))
+    .digest('hex'),
+};
+assert.equal(
+  decodeScheduledIncidentStateOrNull(
+    Buffer.from(JSON.stringify(authenticallyWrongPredecessorRef) + '\n'),
+    predecessorStateKey,
+    stateContext,
+    stateAuthenticationKey,
+  ),
+  null,
+  'an authenticated v4 state from any path except the exact predecessor ref must safely reinitialize',
+);
+assert.equal(
+  decodeScheduledIncidentStateOrNull(
+    Buffer.from(JSON.stringify(predecessorStateRecord) + '\n'),
+    predecessorStateKey,
+    { ...stateContext, predecessorWorkflowRef: 'ScaleSmall/SSAI_Shared/.github/workflows/untrusted.yml@refs/heads/main' },
+    stateAuthenticationKey,
+  ),
+  null,
+  'a v4 restore context with the wrong authoritative workflow ref must safely reinitialize',
 );
 const reinitializedIncident = evaluateIncidentNotification('continuous', 'schedule', null, [incidentFailureA]);
 assert.deepEqual(
@@ -2313,9 +3036,9 @@ assert.equal(findProvisionalWorkflowRecovery(failedRun, [failedRun, currentRun],
 
 const monitorSource = 'name: Scale Small AI Release Health Monitor\nrun-name: Release health monitor [mode:hours]\non:\n  schedule:\n  workflow_dispatch:\n';
 const monitorWorkflow = {
-  id: 315630665,
+  id: releaseHealthMonitorWorkflowIdentities.active.workflowId,
   name: 'Scale Small AI Release Health Monitor',
-  path: '.github/workflows/release-health-monitor.yml',
+  path: releaseHealthMonitorWorkflowIdentities.active.path,
   state: 'active',
 };
 const monitorOldSha = '3'.repeat(40);
@@ -2341,11 +3064,17 @@ const monitorPolicyInput = {
   headRepository: 'ScaleSmall/SSAI_Shared',
   failedEvents: ['schedule'],
   recoveryEvents: ['workflow_dispatch'],
-  jobNames: ['Verify current organization release health'],
+  jobNames: [releaseHealthMonitorJobNames.scan, releaseHealthMonitorJobNames.delivery],
   recoveryDisplayTitles: ['Release health monitor [continuous:6h]'],
   monitorSelfRecoveryContract: 'release-health-monitor-v1',
   monitorSelfRecoveryEvents: ['schedule', 'workflow_dispatch'],
+  monitorWorkflowIdentities: [
+    releaseHealthMonitorWorkflowIdentities.active,
+    releaseHealthMonitorWorkflowIdentities.predecessor,
+  ],
   auditedMonitorOrigins: [{
+    workflowId: releaseHealthMonitorWorkflowIdentities.predecessor.workflowId,
+    workflowPath: releaseHealthMonitorWorkflowIdentities.predecessor.path,
     runId: 704,
     runAttempt: 1,
     checkRunId: 812,
@@ -2359,6 +3088,8 @@ const monitorPolicyInput = {
     utilsSourceSha256: createHash('sha256').update(auditedHistoricalUtilsSource).digest('hex'),
     deliverySourceSha256: null,
   }, {
+    workflowId: releaseHealthMonitorWorkflowIdentities.predecessor.workflowId,
+    workflowPath: releaseHealthMonitorWorkflowIdentities.predecessor.path,
     runId: 705,
     runAttempt: 1,
     checkRunId: 813,
@@ -2380,6 +3111,19 @@ const auditedOriginSources = new Map([[monitorOldSha, {
   utilsSource: auditedHistoricalUtilsSource,
   deliverySource: null,
 }]]);
+assert.equal(Object.isFrozen(releaseHealthMonitorWorkflowIdentities), true, 'the workflow identity registry must be immutable');
+assert.equal(Object.isFrozen(releaseHealthMonitorWorkflowIdentities.active), true, 'the active workflow identity must be immutable');
+assert.equal(Object.isFrozen(releaseHealthMonitorWorkflowIdentities.predecessor), true, 'the predecessor workflow identity must be immutable');
+assert.notEqual(
+  releaseHealthMonitorWorkflowIdentities.active.workflowId,
+  releaseHealthMonitorWorkflowIdentities.predecessor.workflowId,
+  'active and predecessor workflow IDs must remain distinct',
+);
+assert.notEqual(
+  releaseHealthMonitorWorkflowIdentities.active.path,
+  releaseHealthMonitorWorkflowIdentities.predecessor.path,
+  'active and predecessor workflow paths must remain distinct',
+);
 const monitorPolicy = verifyForwardFixRecoveryPolicy({
   ...monitorVerificationContext,
   workflow: monitorWorkflow,
@@ -2389,6 +3133,42 @@ const monitorPolicy = verifyForwardFixRecoveryPolicy({
 });
 assert.ok(monitorPolicy, 'trusted monitor recovery requires an exact source-hashed policy');
 assert.equal(isTrustedMonitorRecoveryPolicy(monitorPolicy), true, 'the exact monitor policy must enter trusted monitor recovery');
+assert.deepEqual(
+  [...monitorPolicy.jobNames].sort(),
+  Object.values(releaseHealthMonitorJobNames).sort(),
+  'trusted monitor recovery tests must use the shared active scan and delivery job-name registry',
+);
+assert.deepEqual(
+  monitorPolicy.monitorWorkflowIdentities,
+  [
+    releaseHealthMonitorWorkflowIdentities.active,
+    releaseHealthMonitorWorkflowIdentities.predecessor,
+  ],
+  'trusted monitor recovery must bind the exact active and predecessor identity registry',
+);
+for (const [label, monitorWorkflowIdentities] of [
+  ['missing predecessor', [releaseHealthMonitorWorkflowIdentities.active]],
+  ['reversed roles', [
+    releaseHealthMonitorWorkflowIdentities.predecessor,
+    releaseHealthMonitorWorkflowIdentities.active,
+  ]],
+  ['wrong active ID', [
+    { ...releaseHealthMonitorWorkflowIdentities.active, workflowId: 123 },
+    releaseHealthMonitorWorkflowIdentities.predecessor,
+  ]],
+  ['wrong predecessor path', [
+    releaseHealthMonitorWorkflowIdentities.active,
+    { ...releaseHealthMonitorWorkflowIdentities.predecessor, path: '.github/workflows/lookalike.yml' },
+  ]],
+]) {
+  assert.equal(verifyForwardFixRecoveryPolicy({
+    ...monitorVerificationContext,
+    workflow: monitorWorkflow,
+    workflowSource: monitorSource,
+    policy: { ...monitorPolicyInput, monitorWorkflowIdentities },
+    auditedOriginSources,
+  }), null, label + ' must invalidate trusted monitor recovery');
+}
 assert.deepEqual(
   [...monitorPolicy.attestedMonitorHeadShas],
   [monitorCurrentSha],
@@ -2542,7 +3322,7 @@ const exactManualIncidentRecoveryCheck = {
   head_repository: 'ScaleSmall/SSAI_Shared',
   event: 'workflow_dispatch',
   source_run_display_title: 'Release health monitor [incident:168h]',
-  name: 'Verify current organization release health',
+  name: releaseHealthMonitorJobNames.scan,
   status: 'completed',
   conclusion: 'success',
 };
@@ -2739,6 +3519,24 @@ assert.equal(verifyForwardFixRecoveryPolicy({
   },
   auditedOriginSources,
 }), null, 'an invalid audited check identity must fail closed');
+for (const [label, originMutation] of [
+  ['unregistered historical workflow ID', { workflowId: 123 }],
+  ['unregistered historical workflow path', { workflowPath: '.github/workflows/lookalike.yml' }],
+  ['active ID with predecessor path', { workflowId: releaseHealthMonitorWorkflowIdentities.active.workflowId }],
+]) {
+  assert.equal(verifyForwardFixRecoveryPolicy({
+    ...monitorVerificationContext,
+    workflow: monitorWorkflow,
+    workflowSource: monitorSource,
+    policy: {
+      ...monitorPolicyInput,
+      auditedMonitorOrigins: monitorPolicyInput.auditedMonitorOrigins.map((origin, index) => (
+        index === 0 ? { ...origin, ...originMutation } : origin
+      )),
+    },
+    auditedOriginSources,
+  }), null, label + ' must invalidate historical recovery provenance');
+}
 const monitorSearch = {
   policy: monitorPolicy,
   currentHeadSha: monitorCurrentSha,
@@ -2882,6 +3680,20 @@ assert.equal(
   ),
   null,
   'a fork run must not recover a trusted monitor failure',
+);
+assert.equal(
+  findProvisionalTrustedMonitorWorkflowRecovery(
+    scheduledMonitorFailure,
+    [scheduledMonitorFailure, {
+      ...currentIncidentMonitorRun,
+      workflow_id: releaseHealthMonitorWorkflowIdentities.predecessor.workflowId,
+    }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'the predecessor workflow identity must never act as a recovery candidate',
 );
 assert.equal(
   findProvisionalTrustedMonitorWorkflowRecovery(
@@ -3038,6 +3850,7 @@ assert.equal(isEligibleTrustedMonitorImplementationCandidate(
 ), true, 'an exact successful monitor run on an attested default-main ancestor is an eligible source candidate');
 for (const mutation of [
   { workflow_id: 123 },
+  { workflow_id: releaseHealthMonitorWorkflowIdentities.predecessor.workflowId },
   { head_repository: { full_name: 'untrusted/fork' } },
   { head_branch: 'feature' },
   { event: 'push' },
@@ -3060,6 +3873,7 @@ const auditedLegacyMonitorFailure = {
   ...manualContinuousMonitorFailure,
   id: 704,
   run_attempt: 1,
+  workflow_id: releaseHealthMonitorWorkflowIdentities.predecessor.workflowId,
   head_sha: monitorOldSha,
   event: 'workflow_dispatch',
   display_title: 'Scale Small AI Release Health Monitor',
@@ -3082,6 +3896,7 @@ for (const mutation of [
   { head_sha: '5'.repeat(40) },
   { event: 'schedule' },
   { display_title: 'Scale Small AI Release Health Monitor ' },
+  { workflow_id: releaseHealthMonitorWorkflowIdentities.active.workflowId },
   { head_repository: { full_name: 'untrusted/fork' } },
   { head_branch: 'feature' },
 ]) {
@@ -3112,6 +3927,7 @@ const auditedPriorIncidentFailure = {
   ...manualIncidentMonitorFailure,
   id: 705,
   run_attempt: 1,
+  workflow_id: releaseHealthMonitorWorkflowIdentities.predecessor.workflowId,
   head_sha: monitorOldSha,
 };
 assert.equal(
@@ -3127,7 +3943,11 @@ assert.equal(
 );
 assert.equal(
   findProvisionalTrustedMonitorWorkflowRecovery(
-    { ...auditedPriorIncidentFailure, id: 706 },
+    {
+      ...auditedPriorIncidentFailure,
+      id: 706,
+      workflow_id: releaseHealthMonitorWorkflowIdentities.active.workflowId,
+    },
     [currentIncidentMonitorRun],
     799,
     2,
@@ -3336,7 +4156,7 @@ const scheduledMonitorFailedCheck = {
   ...failedCheck,
   id: 810,
   workflow_id: monitorWorkflow.id,
-  name: 'Verify current organization release health',
+  name: releaseHealthMonitorJobNames.scan,
   event: 'schedule',
   head_sha: monitorOldSha,
   head_repository: 'ScaleSmall/SSAI_Shared',
@@ -3469,6 +4289,20 @@ assert.equal(
 assert.equal(
   findProvisionalTrustedMonitorCheckRecovery(
     incidentMonitorFailedCheck,
+    [incidentMonitorFailedCheck, {
+      ...currentIncidentMonitorCheck,
+      workflow_id: releaseHealthMonitorWorkflowIdentities.predecessor.workflowId,
+    }],
+    799,
+    2,
+    monitorSearch,
+  ),
+  null,
+  'a predecessor-workflow check must never act as a recovery candidate',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecovery(
+    incidentMonitorFailedCheck,
     [incidentMonitorFailedCheck, { ...currentIncidentMonitorCheck, source_run_display_title: 'Release health monitor [incident:167h]' }],
     799,
     2,
@@ -3493,6 +4327,7 @@ const auditedLegacyMonitorFailedCheck = {
   id: 812,
   source_run_id: 704,
   source_run_attempt: 1,
+  workflow_id: releaseHealthMonitorWorkflowIdentities.predecessor.workflowId,
   event: 'workflow_dispatch',
   head_sha: monitorOldSha,
   source_run_display_title: 'Scale Small AI Release Health Monitor',
@@ -3571,6 +4406,33 @@ assert.equal(
   )?.id,
   799,
   'the exact current workflow run may bind recovery while GitHub has not indexed its check yet',
+);
+const scheduledMonitorDeliveryFailedCheck = {
+  ...scheduledMonitorFailedCheck,
+  id: 813,
+  name: releaseHealthMonitorJobNames.delivery,
+};
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecoveryFromRun(
+    scheduledMonitorDeliveryFailedCheck,
+    [scheduledMonitorFailure, currentScheduledMonitorRun],
+    798,
+    1,
+    monitorSearch,
+  )?.id,
+  798,
+  'the registered active delivery check may use the exact current scheduled run for provisional recovery',
+);
+assert.equal(
+  findProvisionalTrustedMonitorCheckRecoveryFromRun(
+    { ...scheduledMonitorDeliveryFailedCheck, name: 'unregistered-monitor-job' },
+    [scheduledMonitorFailure, currentScheduledMonitorRun],
+    798,
+    1,
+    monitorSearch,
+  ),
+  null,
+  'an unregistered monitor job name must remain ineligible for trusted provisional recovery',
 );
 assert.equal(
   findProvisionalTrustedMonitorCheckRecoveryFromRun(

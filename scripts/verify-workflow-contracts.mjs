@@ -3,6 +3,11 @@ import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  releaseHealthIncidentProducerPolicies,
+  releaseHealthMonitorJobNames,
+  releaseHealthMonitorWorkflowIdentities,
+} from './release-health-monitor-utils.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
@@ -26,8 +31,7 @@ const assertRecoveryPolicyFields = (block, key, expectedFields) => {
   }
 };
 
-const requireRecoveryPolicyBlock = (source, key, expectedFields) => {
-  const marker = `['${key}', {`;
+const requireRecoveryPolicyBlock = (source, key, expectedFields, marker = `['${key}', {`) => {
   const start = source.indexOf(marker);
   if (start < 0) throw new Error(`Missing recovery policy: ${key}`);
   const end = source.indexOf('\n  }],', start);
@@ -123,6 +127,64 @@ const expandCronMinuteField = (field, description) => {
   return minutes;
 };
 
+const requireWorkflowJobBlock = (source, jobName, description) => {
+  const jobsStart = source.indexOf('\njobs:\n');
+  if (jobsStart < 0) throw new Error(`Missing jobs mapping in ${description}`);
+  const marker = `\n  ${jobName}:\n`;
+  const start = source.indexOf(marker, jobsStart);
+  if (start < 0) throw new Error(`Missing ${jobName} job in ${description}`);
+  const remainderStart = start + marker.length;
+  const nextJobOffset = source.slice(remainderStart).search(/^  [A-Za-z0-9_-]+:\n/m);
+  const end = nextJobOffset < 0 ? source.length : remainderStart + nextJobOffset;
+  return source.slice(start + 1, end);
+};
+
+const collectWorkflowJobNames = (source, description) => {
+  const jobsStart = source.indexOf('\njobs:\n');
+  if (jobsStart < 0) throw new Error(`Missing jobs mapping in ${description}`);
+  return [...source.slice(jobsStart + '\njobs:\n'.length).matchAll(/^  ([A-Za-z0-9_-]+):\n/gm)]
+    .map((match) => match[1]);
+};
+
+const requireFlatJobMapping = (jobBlock, fieldName, description) => {
+  const pattern = new RegExp(`^    ${fieldName}:\\n((?:^      [A-Za-z0-9_-]+:.*\\n)+)`, 'm');
+  const match = jobBlock.match(pattern);
+  if (!match) throw new Error(`Missing ${description}`);
+  return `    ${fieldName}:\n${match[1]}`;
+};
+
+const assertSharedMonitorConcurrency = (source, description, queueRequired = false) => {
+  requireText(source, 'concurrency:', `${description} concurrency mapping`);
+  requireText(source, '  group: scale-small-ai-release-health-monitor-v2', `${description} shared concurrency group`);
+  requireText(source, '  cancel-in-progress: false', `${description} non-cancelling concurrency`);
+  if (queueRequired) requireText(source, '  queue: max', `${description} lossless pending-run queue`);
+  assert.equal((source.match(/^concurrency:$/gm) || []).length, 1, `${description} must declare one top-level concurrency contract`);
+  assert.equal((source.match(/^  group: scale-small-ai-release-health-monitor-v2$/gm) || []).length, 1, `${description} must declare the shared concurrency group once`);
+  assert.equal((source.match(/^  cancel-in-progress: false$/gm) || []).length, 1, `${description} must declare non-cancelling concurrency once`);
+  if (queueRequired) assert.equal((source.match(/^  queue: max$/gm) || []).length, 1, `${description} must declare queue:max once`);
+};
+
+const assertProtectedWorkflowAdmission = (jobBlock, jobName, eventAssertion) => {
+  for (const [expected, description] of [
+    ['ref: ${{ github.sha }}', 'exact checkout SHA'],
+    ['ACTUAL_EVENT: ${{ github.event_name }}', 'event binding'],
+    ['ACTUAL_REF: ${{ github.ref }}', 'branch ref binding'],
+    ['ACTUAL_REPOSITORY: ${{ github.repository }}', 'repository binding'],
+    ['ACTUAL_SHA: ${{ github.sha }}', 'event SHA binding'],
+    ['ACTUAL_WORKFLOW_REF: ${{ github.workflow_ref }}', 'workflow ref binding'],
+    ['EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}', 'default-branch ref'],
+    ['EXPECTED_REPOSITORY: ScaleSmall/SSAI_Shared', 'exact repository'],
+    ['EXPECTED_WORKFLOW_REF: ScaleSmall/SSAI_Shared/.github/workflows/release-health-monitor.yml@refs/heads/${{ github.event.repository.default_branch }}', 'authoritative workflow path'],
+    ['checked_out_sha="$(git rev-parse HEAD)"', 'checked-out SHA attestation'],
+    [eventAssertion, 'event allowlist'],
+    ['[ "$ACTUAL_REPOSITORY" != "$EXPECTED_REPOSITORY" ]', 'repository assertion'],
+    ['[ "$ACTUAL_REF" != "$EXPECTED_REF" ]', 'ref assertion'],
+    ['[ "$ACTUAL_WORKFLOW_REF" != "$EXPECTED_WORKFLOW_REF" ]', 'workflow ref assertion'],
+    ['! [[ "$ACTUAL_SHA" =~ ^[0-9a-f]{40}$ ]]', 'full SHA format assertion'],
+    ['[ "$checked_out_sha" != "$ACTUAL_SHA" ]', 'checked-out SHA equality assertion'],
+  ]) requireText(jobBlock, expected, `${jobName} ${description}`);
+};
+
 const workflowSources = await collectWorkflowSources();
 const validate = requireWorkflowSource(workflowSources, 'validate.yml');
 const propagate = requireWorkflowSource(workflowSources, 'propagate.yml');
@@ -130,9 +192,48 @@ const releaseHealth = requireWorkflowSource(workflowSources, 'release-health-mon
 const releaseHealthIdentityCanary = requireWorkflowSource(workflowSources, 'release-health-monitor-v3.yml');
 const releaseHealthFallbackRegistration = requireWorkflowSource(workflowSources, 'release-health-monitor-fallback.yml');
 const releaseHealthVerifier = await readSource('scripts', 'verify-org-release-health.mjs');
+const releaseHealthUtils = await readSource('scripts', 'release-health-monitor-utils.mjs');
+const releaseHealthDelivery = await readSource('scripts', 'sync-release-health-incident-issue.mjs');
 const releaseHealthRunbook = await readSource('docs', 'RELEASE_HEALTH_GITHUB_APP_RUNBOOK.md');
 const propagationRetirementRunbook = await readSource('docs', 'SHARED_PROPAGATION_RETIREMENT.md');
 const combined = [...workflowSources.values()].join('\n');
+
+assert.deepEqual(
+  releaseHealthMonitorWorkflowIdentities,
+  {
+    active: { workflowId: 315630665, path: '.github/workflows/release-health-monitor.yml' },
+    predecessor: { workflowId: 344135917, path: '.github/workflows/release-health-monitor-v3.yml' },
+    canary: { workflowId: 344135917, path: '.github/workflows/release-health-monitor-v3.yml' },
+    fallback: { workflowId: 344170407, path: '.github/workflows/release-health-monitor-fallback.yml' },
+  },
+  'the shared release-health identity registry must remain exact',
+);
+assert.deepEqual(
+  releaseHealthIncidentProducerPolicies,
+  {
+    nativeSchedule: {
+      kind: 'github-actions-workflow-run',
+      policy: 'native-schedule-v1',
+      workflowId: 315630665,
+      path: '.github/workflows/release-health-monitor.yml',
+      events: ['schedule'],
+    },
+  },
+  'F2a must authorize only the native scheduled monitor as an incident-state producer',
+);
+assert.deepEqual(
+  releaseHealthMonitorJobNames,
+  {
+    scan: 'Verify current organization release health',
+    delivery: 'Deliver managed incident and conclude',
+  },
+  'the shared release-health job-name registry must remain exact',
+);
+assert.deepEqual(
+  [...releaseHealth.matchAll(/^    name: (.+)$/gm)].map((match) => match[1]),
+  [releaseHealthMonitorJobNames.scan, releaseHealthMonitorJobNames.delivery],
+  'the authoritative workflow job names must exactly match the shared runtime registry',
+);
 
 for (const [name, source] of [
   ['renamed-cross-repository-delivery.yaml', 'env:\n  GH_TOKEN: ${{ secrets.SCALESMALL_PAT }}\n'],
@@ -362,10 +463,132 @@ requireText(releaseHealthRunbook, 'two\nconsecutive exact native `schedule` runs
 requireText(releaseHealthRunbook, 'Rollback is ordered: disable controller dispatch first, require zero queued or in-progress fallback\nruns', 'ordered fallback rollback gate');
 requireText(releaseHealthRunbook, 'disable the fallback workflow through the official API', 'official fallback disable rollback gate');
 requireText(releaseHealthRunbook, 'Preserve run and controller-ledger evidence.', 'fallback rollback evidence preservation');
+requireText(releaseHealthRunbook, '## Protected F2a release-health foundation', 'protected F2a foundation contract');
+requireText(releaseHealthRunbook, 'authoritative incident producer remains workflow ID `315630665`', 'native F2a producer authority');
+requireText(releaseHealthRunbook, releaseHealthMonitorWorkflowIdentities.active.path, 'native F2a producer path');
+requireText(releaseHealthRunbook, releaseHealthMonitorWorkflowIdentities.canary.path, 'explicit canary rejection path');
+requireText(releaseHealthRunbook, releaseHealthMonitorWorkflowIdentities.fallback.path, 'explicit fallback rejection path');
+requireText(releaseHealthRunbook, 'explicitly rejects both alternate IDs as state producers and managed-issue\nwriters', 'alternate producer and delivery rejection');
+requireText(releaseHealthRunbook, 'queue: max', 'lossless authoritative writer queue');
+requireText(releaseHealthRunbook, '### Authenticated producer-neutral v6 state', 'producer-neutral v6 state contract');
+requireText(releaseHealthRunbook, 'producer kind and policy, workflow ID and path, event, run ID, run attempt,\nhead SHA, and authoritative run creation time', 'complete authenticated producer provenance');
+requireText(releaseHealthRunbook, 'comes from the exact GitHub\nActions provider record selected by current run ID and attempt', 'provider-sourced producer creation time');
+requireText(releaseHealthRunbook, 'Restore v6 first. Authenticated v4, v3, and v2 records', 'ordered authenticated state migrations');
+requireText(releaseHealthRunbook, '### Managed issue ordering and marker upgrade', 'stale issue-write and marker upgrade contract');
+requireText(releaseHealthRunbook, 'ordered first by authoritative provider creation time, then run ID, then attempt', 'authoritative issue-write ordering');
+requireText(releaseHealthRunbook, 'valid legacy v1 delivery marker is read once and upgraded', 'managed issue marker upgrade');
+requireText(releaseHealthRunbook, '### F2a acceptance evidence ledger', 'finite F2a acceptance ledger');
+requireText(releaseHealthRunbook, '| Provider-bound v6 provenance |', 'producer provenance acceptance row');
+requireText(
+  releaseHealthRunbook,
+  createHash('sha256').update(releaseHealth).digest('hex'),
+  'exact authoritative workflow digest in the F2a runbook',
+);
 requireBalancedExpressions(releaseHealthIdentityCanary, 'release-health scheduler identity canary');
 requireSpaceIndentation(releaseHealthIdentityCanary, 'release-health scheduler identity canary');
 requireBalancedExpressions(releaseHealthFallbackRegistration, 'release-health fallback registration');
 requireSpaceIndentation(releaseHealthFallbackRegistration, 'release-health fallback registration');
+
+const expectedScanOutputs = [
+  '    outputs:',
+  '      scan_completed: ${{ steps.reconcile.outputs.scan_completed }}',
+  '      health_degraded: ${{ steps.reconcile.outputs.health_degraded }}',
+  '      incident_state_changed: ${{ steps.reconcile.outputs.incident_state_changed }}',
+  '      state_persistence_required: ${{ steps.reconcile.outputs.state_persistence_required }}',
+  '      incident_state: ${{ steps.reconcile.outputs.incident_state }}',
+  '      notification_outcome: ${{ steps.reconcile.outputs.notification_outcome }}',
+  '      notification_reconciliation_required: ${{ steps.reconcile.outputs.notification_reconciliation_required }}',
+  '      incident_delivery_identity: ${{ steps.reconcile.outputs.incident_delivery_identity }}',
+  '',
+].join('\n');
+const expectedScanPermissions = [
+  '    permissions:',
+  '      contents: read',
+  '',
+].join('\n');
+const expectedDeliveryPermissions = [
+  '    permissions:',
+  '      actions: read',
+  '      contents: read',
+  '      issues: write',
+  '',
+].join('\n');
+
+const assertAuthoritativeReleaseHealthIsolation = (source) => {
+  requireText(source, 'permissions: {}\n\nenv:', 'empty top-level release-health permissions');
+  assert.equal(
+    (source.match(/^permissions:/gm) || []).length,
+    1,
+    'the authoritative release-health workflow must declare exactly one top-level permission contract',
+  );
+  assertSharedMonitorConcurrency(source, 'authoritative release-health workflow', true);
+  assert.deepEqual(
+    collectWorkflowJobNames(source, 'authoritative release-health workflow'),
+    ['scan', 'deliver'],
+    'the authoritative release-health workflow must expose only the scan and delivery jobs',
+  );
+  const scanJob = requireWorkflowJobBlock(source, 'scan', 'authoritative release-health workflow');
+  const deliverJob = requireWorkflowJobBlock(source, 'deliver', 'authoritative release-health workflow');
+  assert.equal(
+    requireFlatJobMapping(scanJob, 'permissions', 'scan permissions'),
+    expectedScanPermissions,
+    'the scan job must remain contents-read only',
+  );
+  assert.equal(
+    requireFlatJobMapping(deliverJob, 'permissions', 'delivery permissions'),
+    expectedDeliveryPermissions,
+    'the delivery job must have only actions/read, contents/read, and issues/write',
+  );
+  assert.equal(
+    requireFlatJobMapping(scanJob, 'outputs', 'scan output allowlist'),
+    expectedScanOutputs,
+    'the scan job output allowlist must remain exact',
+  );
+  rejectPattern(scanJob, /^      issues:\s*write$/m, 'scan job issue write permission');
+  rejectPattern(
+    deliverJob,
+    /(?:secrets\.|SSAI_RELEASE_MONITOR_APP_|SSAI_RELEASE_MONITOR_STATE_|state\.json|actions\/cache|release_health_app_token)/i,
+    'delivery job App credential, state file, or cache access',
+  );
+  rejectPattern(source, /\bartifacts?\b|actions\/(?:upload|download)-artifact/i, 'release-health artifact transfer');
+  assertProtectedWorkflowAdmission(
+    scanJob,
+    'scan job',
+    '! [[ "$ACTUAL_EVENT" =~ ^(schedule|workflow_dispatch)$ ]]',
+  );
+  assertProtectedWorkflowAdmission(
+    deliverJob,
+    'delivery job',
+    '[ "$ACTUAL_EVENT" != \'schedule\' ]',
+  );
+};
+
+assertAuthoritativeReleaseHealthIsolation(releaseHealth);
+for (const [description, mutatedSource] of [
+  ['top-level write permission', releaseHealth.replace('permissions: {}\n\nenv:', 'permissions:\n  issues: write\n\nenv:')],
+  ['scan issue mutation authority', releaseHealth.replace('    permissions:\n      contents: read\n', '    permissions:\n      contents: read\n      issues: write\n')],
+  ['delivery App secret access', releaseHealth.replace('  deliver:\n', '  deliver:\n    env:\n      SSAI_RELEASE_MONITOR_APP_CLIENT_ID: ${{ secrets.SSAI_RELEASE_MONITOR_APP_CLIENT_ID }}\n')],
+  ['unallowlisted scan output', releaseHealth.replace('      scan_completed:', '      internal_secret:\n      scan_completed:')],
+  ['wrong protected workflow path', releaseHealth.replaceAll('release-health-monitor.yml@refs/heads/', 'release-health-monitor-v3.yml@refs/heads/')],
+  ['missing lossless queue', releaseHealth.replace('  queue: max\n', '')],
+  ['artifact transfer', `${releaseHealth}# artifacts\n`],
+]) {
+  assert.throws(
+    () => assertAuthoritativeReleaseHealthIsolation(mutatedSource),
+    /release-health|scan|delivery|workflow path|queue/i,
+    `the authoritative release-health contract must reject ${description}`,
+  );
+}
+
+const releaseHealthScheduleOwners = [...workflowSources]
+  .filter(([name, source]) => name.startsWith('release-health-monitor') && /^  schedule:/m.test(source))
+  .map(([name]) => name)
+  .sort();
+assert.deepEqual(
+  releaseHealthScheduleOwners,
+  ['release-health-monitor-v3.yml', 'release-health-monitor.yml'].sort(),
+  'only the authoritative native monitor and inert scheduler canary may own release-health schedules in F2a',
+);
 
 requireText(releaseHealth, 'workflow_dispatch:', 'manual release-health control');
 const releaseHealthCron = '9,24,39,54 * * * *';
@@ -421,7 +644,6 @@ for (const [reservation, cron] of fleetScheduleMinuteReservations) {
     throw new Error(`Scheduler identity canary collides with ${reservation} at minute(s): ${canaryCollisions.join(', ')}`);
   }
 }
-requireText(releaseHealth, 'permissions:\n  contents: read\n  issues: write', 'bounded same-repository incident delivery permission');
 rejectPattern(releaseHealth, /(?:actions|checks|contents|deployments|packages|pull-requests|statuses|workflows): write/, 'unapproved release-health write permission');
 requireText(releaseHealth, 'cancel-in-progress: false', 'non-cancelling release-health serialization');
 requireText(releaseHealth, 'runs-on: ubuntu-24.04', 'pinned release-health runner');
@@ -442,17 +664,16 @@ rejectPattern(releaseHealth, /skip-token-revoke:\s*['"]?true/i, 'installation to
 requireText(releaseHealth, 'environment:\n      name: release-health-monitor', 'protected release-health environment binding');
 requireText(
   releaseHealth,
-  "if: ${{ github.event_name != 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}",
-  'server-side default-branch manual dispatch gate',
+  "if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}",
+  'server-side default-branch scan gate',
 );
 requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256: ${{ secrets.SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256 }}', 'protected expected-inventory attestation');
 requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_STATE_HMAC_KEY: ${{ secrets.SSAI_RELEASE_MONITOR_STATE_HMAC_KEY }}', 'dedicated protected state HMAC key');
 requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_STATE_HMAC_EPOCH: v1', 'explicit state HMAC epoch');
-const verifyJobHeader = releaseHealth.slice(
-  releaseHealth.indexOf('  verify:\n'),
-  releaseHealth.indexOf('    steps:\n', releaseHealth.indexOf('  verify:\n')),
-);
-rejectPattern(verifyJobHeader, /secrets\./, 'fleet secrets exposed to job-level actions');
+const scanJob = requireWorkflowJobBlock(releaseHealth, 'scan', 'authoritative release-health workflow');
+const deliveryJob = requireWorkflowJobBlock(releaseHealth, 'deliver', 'authoritative release-health workflow');
+const scanJobHeader = scanJob.slice(0, scanJob.indexOf('    steps:\n'));
+rejectPattern(scanJobHeader, /secrets\./, 'fleet secrets exposed to job-level actions');
 for (const secretName of ['SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256', 'SSAI_RELEASE_MONITOR_STATE_HMAC_KEY']) {
   const references = releaseHealth.match(new RegExp(`secrets\\.${secretName}`, 'g')) || [];
   assert.equal(references.length, 2, `${secretName} must be scoped only to preflight and reconcile steps`);
@@ -482,16 +703,27 @@ requireText(releaseHealth, 'group: scale-small-ai-release-health-monitor-v2', 'o
 requireText(releaseHealth, 'cancel-in-progress: false', 'non-destructive release-health concurrency');
 requireText(releaseHealth, 'actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830', 'pinned scheduled-incident state restore');
 requireText(releaseHealth, 'actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830', 'pinned scheduled-incident state save');
-requireText(releaseHealth, 'ssai-release-health-state-v4-v1-lookup', 'non-sensitive fixed cache lookup key');
-requireText(releaseHealth, 'ssai-release-health-state-v4-v1-', 'epoch-bound non-sensitive cache prefix');
-requireText(releaseHealth, 'ssai-release-health-state-v3-v1-', 'authenticated previous-state migration restore prefix');
-requireText(releaseHealth, 'ssai-release-health-state-v2-v1-', 'authenticated legacy state migration restore prefix');
+requireText(releaseHealth, 'key: ssai-release-health-state-v6-v1-lookup', 'non-sensitive v6 fixed cache lookup key');
+requireText(
+  releaseHealth,
+  'restore-keys: |\n            ssai-release-health-state-v6-v1-\n            ssai-release-health-state-v4-v1-\n            ssai-release-health-state-v3-v1-\n            ssai-release-health-state-v2-v1-',
+  'ordered v6, v4, v3, and v2 authenticated state restoration',
+);
+requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_STATE_CACHE_PREFIX: ssai-release-health-state-v6-v1-', 'v6 authenticated cache save prefix');
 rejectPattern(releaseHealth, /state-v\d+[^\n]*github\.run_id/, 'source run ID in public cache action key');
 requireText(releaseHealth, "if: ${{ github.event_name == 'schedule' }}", 'schedule-only state restore');
-requireText(releaseHealth, "always() && github.event_name == 'schedule' && steps.reconcile.outputs.incident_state_changed == 'true'", 'fail-closed changed-state save');
+assert.equal(
+  (releaseHealth.match(/always\(\) && github\.event_name == 'schedule' && steps\.reconcile\.outputs\.state_persistence_required == 'true'/g) || []).length,
+  3,
+  'save, lookup verification, and persistence assertion must all use state_persistence_required',
+);
 requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}', 'default-branch state provenance');
 requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_STATE_CACHE_MATCHED_KEY:', 'immutable restored cache identity handoff');
-requireText(releaseHealth, 'key: ${{ steps.reconcile.outputs.incident_state_cache_key }}', 'content-digested cache save key');
+assert.equal(
+  (releaseHealth.match(/key: \$\{\{ steps\.reconcile\.outputs\.incident_state_cache_key \}\}/g) || []).length,
+  2,
+  'the v6 content-digested key must bind both cache save and exact lookup verification',
+);
 requireText(releaseHealth, 'id: verify_release_health_state', 'post-save cache visibility verification');
 requireText(releaseHealth, 'lookup-only: true', 'side-effect-free cache visibility verification');
 requireText(releaseHealth, 'fail-on-cache-miss: true', 'fail-closed missing changed-state cache');
@@ -502,16 +734,15 @@ requireText(releaseHealth, '::error::Release-health monitor failed closed', 'gen
 rejectPattern(releaseHealth, /Changed release-health incident state was not durably persisted/, 'detailed public state-persistence error');
 rejectPattern(releaseHealth, /continue-on-error:\s*true/, 'state restore/save failure suppression');
 requireText(releaseHealth, 'notification_reconciliation_required', 'schedule-time incident reconciliation gate');
-requireText(releaseHealth, "steps.reconcile.outcome == 'success'", 'successful monitor result before incident reconciliation');
-requireText(releaseHealth, "steps.reconcile.outputs.scan_completed == 'true'", 'explicit completed-scan delivery gate');
-requireText(releaseHealth, 'steps.verify_release_health_state.outcome == \'success\'', 'delivery after durable state verification');
-requireText(releaseHealth, 'steps.require_release_health_state.outcome == \'success\'', 'delivery after exact persistence assertion');
-requireText(releaseHealth, "steps.reconcile.outputs.health_degraded == 'true'", 'degraded scheduled conclusion restored after delivery');
+requireText(releaseHealth, "needs.scan.result == 'success'", 'successful scan job before incident reconciliation');
+requireText(releaseHealth, "needs.scan.outputs.scan_completed == 'true'", 'explicit completed-scan delivery gate');
+requireText(releaseHealth, "needs.scan.outputs.notification_reconciliation_required == 'true'", 'explicit notification reconciliation gate');
+requireText(releaseHealth, "needs.scan.outputs.health_degraded == 'true'", 'degraded scheduled conclusion restored after delivery');
 requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_DEFER_DEGRADED_EXIT:', 'scheduled scan and health conclusion decoupling');
-requireText(releaseHealth, 'GITHUB_TOKEN: ${{ github.token }}', 'job-scoped same-repository issue token');
-requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_INCIDENT_STATE: ${{ steps.reconcile.outputs.incident_state }}', 'desired managed issue state handoff');
-requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_NOTIFICATION_OUTCOME: ${{ steps.reconcile.outputs.notification_outcome }}', 'allowlisted incident outcome handoff');
-requireText(releaseHealth, 'SSAI_RELEASE_MONITOR_DELIVERY_IDENTITY: ${{ steps.reconcile.outputs.incident_delivery_identity }}', 'durable non-sensitive delivery identity handoff');
+requireText(deliveryJob, 'GITHUB_TOKEN: ${{ github.token }}', 'job-scoped same-repository issue token');
+requireText(deliveryJob, 'SSAI_RELEASE_MONITOR_INCIDENT_STATE: ${{ needs.scan.outputs.incident_state }}', 'desired managed issue state handoff');
+requireText(deliveryJob, 'SSAI_RELEASE_MONITOR_NOTIFICATION_OUTCOME: ${{ needs.scan.outputs.notification_outcome }}', 'allowlisted incident outcome handoff');
+requireText(deliveryJob, 'SSAI_RELEASE_MONITOR_DELIVERY_IDENTITY: ${{ needs.scan.outputs.incident_delivery_identity }}', 'durable non-sensitive delivery identity handoff');
 requireText(releaseHealth, 'node scripts/sync-release-health-incident-issue.mjs', 'managed issue incident delivery');
 requireText(releaseHealth, "await import('./scripts/verify-org-release-health.mjs')", 'workflow-attested dynamic monitor bootstrap');
 requireText(releaseHealth, 'executeReleaseHealthMonitorEntryPoint(monitor.runReleaseHealthMonitor)', 'redacted organization release-health entry point');
@@ -618,12 +849,76 @@ requireText(releaseHealthVerifier, 'findPolicyBoundWorkflowRecovery(', 'coverage
 requireText(releaseHealthVerifier, 'findPolicyBoundCheckRecovery(', 'coverage-aware check recovery selection');
 requireText(releaseHealthVerifier, 'const directRecovery = trustedMonitorPolicy ? null : policyBoundRecovery;', 'trusted monitor generic-recovery bypass prevention');
 requireText(releaseHealthVerifier, "monitorSelfRecoveryContract: 'release-health-monitor-v1'", 'trusted monitor recovery contract');
+requireText(releaseHealthUtils, 'export const releaseHealthMonitorWorkflowIdentities = Object.freeze({', 'canonical workflow identity registry');
+requireText(releaseHealthUtils, 'active: authoritativeNativeWorkflowIdentity', 'canonical native authoritative workflow identity');
+requireText(releaseHealthUtils, 'predecessor: schedulerCanaryWorkflowIdentity', 'canonical rejected canary identity');
+requireText(releaseHealthUtils, 'fallback: fallbackWorkflowIdentity', 'canonical rejected fallback identity');
+requireText(releaseHealthUtils, 'export const releaseHealthIncidentProducerPolicies = Object.freeze({', 'producer policy registry');
+requireText(releaseHealthUtils, "policy: 'native-schedule-v1'", 'native producer policy identifier');
+requireText(releaseHealthUtils, "events: Object.freeze(['schedule'])", 'native schedule-only producer event boundary');
+requireText(releaseHealthUtils, 'export function resolveReleaseHealthIncidentProducer(', 'central producer authorization resolver');
+requireText(releaseHealthVerifier, "const activeReleaseHealthPolicyKey = 'SSAI_Shared:'\n  + releaseHealthMonitorWorkflowIdentities.active.workflowId;", 'derived active recovery-policy key');
+requireText(releaseHealthVerifier, 'releaseHealthIncidentProducerPolicies,', 'verifier producer policy import');
+requireText(releaseHealthVerifier, 'resolveReleaseHealthIncidentProducer,', 'verifier producer resolver import');
+rejectPattern(releaseHealthVerifier, /export const releaseHealthMonitorWorkflowIdentities\s*=\s*Object\.freeze/, 'duplicate verifier workflow identity registry');
+requireText(releaseHealthDelivery, 'releaseHealthIncidentProducerPolicies,', 'incident delivery producer policy import');
+requireText(releaseHealthDelivery, 'resolveReleaseHealthIncidentProducer,', 'incident delivery producer resolver import');
+requireText(releaseHealthDelivery, 'export const activeIncidentWorkflowId = releaseHealthIncidentProducerPolicies.nativeSchedule.workflowId;', 'derived authoritative incident workflow identity');
+requireText(releaseHealthDelivery, 'export const rejectedCanaryWorkflowId = releaseHealthMonitorWorkflowIdentities.canary.workflowId;', 'explicit canary incident delivery rejection identity');
+requireText(releaseHealthDelivery, 'export const rejectedFallbackWorkflowId = releaseHealthMonitorWorkflowIdentities.fallback.workflowId;', 'explicit fallback incident delivery rejection identity');
+requireText(releaseHealthDelivery, "'/attempts/' + runAttempt", 'exact issue-delivery run-attempt provider fetch');
+requireText(releaseHealthDelivery, 'compareAuthoritativeRuns(', 'authoritative stale issue-write ordering');
+requireText(releaseHealthDelivery, 'parseIssueDeliveryReference(', 'v1 and v2 managed issue marker decoder');
+requireText(releaseHealthDelivery, 'incidentDeliveryMarker(deliveryIdentity, producer.workflowId)', 'producer-authenticated v2 issue marker writer');
+requireText(releaseHealthVerifier, 'const incidentStateWorkflowId = releaseHealthIncidentProducerPolicies.nativeSchedule.workflowId;', 'native state workflow identity binding');
 requireText(releaseHealthVerifier, 'source_run_attempt:', 'exact current run-attempt binding');
 requireText(releaseHealthVerifier, "'incident_delivery_identity=' + exactIncidentDeliveryIdentity", 'authenticated stable delivery identity output');
 requireText(releaseHealthVerifier, 'incidentDeliveryIdentity: state.delivery_identity', 'restored delivery identity reconciliation');
+requireText(releaseHealthVerifier, 'const incidentStateSchema = 6', 'producer-neutral authenticated v6 incident-state schema');
+requireText(releaseHealthVerifier, 'const predecessorIncidentStateSchema = 4', 'authenticated predecessor v4 state schema');
 requireText(releaseHealthVerifier, 'const previousIncidentStateSchema = 3', 'explicit previous-state migration schema');
-requireText(releaseHealthVerifier, 'validatePreviousPersistedIncidentState(', 'authenticated v3-to-v4 state migration');
+requireText(releaseHealthVerifier, 'const legacyIncidentStateSchema = 2', 'explicit legacy-state migration schema');
+requireText(releaseHealthVerifier, 'validatePredecessorPersistedIncidentState(', 'authenticated v4-to-v6 predecessor migration');
+requireText(releaseHealthVerifier, 'validatePreviousPersistedIncidentState(', 'authenticated v3-to-v6 state migration');
+requireText(releaseHealthVerifier, 'validateLegacyPersistedIncidentState(', 'authenticated v2-to-v6 state migration');
+requireText(releaseHealthVerifier, "const expectedCachePrefix = 'ssai-release-health-state-v6-'", 'active v6 cache provenance boundary');
+requireText(releaseHealthVerifier, "const predecessorCachePrefix = 'ssai-release-health-state-v4-'", 'predecessor v4 cache provenance boundary');
 requireText(releaseHealthVerifier, "const previousCachePrefix = 'ssai-release-health-state-v3-'", 'previous-state cache provenance boundary');
+requireText(releaseHealthVerifier, "const legacyCachePrefix = 'ssai-release-health-state-v2-'", 'legacy-state cache provenance boundary');
+requireText(releaseHealthVerifier, 'const producerAuthorityAdvanced = Boolean(producer !== null && previous?.producerAuthority);', 'strictly newer authenticated producer watermark detection');
+requireText(releaseHealthVerifier, 'const statePersistenceRequired = stateMigrationRequired || changed || producerAuthorityAdvanced;', 'mandatory v6 persistence after migration, semantic change, or authority advance');
+requireText(releaseHealthVerifier, 'decision.changed || decision.stateMigrationRequired || decision.producerAuthorityAdvanced', 'authority-only persistence decision validation');
+requireText(releaseHealthVerifier, 'producerAuthority: Object.freeze({', 'authenticated v6 producer authority restoration');
+requireText(releaseHealthVerifier, 'compareScheduledIncidentProducerAuthority(producer, previous.producerAuthority) <= 0', 'stale and equal cache producer suppression');
+requireText(releaseHealthVerifier, "!/^ssai-release-health-state-v6-v1-at-", 'v6 content-digested cache-key validation');
+requireText(releaseHealthVerifier, 'export function validateScheduledIncidentProducerRun(run, expected)', 'provider-attested producer run validator');
+for (const field of [
+  'producer_policy',
+  'producer_kind',
+  'producer_workflow_id',
+  'producer_workflow_path',
+  'producer_event',
+  'producer_run_id',
+  'producer_run_attempt',
+  'producer_head_sha',
+  'producer_created_at',
+]) {
+  requireText(releaseHealthVerifier, `${field}: producerExecution.`, `authenticated v6 ${field} field`);
+}
+requireText(releaseHealthVerifier, 'const createdAt = canonicalGitHubTimestamp(run.created_at);', 'authoritative provider run creation time');
+requireText(releaseHealthVerifier, "const currentWorkflowHeadSha = String(process.env.GITHUB_SHA || '').trim().toLowerCase();", 'immutable executing workflow SHA binding');
+requireText(releaseHealthVerifier, 'headSha: currentWorkflowHeadSha', 'provider evidence bound to immutable GITHUB_SHA');
+requireText(releaseHealthVerifier, 'incident_state_producer: incidentStateProducer', 'provider record threaded into repository scan output');
+requireText(releaseHealthVerifier, 'const stateProducers = rows.map((row) => row.incident_state_producer).filter(Boolean);', 'single provider-attested producer selection');
+requireText(releaseHealthVerifier, 'stateProducers.length !== 1', 'fail-closed producer cardinality');
+requireText(releaseHealthVerifier, 'producer: stateProducers[0] || null', 'provider execution threaded into scheduled state persistence');
+requireText(releaseHealthDelivery, 'assertSameMarkerSnapshotUnchanged(initialIssue, exactIssue);', 'same-marker issue snapshot mutation fence');
+requireText(releaseHealthDelivery, 'const initialRun = await validatePriorRun(api, initialReference);', 'initial marker provider metadata prefetch before final issue read');
+requireText(releaseHealthDelivery, 'let exactIssue = validateExactManagedIssue(await api(issuePath), number);', 'single immediate exact issue re-read before PATCH');
+requireText(releaseHealthDelivery, 'priorRun = await validatePriorRun(api, priorReference);', 'bounded advanced-marker metadata prefetch');
+requireText(releaseHealthDelivery, 'exactIssue = validateExactManagedIssue(await api(issuePath), number);', 'second and final exact issue read after bounded marker prefetch');
+requireText(releaseHealthDelivery, 'the authoritative delivery marker advanced again during bounded revalidation.', 'repeated marker advance fail-closed boundary');
+requireText(releaseHealthDelivery, 'the managed issue changed without an authoritative delivery-marker advance.', 'operator-edit fail-closed boundary');
 requireText(releaseHealthVerifier, 'auditedMonitorOrigins:', 'immutable audited monitor-origin policy');
 requireText(releaseHealthVerifier, 'collectMonitorImplementationSource(', 'historical monitor implementation source verification');
 requireText(releaseHealthVerifier, 'auditedOriginSources', 'historical workflow/script/utils/delivery digest handoff');
