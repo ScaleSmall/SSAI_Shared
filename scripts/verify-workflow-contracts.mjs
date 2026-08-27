@@ -200,7 +200,7 @@ requireText(
 rejectPattern(propagationRetirementRunbook, /gh\s+workflow\s+(?:enable|run)|\/actions\/workflows\/247016064\/(?:enable|dispatches)/i, 'retired propagation reactivation command');
 
 requireText(releaseHealth, 'workflow_dispatch:', 'manual release-health control');
-const releaseHealthCron = '3,18,33,48 * * * *';
+const releaseHealthCron = '9,24,39,54 * * * *';
 requireText(releaseHealth, `cron: '${releaseHealthCron}'`, 'fleet-staggered 15-minute release-health schedule');
 const releaseHealthMinutes = [...expandCronMinuteField(releaseHealthCron.split(/\s+/)[0], 'release-health monitor')]
   .sort((left, right) => left - right);
