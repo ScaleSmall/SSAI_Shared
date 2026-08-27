@@ -1,0 +1,24 @@
+name: Scale Small AI Release Health Independent Fallback (Registration)
+run-name: Release health independent fallback registration [inert]
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: scale-small-ai-release-health-monitor-v2
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  registration:
+    name: Register independent fallback workflow identity
+    if: ${{ false }}
+    permissions: {}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Independent fallback remains inert until protected Stage F2
+        run: |
+          echo "::error::Independent release-health fallback is not activated."
+          exit 1

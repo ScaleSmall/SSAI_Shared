@@ -128,6 +128,7 @@ const validate = requireWorkflowSource(workflowSources, 'validate.yml');
 const propagate = requireWorkflowSource(workflowSources, 'propagate.yml');
 const releaseHealth = requireWorkflowSource(workflowSources, 'release-health-monitor.yml');
 const releaseHealthIdentityCanary = requireWorkflowSource(workflowSources, 'release-health-monitor-v3.yml');
+const releaseHealthFallbackRegistration = requireWorkflowSource(workflowSources, 'release-health-monitor-fallback.yml');
 const releaseHealthVerifier = await readSource('scripts', 'verify-org-release-health.mjs');
 const releaseHealthRunbook = await readSource('docs', 'RELEASE_HEALTH_GITHUB_APP_RUNBOOK.md');
 const propagationRetirementRunbook = await readSource('docs', 'SHARED_PROPAGATION_RETIREMENT.md');
@@ -274,6 +275,72 @@ assert.equal(
   '3fe965ac8e77c17640fbc89633c230639c83d2e4e3ba0d43c9c50195338ce825',
   'the scheduler identity canary source digest must remain exact',
 );
+
+const expectedReleaseHealthFallbackRegistrationSource = [
+  'name: Scale Small AI Release Health Independent Fallback (Registration)',
+  'run-name: Release health independent fallback registration [inert]',
+  '',
+  'on:',
+  '  workflow_dispatch:',
+  '',
+  'concurrency:',
+  '  group: scale-small-ai-release-health-monitor-v2',
+  '  cancel-in-progress: false',
+  '',
+  'permissions: {}',
+  '',
+  'jobs:',
+  '  registration:',
+  '    name: Register independent fallback workflow identity',
+  '    if: ${{ false }}',
+  '    permissions: {}',
+  '    runs-on: ubuntu-24.04',
+  '    timeout-minutes: 1',
+  '    steps:',
+  '      - name: Independent fallback remains inert until protected Stage F2',
+  '        run: |',
+  '          echo "::error::Independent release-health fallback is not activated."',
+  '          exit 1',
+  '',
+].join('\n');
+
+const assertReleaseHealthFallbackRegistration = (source) => {
+  assert.equal(
+    source,
+    expectedReleaseHealthFallbackRegistrationSource,
+    'the independent fallback registration must remain the exact inert Stage F1 source',
+  );
+  rejectPattern(source, /^\s{2}(?:schedule|push|pull_request|pull_request_target|repository_dispatch|workflow_call):/m, 'fallback registration executable event trigger');
+  rejectPattern(source, /\b(?:uses:|secrets\.|github\.token|GITHUB_TOKEN|environment:|cache|https?:\/\/|curl\b|wget\b)/i, 'fallback registration credential, action, environment, cache, or network access');
+};
+
+assertReleaseHealthFallbackRegistration(releaseHealthFallbackRegistration);
+for (const [description, mutatedSource] of [
+  ['executable job', releaseHealthFallbackRegistration.replace('if: ${{ false }}', 'if: ${{ true }}')],
+  ['native schedule', releaseHealthFallbackRegistration.replace('  workflow_dispatch:\n', "  schedule:\n    - cron: '*/5 * * * *'\n")],
+  ['repository dispatch', releaseHealthFallbackRegistration.replace('  workflow_dispatch:', '  repository_dispatch:')],
+  ['workflow write permission', releaseHealthFallbackRegistration.replace('permissions: {}', 'permissions:\n  actions: write')],
+  ['job write permission', releaseHealthFallbackRegistration.replace('    permissions: {}', '    permissions:\n      contents: write')],
+  ['different concurrency group', releaseHealthFallbackRegistration.replace('scale-small-ai-release-health-monitor-v2', 'unregistered-fallback-group')],
+  ['environment access', releaseHealthFallbackRegistration.replace('    runs-on: ubuntu-24.04', '    environment: production\n    runs-on: ubuntu-24.04')],
+  ['secret access', `${releaseHealthFallbackRegistration}# \${{ secrets.UNTRUSTED_SECRET }}\n`],
+  ['action execution', releaseHealthFallbackRegistration.replace('    steps:\n', '    steps:\n      - uses: actions/checkout@untrusted\n')],
+  ['network access', releaseHealthFallbackRegistration.replace('          exit 1', '          curl https://example.invalid\n          exit 1')],
+]) {
+  assert.throws(
+    () => assertReleaseHealthFallbackRegistration(mutatedSource),
+    /fallback registration/,
+    `the Stage F1 contract must reject ${description}`,
+  );
+}
+const releaseHealthFallbackRegistrationSourceSha256 = createHash('sha256')
+  .update(releaseHealthFallbackRegistration)
+  .digest('hex');
+assert.equal(
+  releaseHealthFallbackRegistrationSourceSha256,
+  '7dc0169828e640614cbced70dc21594ee1cc605118cd81ab5e40cafeab2994ac',
+  'the independent fallback registration source digest must remain exact',
+);
 requireText(releaseHealthRunbook, '## Scheduler identity recovery', 'bounded scheduler identity recovery procedure');
 requireText(releaseHealthRunbook, '`.github/workflows/release-health-monitor-v3.yml`', 'replacement workflow path');
 requireText(releaseHealthRunbook, releaseHealthIdentityCanarySourceSha256, 'exact canary source digest');
@@ -282,8 +349,23 @@ requireText(releaseHealthRunbook, 'Do not leave two full\n   incident writers sc
 requireText(releaseHealthRunbook, 'require zero queued or in-progress runs', 'drained scheduler cutover gate');
 requireText(releaseHealthRunbook, 'Rollback is also protected', 'protected scheduler rollback procedure');
 requireText(releaseHealthRunbook, 'Any future hard timing\nrequirement needs a separately reviewed independent scheduler', 'explicit GitHub scheduler service-level boundary');
+requireText(releaseHealthRunbook, '## Independent scheduler failover registration', 'bounded independent scheduler failover procedure');
+requireText(releaseHealthRunbook, '`.github/workflows/release-health-monitor-fallback.yml`', 'independent fallback workflow path');
+requireText(releaseHealthRunbook, releaseHealthFallbackRegistrationSourceSha256, 'exact independent fallback registration digest');
+requireText(releaseHealthRunbook, 'Never dispatch Stage F1.', 'inert registration dispatch prohibition');
+requireText(releaseHealthRunbook, 'Merge Stage F1 only through exact-head independent approval, hosted validation, and normal branch\nprotection.', 'protected Stage F1 merge gate');
+requireText(releaseHealthRunbook, 'record the distinct numeric ID at\nthe exact fallback path and verify state `active`', 'post-merge distinct fallback identity proof');
+requireText(releaseHealthRunbook, 'Do not change, dispatch, disable, or reinterpret\nthe existing monitor or native canary', 'native workflow non-mutation boundary');
+requireText(releaseHealthRunbook, 'strongly consistent per-slot idempotency', 'independent controller idempotency requirement');
+requireText(releaseHealthRunbook, 'Every fallback run must be labeled as fallback', 'fallback provenance boundary');
+requireText(releaseHealthRunbook, 'two\nconsecutive exact native `schedule` runs', 'native recovery standby gate');
+requireText(releaseHealthRunbook, 'Rollback is ordered: disable controller dispatch first, require zero queued or in-progress fallback\nruns', 'ordered fallback rollback gate');
+requireText(releaseHealthRunbook, 'disable the fallback workflow through the official API', 'official fallback disable rollback gate');
+requireText(releaseHealthRunbook, 'Preserve run and controller-ledger evidence.', 'fallback rollback evidence preservation');
 requireBalancedExpressions(releaseHealthIdentityCanary, 'release-health scheduler identity canary');
 requireSpaceIndentation(releaseHealthIdentityCanary, 'release-health scheduler identity canary');
+requireBalancedExpressions(releaseHealthFallbackRegistration, 'release-health fallback registration');
+requireSpaceIndentation(releaseHealthFallbackRegistration, 'release-health fallback registration');
 
 requireText(releaseHealth, 'workflow_dispatch:', 'manual release-health control');
 const releaseHealthCron = '9,24,39,54 * * * *';

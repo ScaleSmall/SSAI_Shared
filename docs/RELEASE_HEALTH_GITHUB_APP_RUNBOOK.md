@@ -122,6 +122,38 @@ workflow identity but is not a delivery-time service-level guarantee. Any future
 requirement needs a separately reviewed independent scheduler and a least-privilege authenticated
 entry point; it must not be simulated by manual dispatch.
 
+## Independent scheduler failover registration
+
+Use this path only when read-only evidence proves GitHub is not creating native `schedule` run
+records after the bounded scheduler-identity recovery above. The fallback restores availability;
+it never proves that GitHub's native scheduler recovered.
+
+Stage F1 registers `.github/workflows/release-health-monitor-fallback.yml` with normalized source
+SHA-256 `7dc0169828e640614cbced70dc21594ee1cc605118cd81ab5e40cafeab2994ac`.
+The source is intentionally inert: it has only an uninvoked `workflow_dispatch` registration
+trigger, empty workflow and job permissions, the shared non-cancelling monitor concurrency group,
+an unconditionally false job, no environment, no secrets, no action, no cache, no token, no
+network access, and no write path. Never dispatch Stage F1.
+
+Merge Stage F1 only through exact-head independent approval, hosted validation, and normal branch
+protection. After merge, use the read-only workflow inventory to record the distinct numeric ID at
+the exact fallback path and verify state `active`. Do not change, dispatch, disable, or reinterpret
+the existing monitor or native canary while registering the fallback identity.
+
+Stage F2 is a separate protected activation change. It must pin the observed fallback ID and exact
+path, accept only a dedicated repository-scoped GitHub App, validate a fresh HMAC-signed slot and
+request identity before accessing protected credentials, share the existing non-cancelling monitor
+concurrency group, and preserve authenticated incident state plus stale issue-write fencing. The
+independent controller must use strongly consistent per-slot idempotency, fail closed when native
+freshness cannot be determined, start in observe-only mode, and enter standby only after two
+consecutive exact native `schedule` runs. Every fallback run must be labeled as fallback and must
+remain excluded from native scheduler proof.
+
+Rollback is ordered: disable controller dispatch first, require zero queued or in-progress fallback
+runs, disable the fallback workflow through the official API, and use a reviewed protected revert
+if permanent retirement is intended. Preserve run and controller-ledger evidence. Never alter the
+native cron or re-enable another workflow identity as part of fallback rollback.
+
 The permanent legacy Shared propagation hold is separate from bounded production activation.
 Follow [Shared propagation retirement](./SHARED_PROPAGATION_RETIREMENT.md). Workflow `247016064`
 must remain disabled and has no reactivation or recovery path.
