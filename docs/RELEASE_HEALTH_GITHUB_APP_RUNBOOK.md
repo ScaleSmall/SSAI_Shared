@@ -154,6 +154,92 @@ runs, disable the fallback workflow through the official API, and use a reviewed
 if permanent retirement is intended. Preserve run and controller-ledger evidence. Never alter the
 native cron or re-enable another workflow identity as part of fallback rollback.
 
+## Protected F2a release-health foundation
+
+F2a hardens the existing native monitor without activating either alternate workflow. The current
+authoritative incident producer remains workflow ID `315630665` at
+`.github/workflows/release-health-monitor.yml`, and it is authorized only for the `schedule` event.
+Its exact LF-normalized source SHA-256 is
+`cc8371a32d055c7c515afd9dc947e486fc11d5e23fb609c1a4d74ff62048e1a2`.
+Workflow ID `344135917` at `.github/workflows/release-health-monitor-v3.yml` remains the exact inert
+scheduler canary. Workflow ID `344170407` at
+`.github/workflows/release-health-monitor-fallback.yml` remains the exact inert fallback
+registration. F2a explicitly rejects both alternate IDs as state producers and managed-issue
+writers. Do not dispatch, promote, or reinterpret either alternate workflow during F2a.
+
+The authoritative workflow uses the shared `scale-small-ai-release-health-monitor-v2` concurrency
+group with `queue: max` and `cancel-in-progress: false`. The scan and delivery capabilities are
+separate jobs. The scan job has only `contents: read`; it owns the protected environment, GitHub
+App token, authenticated cache, and monitor execution. The delivery job has only `actions: read`,
+`contents: read`, and `issues: write`; it receives an exact allowlist of non-sensitive scan outputs
+and cannot read App credentials, HMAC material, state files, or caches. No artifact transfer is
+allowed between the jobs. Delivery runs only after the scan job and required state persistence
+succeed.
+
+### Authenticated producer-neutral v6 state
+
+Schema v6 authenticates both notification state and the actual producer execution. Every new
+record includes the producer kind and policy, workflow ID and path, event, run ID, run attempt,
+head SHA, and authoritative run creation time. The run creation time comes from the exact GitHub
+Actions provider record selected by current run ID and attempt. It is never replaced with a runner
+clock or an environment timestamp. The currently registered producer policy is
+`native-schedule-v1`; it resolves only workflow `315630665`, the authoritative path, and event
+`schedule`. The schema can represent a separately authorized future fallback producer without
+mislabeling `workflow_dispatch` as `schedule`, but adding that policy is a later protected change.
+
+Restore v6 first. Authenticated v4, v3, and v2 records are accepted only by their exact legacy
+decoders and are immediately persisted as v6 even when the notification semantics did not change.
+Unknown schemas, invalid HMACs, unexpected fields, unregistered producer identities, malformed run
+provenance, and cache-key boundary mismatches fail closed into safe state reinitialization. Cache
+keys remain non-sensitive and content-bound; credentials and raw failure evidence are never cached.
+
+The authenticated producer tuple is also the state authority watermark. It is totally ordered by
+provider creation time, numeric run ID, and run attempt. Older and equal candidates cannot persist,
+migrate, or affect suppression. Every strictly newer accepted v6 producer advances the watermark,
+even when incident semantics are unchanged, while preserving the prior semantic delivery identity.
+This prevents an intermediate delayed run from overwriting state after a newer unchanged scan.
+The provider run head SHA is bound to the executing run's immutable `GITHUB_SHA`; the separately
+resolved live default-branch head may advance during the scan without invalidating that run proof.
+
+### Managed issue ordering and marker upgrade
+
+Managed issue delivery fetches the exact candidate and prior Actions run attempts through the
+official run-attempt endpoint. It validates workflow policy, repository, branch, event, head SHA,
+run ID, attempt, and provider creation time before any issue write. Competing deliveries are
+ordered first by authoritative provider creation time, then run ID, then attempt. An older delivery
+is suppressed, an exact replay is idempotent, and a conflicting exact replay requires operator
+reconciliation. A valid legacy v1 delivery marker is read once and upgraded to the workflow-bound
+v2 marker on the next authoritative reconciliation. Canary and fallback markers or run metadata
+are rejected in F2a.
+
+Immediately before every PATCH, delivery performs one exact issue re-read and revalidates the
+managed title, marker, label, state, provider ordering, and desired body. If the marker is unchanged
+but the body, state, state reason, title, label identity, or update timestamp changed since the
+initial list read, delivery fails closed for operator reconciliation. A legitimately newer marker
+is handled by one bounded provider-metadata prefetch followed by a second final exact issue read.
+If the marker advances again, delivery fails closed. Otherwise the refreshed authority can
+stale-suppress an older candidate, and a candidate newer than it may write once. No provider or
+repository request occurs between the final validated issue read and PATCH, and there is no
+open-ended retry loop.
+
+### F2a acceptance evidence ledger
+
+| Invariant | Correction | Negative regression | Positive control | Required result |
+| --- | --- | --- | --- | --- |
+| Native producer authority | Central producer policy pins ID `315630665`, path, and `schedule` | Authenticated canary, fallback, wrong-event, and malformed provenance fixtures | Exact provider record for the native run and attempt | Local focused tests pass |
+| Provider-bound v6 provenance | Persist kind, policy, workflow, event, run, attempt, SHA, and provider `created_at` | Individually tampered signed fields and creation time after state creation | Exact signed v6 round trip | Local focused tests pass |
+| Monotonic state authority | Total-order authenticated producer authority and persist every strictly newer watermark | Older changed rerun after a newer unchanged scan | Newer unchanged scan persists while preserving semantic delivery identity | Local focused tests pass |
+| Safe state migration | Separate HMAC-authenticated v4, v3, and v2 decoders force v6 persistence | Wrong schema, HMAC, fields, cache prefix, branch, and workflow | Exact v4, v3, and v2 migrations | Local focused tests pass |
+| Least-privilege split | Isolated scan and delivery jobs with allowlisted outputs | Write permission, secret handoff, extra output, wrong path, and artifact mutations | Exact workflow contract | Local workflow contract passes |
+| Lossless state ordering | Shared concurrency adds `queue: max` without cancellation | Missing queue mutation | Exact authoritative workflow source | Local workflow contract passes |
+| Stale issue-write fence | Exact-attempt validation and provider ordering precede every mutation | Stale, deleted-prior, mismatched-attempt, canary, fallback, and conflict fixtures | Newer delivery, exact replay, and v1 upgrade | Local focused tests pass |
+| Immediate issue mutation fence | Prefetch authority, then make the final exact issue read directly adjacent to PATCH | Body or timestamp drift, equal conflict, stale candidate, or a second marker advance | Newer candidate after one bounded marker prefetch writes once | Local focused tests pass |
+| Inert alternate workflows | Exact source and digest locks remain on canary and fallback registration | Trigger, permission, action, secret, network, and execution mutations | Byte-identical checked-in sources | Local workflow contract passes |
+
+This ledger records local foundation evidence only. It does not activate the fallback, promote the
+canary, or substitute for the protected merge, hosted validation, and natural-run evidence required
+by a later activation stage.
+
 The permanent legacy Shared propagation hold is separate from bounded production activation.
 Follow [Shared propagation retirement](./SHARED_PROPAGATION_RETIREMENT.md). Workflow `247016064`
 must remain disabled and has no reactivation or recovery path.
