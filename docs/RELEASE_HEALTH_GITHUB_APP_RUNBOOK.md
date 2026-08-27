@@ -49,7 +49,7 @@ Do not reuse the superseded 20-repository digest. Keep
    checks pass.
 3. After the App installation includes the exact reviewed inventory and the protected inventory
    digest is updated, enable the workflow before the next staggered 15-minute schedule boundary
-   (minutes 3, 18, 33, and 48 UTC). Do not use `workflow_dispatch` as scheduler proof; require the
+   (minutes 9, 24, 39, and 54 UTC). Do not use `workflow_dispatch` as scheduler proof; require the
    first natural scheduled run on exact current `main` to finish successfully and report the
    complete reviewed inventory.
 4. Monitor the following natural scheduled run. Require a changed state to persist successfully
@@ -59,6 +59,68 @@ Do not reuse the superseded 20-repository digest. Keep
 
 The pinned token action revokes its installation token during job cleanup. Never enable
 `skip-token-revoke`.
+
+## Scheduler identity recovery
+
+Use this procedure only after an unchanged workflow identity has missed multiple natural schedule
+boundaries and both supported repository-side registration recoveries have failed: a reviewed cron
+change on the default branch and one verified disable-enable cycle with zero active or queued runs.
+Do not repeat either recovery without new evidence.
+
+The recovery uses two protected merges because GitHub assigns the replacement numeric workflow ID
+only after a new workflow path exists on the default branch.
+
+### Stage 1: prove a new scheduler identity
+
+1. Add `.github/workflows/release-health-monitor-v3.yml` as the exact inert canary with normalized
+   source SHA-256 `3fe965ac8e77c17640fbc89633c230639c83d2e4e3ba0d43c9c50195338ce825`.
+2. Keep the canary schedule-only at minutes 1, 16, 31, and 46 UTC. It must have empty permissions,
+   no manual trigger, no secrets, no token, no checkout, no third-party action, no network access,
+   a two-minute timeout, and its own non-cancelling concurrency group.
+3. Keep the current full monitor unchanged. The canary is read-only and cannot reconcile issues or
+   alter release-health state.
+4. Merge only through normal branch protection after exact-head approval and hosted validation.
+5. Query the Actions workflow inventory and require a distinct numeric ID at the exact new path in
+   `active` state.
+6. Require two successful natural `schedule` runs from the current `main` SHA. A manual, push, or
+   pull-request run is not acceptance evidence. Retain the run IDs, attempts, timestamps, workflow
+   ID, path, head SHA, event, job conclusion, and the canary's verified repository/ref/SHA output.
+
+If the new identity does not produce natural runs, do not promote it or retire the current monitor.
+Classify the scheduler as an external GitHub delivery failure and retain all completed evidence.
+
+### Stage 2: promote the proven identity
+
+1. Before the change window, require zero queued or in-progress runs for both the current monitor
+   and the canary. Do not cancel a state-writing or issue-writing run to accelerate the cutover.
+2. In one protected change, replace the canary content at the same path with the full hardened
+   monitor and remove the schedule trigger from the old workflow identity. Do not leave two full
+   incident writers scheduled.
+3. Pin the newly observed numeric workflow ID, exact path, normalized workflow digest, repository,
+   event allowlist, job name, run title, and default-branch provenance in the monitor policy and its
+   contract tests. Preserve the old identity as an immutable predecessor or tombstone contract.
+4. Preserve the existing cache path, compatible cache action, restore prefixes, HMAC epoch, and
+   content verification. Cache data remains untrusted until its HMAC and exact provenance pass.
+   Never cache credentials.
+5. Preserve the managed issue title, label, marker, and delivery identity so issue `#24` is updated
+   or closed in place instead of creating a duplicate.
+6. Merge only through normal branch protection after exact-head approval, focused contracts, the
+   complete production-readiness gate, and hosted validation.
+7. Require the first natural full-monitor run to restore authenticated state and reconcile issue
+   `#24`. Require the next natural run to prove unchanged-state suppression without hiding a changed
+   or recovered condition.
+8. Disable or permanently tombstone the superseded workflow identity only after all acceptance
+   evidence above is complete and no old-identity run is active or queued.
+
+Rollback is also protected. Revert the activation change through a reviewed pull request, restore
+the old schedule source before re-enabling the old identity, verify no new-identity run is active or
+queued, and only then disable the new identity. Never edit `main` directly or run two scheduled
+incident writers during rollback.
+
+GitHub documents that scheduled events can be delayed or dropped. This recovery proves a healthy
+workflow identity but is not a delivery-time service-level guarantee. Any future hard timing
+requirement needs a separately reviewed independent scheduler and a least-privilege authenticated
+entry point; it must not be simulated by manual dispatch.
 
 The permanent legacy Shared propagation hold is separate from bounded production activation.
 Follow [Shared propagation retirement](./SHARED_PROPAGATION_RETIREMENT.md). Workflow `247016064`

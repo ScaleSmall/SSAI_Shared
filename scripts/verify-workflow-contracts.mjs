@@ -127,6 +127,7 @@ const workflowSources = await collectWorkflowSources();
 const validate = requireWorkflowSource(workflowSources, 'validate.yml');
 const propagate = requireWorkflowSource(workflowSources, 'propagate.yml');
 const releaseHealth = requireWorkflowSource(workflowSources, 'release-health-monitor.yml');
+const releaseHealthIdentityCanary = requireWorkflowSource(workflowSources, 'release-health-monitor-v3.yml');
 const releaseHealthVerifier = await readSource('scripts', 'verify-org-release-health.mjs');
 const releaseHealthRunbook = await readSource('docs', 'RELEASE_HEALTH_GITHUB_APP_RUNBOOK.md');
 const propagationRetirementRunbook = await readSource('docs', 'SHARED_PROPAGATION_RETIREMENT.md');
@@ -199,6 +200,91 @@ requireText(
 );
 rejectPattern(propagationRetirementRunbook, /gh\s+workflow\s+(?:enable|run)|\/actions\/workflows\/247016064\/(?:enable|dispatches)/i, 'retired propagation reactivation command');
 
+const expectedReleaseHealthIdentityCanarySource = [
+  'name: Scale Small AI Release Health Scheduler Identity Canary',
+  'run-name: Release health scheduler identity canary [natural]',
+  '',
+  'on:',
+  '  schedule:',
+  "    - cron: '1,16,31,46 * * * *'",
+  '',
+  'concurrency:',
+  '  group: scale-small-ai-release-health-monitor-v3-canary',
+  '  cancel-in-progress: false',
+  '',
+  'permissions: {}',
+  '',
+  'jobs:',
+  '  prove-natural-delivery:',
+  '    name: Prove natural scheduler delivery',
+  "    if: ${{ github.event_name == 'schedule' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}",
+  '    runs-on: ubuntu-24.04',
+  '    timeout-minutes: 2',
+  '    steps:',
+  '      - name: Verify immutable natural-schedule context',
+  '        shell: bash',
+  '        env:',
+  '          ACTUAL_EVENT: ${{ github.event_name }}',
+  '          ACTUAL_REF: ${{ github.ref }}',
+  '          ACTUAL_REPOSITORY: ${{ github.repository }}',
+  '          ACTUAL_SHA: ${{ github.sha }}',
+  '          EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}',
+  '          EXPECTED_REPOSITORY: ScaleSmall/SSAI_Shared',
+  '        run: |',
+  '          set -euo pipefail',
+  '          if [ "$ACTUAL_EVENT" != \'schedule\' ] || [ "$ACTUAL_REPOSITORY" != "$EXPECTED_REPOSITORY" ] || [ "$ACTUAL_REF" != "$EXPECTED_REF" ] || ! [[ "$ACTUAL_SHA" =~ ^[0-9a-f]{40}$ ]]; then',
+  '            echo "::error::Scheduler identity canary received an invalid execution context."',
+  '            exit 1',
+  '          fi',
+  "          printf 'natural_schedule_delivery=verified\\n'",
+  "          printf 'repository=%s\\n' \"$ACTUAL_REPOSITORY\"",
+  "          printf 'ref=%s\\n' \"$ACTUAL_REF\"",
+  "          printf 'sha=%s\\n' \"$ACTUAL_SHA\"",
+  '',
+].join('\n');
+
+const assertReleaseHealthIdentityCanary = (source) => {
+  assert.equal(
+    source,
+    expectedReleaseHealthIdentityCanarySource,
+    'the scheduler identity canary must remain the exact schedule-only inert source',
+  );
+  rejectPattern(source, /^\s{2}(?:workflow_dispatch|push|pull_request|pull_request_target|repository_dispatch|workflow_call):/m, 'scheduler identity canary non-schedule trigger');
+  rejectPattern(source, /\b(?:uses:|secrets\.|github\.token|GITHUB_TOKEN|https?:\/\/|curl\b|wget\b)/i, 'scheduler identity canary credential, action, or network access');
+};
+
+assertReleaseHealthIdentityCanary(releaseHealthIdentityCanary);
+for (const [description, mutatedSource] of [
+  ['manual trigger', releaseHealthIdentityCanary.replace('  schedule:\n', '  workflow_dispatch:\n  schedule:\n')],
+  ['repository write permission', releaseHealthIdentityCanary.replace('permissions: {}', 'permissions:\n  contents: write')],
+  ['secret access', `${releaseHealthIdentityCanary}# \${{ secrets.UNTRUSTED_SECRET }}\n`],
+  ['third-party action', releaseHealthIdentityCanary.replace('    steps:\n', '    steps:\n      - uses: actions/checkout@untrusted\n')],
+]) {
+  assert.throws(
+    () => assertReleaseHealthIdentityCanary(mutatedSource),
+    /scheduler identity canary/,
+    `the canary contract must reject ${description}`,
+  );
+}
+const releaseHealthIdentityCanarySourceSha256 = createHash('sha256')
+  .update(releaseHealthIdentityCanary)
+  .digest('hex');
+assert.equal(
+  releaseHealthIdentityCanarySourceSha256,
+  '3fe965ac8e77c17640fbc89633c230639c83d2e4e3ba0d43c9c50195338ce825',
+  'the scheduler identity canary source digest must remain exact',
+);
+requireText(releaseHealthRunbook, '## Scheduler identity recovery', 'bounded scheduler identity recovery procedure');
+requireText(releaseHealthRunbook, '`.github/workflows/release-health-monitor-v3.yml`', 'replacement workflow path');
+requireText(releaseHealthRunbook, releaseHealthIdentityCanarySourceSha256, 'exact canary source digest');
+requireText(releaseHealthRunbook, 'Require two successful natural `schedule` runs', 'repeated natural-delivery acceptance gate');
+requireText(releaseHealthRunbook, 'Do not leave two full\n   incident writers scheduled', 'single incident-writer cutover gate');
+requireText(releaseHealthRunbook, 'require zero queued or in-progress runs', 'drained scheduler cutover gate');
+requireText(releaseHealthRunbook, 'Rollback is also protected', 'protected scheduler rollback procedure');
+requireText(releaseHealthRunbook, 'Any future hard timing\nrequirement needs a separately reviewed independent scheduler', 'explicit GitHub scheduler service-level boundary');
+requireBalancedExpressions(releaseHealthIdentityCanary, 'release-health scheduler identity canary');
+requireSpaceIndentation(releaseHealthIdentityCanary, 'release-health scheduler identity canary');
+
 requireText(releaseHealth, 'workflow_dispatch:', 'manual release-health control');
 const releaseHealthCron = '9,24,39,54 * * * *';
 requireText(releaseHealth, `cron: '${releaseHealthCron}'`, 'fleet-staggered 15-minute release-health schedule');
@@ -209,6 +295,25 @@ const cyclicReleaseHealthIntervals = releaseHealthMinutes.map((minute, index) =>
   return (nextMinute - minute + 60) % 60;
 });
 assert.deepEqual(cyclicReleaseHealthIntervals, [15, 15, 15, 15], 'release-health cadence must remain exactly 15 minutes');
+const releaseHealthIdentityCanaryCron = '1,16,31,46 * * * *';
+const releaseHealthIdentityCanaryMinutes = [...expandCronMinuteField(
+  releaseHealthIdentityCanaryCron.split(/\s+/)[0],
+  'release-health scheduler identity canary',
+)].sort((left, right) => left - right);
+const cyclicReleaseHealthIdentityCanaryIntervals = releaseHealthIdentityCanaryMinutes.map((minute, index) => {
+  const nextMinute = releaseHealthIdentityCanaryMinutes[(index + 1) % releaseHealthIdentityCanaryMinutes.length];
+  return (nextMinute - minute + 60) % 60;
+});
+assert.deepEqual(
+  cyclicReleaseHealthIdentityCanaryIntervals,
+  [15, 15, 15, 15],
+  'scheduler identity canary cadence must remain exactly 15 minutes',
+);
+assert.deepEqual(
+  releaseHealthIdentityCanaryMinutes.filter((minute) => releaseHealthMinutes.includes(minute)),
+  [],
+  'scheduler identity canary must not collide with the current monitor',
+);
 // Keep these minute fields aligned with every in-scope fleet cron so the monitor
 // does not sample partial state while scheduled production work is starting.
 const fleetScheduleMinuteReservations = new Map([
@@ -228,6 +333,10 @@ for (const [reservation, cron] of fleetScheduleMinuteReservations) {
   const collisions = releaseHealthMinutes.filter((minute) => reservedMinutes.has(minute));
   if (collisions.length > 0) {
     throw new Error(`Release-health schedule collides with ${reservation} at minute(s): ${collisions.join(', ')}`);
+  }
+  const canaryCollisions = releaseHealthIdentityCanaryMinutes.filter((minute) => reservedMinutes.has(minute));
+  if (canaryCollisions.length > 0) {
+    throw new Error(`Scheduler identity canary collides with ${reservation} at minute(s): ${canaryCollisions.join(', ')}`);
   }
 }
 requireText(releaseHealth, 'permissions:\n  contents: read\n  issues: write', 'bounded same-repository incident delivery permission');
