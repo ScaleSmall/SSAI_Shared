@@ -18,7 +18,7 @@ on:
         default: '6'
         type: string
   schedule:
-    - cron: '3,18,33,48 * * * *'
+    - cron: '9,24,39,54 * * * *'
 
 concurrency:
   # v2 isolates the protected scheduler from the immutable orphaned v1 run.
