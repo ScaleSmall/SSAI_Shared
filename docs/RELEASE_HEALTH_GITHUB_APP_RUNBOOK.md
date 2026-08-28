@@ -154,6 +154,87 @@ runs, disable the fallback workflow through the official API, and use a reviewed
 if permanent retirement is intended. Preserve run and controller-ledger evidence. Never alter the
 native cron or re-enable another workflow identity as part of fallback rollback.
 
+## Protected F2b observe-only fallback activation
+
+F2b activates workflow ID `344170407` at `.github/workflows/release-health-monitor-fallback.yml`
+for authenticated `workflow_dispatch` only. Its exact checked-in SHA-256 is
+`6fdb093c47e8631ea151b6f0a0aa5356db03c025a6813321f7f35e8bc6ed86b9`. Native workflow
+`315630665` and canary `344135917` remain unchanged and retain their native-schedule-only proof
+roles. A fallback run is never scheduler recovery evidence.
+
+The fallback accepts exactly four routing inputs: packed base64url envelope, logical slot epoch
+minute, request ID, and signature. The canonical envelope carries eleven fields in fixed order:
+version, repository, repository ID, workflow ID, workflow path, ref, expected SHA, logical slot,
+request ID, issued-at, and expires-at. The slot and request routing inputs must exactly duplicate
+their signed envelope values. The canonical bytes are HMAC-authenticated with the domain
+`ssai-release-health-fallback-envelope-v1\0` and uint32 big-endian length-delimited UTF-8 field
+names and values. The request ID is 32 lowercase hexadecimal characters and the signature is 64.
+The dedicated key is base64 encoding of at least 32 bytes and is distinct from the state key.
+Actor login, actor ID, and event sender ID are separately pinned in the admission environment.
+
+Admission validates repository ID `1183552904`, protected main, provider run attempt 1, exact main
+SHA, normalized provider path, workflow identity, actor and sender, bounded expiry, logical slot,
+request, and HMAC before checkout, cache, or monitor credentials. A minimal bootstrap fetches the
+validator at the signed SHA, and checkout byte-compares that source before cache access. Every job
+rejects reruns. The immutable slot claim uses its own HMAC domain and the exact slot only, and both
+claim and authenticated state require exact post-save cache visibility.
+Both native and fallback share the non-cancelling `scale-small-ai-release-health-monitor-v2`
+`queue: max` group and `ssai-release-health-state-v6-v1-` namespace. Schema v6 authenticates its
+recorded producer independently, so either authorized producer can restore the other's state.
+Legacy v4, v3, v2, and v1 issue markers remain native historical formats.
+
+The zero-dependency Cloudflare controller is under `workers/release-health-controller`. Its
+canonical sorted-source digest is `2ebf1e68002676aeca95bd75ed31633562210f59d5089591f548ab02619a18f2`.
+Its activation-profile digest is
+`7c33bb9451f67921f04e6ee21a46b059a546615e75872ebc2e04834c40a2f0d9`. The checked-in
+configuration is `MODE=observe`, has no public route, and schedules evaluation every minute.
+Logical slots are minutes 1, 16, 31, and 46. Evaluation occurs only at ages 10 through 14 minutes
+to provide five bounded same-slot recovery opportunities, and never backfills a new dispatch. A
+final exact native/canary lookup, stable main SHA, and one
+unfiltered fallback inventory must pass before the durable prepare transition. Any exact native or
+canary schedule run in the slot blocks fallback. Only two consecutive canary slots establish
+persistent standby, and standby/resume evidence is transactionally audited.
+
+The SQLite ledger binds every global slot to exact source and profile digests and uses the phases
+`leased`, `prepared`, `post-attempted`, `unknown`, `confirmed`, and `terminal`. Prepared state holds
+only unsigned request metadata. The atomic `prepared` to `post-attempted` transition consumes the
+sole workflow POST permit before network access. A restart from `post-attempted` or `unknown` uses
+exact request-ID GET reconciliation only, including after a source/profile generation change.
+GitHub provides no dispatch idempotency key, so an uncertain attempt is never reposted. Bounded
+delayed reconciliation tolerates provider indexing lag while retaining unresolved evidence.
+A prepared request resumes only under its original exact digests. Any source/profile mutation
+atomically terminalizes the unattempted request as `prepared-abandoned`, appends its chained audit
+event, and enqueues its sanitized alert. The globally consumed slot is never reassigned.
+A prepared row that survives beyond its admission window is terminalized and alerted on the next
+minute tick. It is never dispatched from a later logical slot.
+A lease interrupted before preparation is likewise terminalized and alerted as `lease-abandoned`;
+no pre-network row remains nonterminal indefinitely.
+
+Observe mode durably records `would_dispatch` and makes zero workflow dispatch POSTs. Two
+consecutive observe slots under the same source/profile generation establish the protected
+activation proof in the same transaction as the second terminal result and chained audit row.
+Changing only `MODE` preserves the proof. Any effective source, policy, identity, cadence,
+credential-epoch, HMAC-epoch, alert-epoch, or circuit-policy change invalidates it. Observation uses
+a repository-scoped Actions-read installation token. Active dispatch mints a distinct uncached
+Actions-write token only after proof and post-permit checks pass and immediately before the one
+dispatch request.
+
+Four unresolved attempts within 60 minutes open the durable circuit for a documented 60-minute
+cooldown and enqueue one `circuit-open` alert for the episode. One half-open probe follows the
+cooldown. Confirmation closes the circuit; ambiguity reopens it. Failure evidence and a sanitized
+deterministic alert body commit before delivery. The HMAC signature is derived only at delivery
+time and is never persisted. Sink failure leaves the original evidence and outbox record pending
+for bounded retry under the same alert ID. Rollback first disables controller evaluation, then
+proves no fallback run is queued or active, and only then disables the fallback workflow.
+
+While observe-only, exact fallback workflow ID `344170407` and its exact source digest have a
+temporary no-history inventory allowance. It requires a successful current-main
+`Validate shared package` push run from `.github/workflows/validate.yml` no older than 30 hours.
+The allowance expires absolutely at `2026-09-30T23:59:59Z`, is recorded with
+`recovery_evidence=false`, and cannot provide native recovery evidence. At or after the expiry,
+missing fallback history becomes an unresolved no-history failure. Protected active-mode
+activation must remove or allow this observe-only allowance to expire rather than extending it.
+
 ## Protected F2a release-health foundation
 
 F2a hardens the existing native monitor without activating either alternate workflow. The current

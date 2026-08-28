@@ -1,0 +1,44 @@
+{
+  "name": "ssai-release-health-controller",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-08-27",
+  "workers_dev": false,
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "vars": {
+    "MODE": "observe",
+    "CONTROLLER_SOURCE_SHA256": "2ebf1e68002676aeca95bd75ed31633562210f59d5089591f548ab02619a18f2",
+    "CONTROLLER_ACTIVATION_PROFILE_SHA256": "7c33bb9451f67921f04e6ee21a46b059a546615e75872ebc2e04834c40a2f0d9",
+    "REPOSITORY": "ScaleSmall/SSAI_Shared",
+    "REPOSITORY_ID": "1183552904",
+    "DEFAULT_BRANCH": "main",
+    "NATIVE_WORKFLOW_ID": "315630665",
+    "CANARY_WORKFLOW_ID": "344135917",
+    "FALLBACK_WORKFLOW_ID": "344170407",
+    "LOGICAL_SLOT_MINUTES": "1,16,31,46",
+    "NATIVE_MINUTES": "9,24,39,54",
+    "GRACE_MINUTES": "10",
+    "CIRCUIT_FAILURE_LIMIT": "4",
+    "CIRCUIT_WINDOW_MINUTES": "60",
+    "CIRCUIT_COOLDOWN_MINUTES": "60",
+    "GITHUB_APP_CREDENTIAL_EPOCH": "github-app-credential-v1",
+    "FALLBACK_ADMISSION_HMAC_EPOCH": "fallback-admission-hmac-v1",
+    "ALERT_SIGNING_EPOCH": "release-health-alert-hmac-v1",
+    "ALERT_SINK_URL": "https://alerts.scalesmall.ai/release-health-alert"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SLOT_LEDGER",
+        "class_name": "ReleaseHealthControllerObject"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ReleaseHealthControllerObject"]
+    }
+  ]
+}

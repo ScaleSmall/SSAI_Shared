@@ -4,10 +4,12 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  releaseHealthFallbackNoHistoryExpiresAt,
   releaseHealthIncidentProducerPolicies,
   releaseHealthMonitorJobNames,
   releaseHealthMonitorWorkflowIdentities,
 } from './release-health-monitor-utils.mjs';
+import { activationProfileDigest } from '../workers/release-health-controller/src/activation-profile.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
@@ -90,8 +92,17 @@ const assertNoLegacyCrossRepositoryPat = (sources) => {
 
 const requireBalancedExpressions = (source, description) => {
   const openings = source.match(/\$\{\{/g)?.length ?? 0;
-  const closings = source.match(/\}\}/g)?.length ?? 0;
-  if (openings !== closings) throw new Error(`Unbalanced GitHub expressions in ${description}: ${openings}/${closings}`);
+  let cursor = 0;
+  let paired = 0;
+  while (true) {
+    const opening = source.indexOf('${{', cursor);
+    if (opening < 0) break;
+    const closing = source.indexOf('}}', opening + 3);
+    if (closing < 0) break;
+    paired += 1;
+    cursor = closing + 2;
+  }
+  if (openings !== paired) throw new Error(`Unbalanced GitHub expressions in ${description}: ${openings}/${paired}`);
 };
 
 const requireSpaceIndentation = (source, description) => {
@@ -195,8 +206,104 @@ const releaseHealthVerifier = await readSource('scripts', 'verify-org-release-he
 const releaseHealthUtils = await readSource('scripts', 'release-health-monitor-utils.mjs');
 const releaseHealthDelivery = await readSource('scripts', 'sync-release-health-incident-issue.mjs');
 const releaseHealthRunbook = await readSource('docs', 'RELEASE_HEALTH_GITHUB_APP_RUNBOOK.md');
+const fallbackAdmission = await readSource('scripts', 'verify-release-health-fallback-admission.mjs');
+const controllerConfig = JSON.parse(await readSource('workers', 'release-health-controller', 'wrangler.jsonc'));
+const controllerSourceNames = (await readdir(path.join(repoRoot, 'workers', 'release-health-controller', 'src'))).sort();
+const controllerSources = await Promise.all(controllerSourceNames.map((name) => readSource('workers', 'release-health-controller', 'src', name)));
+const controllerSourceByName = new Map(controllerSourceNames.map((name, index) => [name, controllerSources[index]]));
 const propagationRetirementRunbook = await readSource('docs', 'SHARED_PROPAGATION_RETIREMENT.md');
 const combined = [...workflowSources.values()].join('\n');
+
+assert.equal(controllerConfig.vars.MODE, 'observe', 'F2b controller must remain observe-only');
+assert.equal(controllerConfig.workers_dev, false, 'F2b controller must have no public workers.dev route');
+assert.deepEqual(controllerConfig.triggers.crons, ['* * * * *'], 'controller recovery cadence must remain exact');
+assert.deepEqual(controllerConfig.migrations, [{ tag: 'v1', new_sqlite_classes: ['ReleaseHealthControllerObject'] }], 'controller SQLite Durable Object migration must remain exact');
+assert.deepEqual(
+  {
+    repository: controllerConfig.vars.REPOSITORY,
+    repositoryId: controllerConfig.vars.REPOSITORY_ID,
+    nativeWorkflow: controllerConfig.vars.NATIVE_WORKFLOW_ID,
+    canaryWorkflow: controllerConfig.vars.CANARY_WORKFLOW_ID,
+    fallbackWorkflow: controllerConfig.vars.FALLBACK_WORKFLOW_ID,
+    logicalSlots: controllerConfig.vars.LOGICAL_SLOT_MINUTES,
+    nativeMinutes: controllerConfig.vars.NATIVE_MINUTES,
+    grace: controllerConfig.vars.GRACE_MINUTES,
+    circuitFailures: controllerConfig.vars.CIRCUIT_FAILURE_LIMIT,
+    circuitWindow: controllerConfig.vars.CIRCUIT_WINDOW_MINUTES,
+    circuitCooldown: controllerConfig.vars.CIRCUIT_COOLDOWN_MINUTES,
+    appEpoch: controllerConfig.vars.GITHUB_APP_CREDENTIAL_EPOCH,
+    admissionEpoch: controllerConfig.vars.FALLBACK_ADMISSION_HMAC_EPOCH,
+    alertEpoch: controllerConfig.vars.ALERT_SIGNING_EPOCH,
+    alertSink: controllerConfig.vars.ALERT_SINK_URL,
+  },
+  {
+    repository: 'ScaleSmall/SSAI_Shared',
+    repositoryId: '1183552904',
+    nativeWorkflow: '315630665',
+    canaryWorkflow: '344135917',
+    fallbackWorkflow: '344170407',
+    logicalSlots: '1,16,31,46',
+    nativeMinutes: '9,24,39,54',
+    grace: '10',
+    circuitFailures: '4',
+    circuitWindow: '60',
+    circuitCooldown: '60',
+    appEpoch: 'github-app-credential-v1',
+    admissionEpoch: 'fallback-admission-hmac-v1',
+    alertEpoch: 'release-health-alert-hmac-v1',
+    alertSink: 'https://alerts.scalesmall.ai/release-health-alert',
+  },
+  'controller effective activation environment must remain exact',
+);
+assert.equal(Object.hasOwn(controllerConfig.vars, 'NO_HISTORY_EXPIRES_AT'), false, 'inventory allowance expiry must not be an ignored controller variable');
+const controllerDigest = createHash('sha256');
+for (let index = 0; index < controllerSourceNames.length; index += 1) {
+  controllerDigest.update(controllerSourceNames[index] + '\0').update(controllerSources[index]).update('\0');
+}
+assert.equal(controllerConfig.vars.CONTROLLER_SOURCE_SHA256, controllerDigest.digest('hex'), 'controller source digest must bind every runtime module');
+assert.equal(
+  controllerConfig.vars.CONTROLLER_ACTIVATION_PROFILE_SHA256,
+  await activationProfileDigest(controllerConfig.vars),
+  'controller activation profile must bind the effective nonsecret environment',
+);
+for (const source of controllerSources) rejectPattern(source, /from ['"](?!\.\/|node:)/, 'controller runtime dependency');
+const controllerRuntime = controllerSourceByName.get('controller.mjs');
+const controllerStore = controllerSourceByName.get('store.mjs');
+const controllerApi = controllerSourceByName.get('github-api.mjs');
+const controllerIndex = controllerSourceByName.get('index.mjs');
+requireText(controllerStore, "CHECK(phase IN ('leased','prepared','post-attempted','unknown','confirmed','terminal'))", 'typed durable controller phases');
+requireText(controllerStore, "phase='post-attempted',post_attempt_count=1", 'pre-network one-shot dispatch permit');
+requireText(controllerStore, 'envelope_json TEXT', 'unsigned prepared envelope persistence');
+rejectPattern(controllerStore, /inputs_json|signature\s+TEXT/i, 'persisted reusable dispatch or alert signature');
+requireText(controllerStore, "phase IN ('post-attempted','unknown')", 'restart GET-only reconciliation inventory');
+requireText(controllerStore, 'async abandonUnattempted(', 'stale lease/prepared abandonment');
+requireText(controllerRuntime, "phase === 'prepared' ? 'prepared-abandoned' : 'lease-abandoned'", 'stale unattempted alert path');
+requireText(controllerStore, "circuit_state='half-open'", 'durable circuit half-open transition');
+requireText(controllerStore, "state IN ('pending','sending','delivered','dead')", 'durable alert outbox phases');
+requireText(controllerRuntime, "344170407,\n      'workflow_dispatch'", 'single unfiltered fallback inventory');
+rejectPattern(controllerRuntime, /actions\/workflows\/344170407\/runs\?status=/, 'sequential fallback status inventory');
+requireText(controllerApi, 'export async function dispatchWorkflowOnce', 'operation-specific one-attempt dispatch client');
+requireText(controllerApi, 'attempts: 3', 'bounded GitHub read and token retry client');
+requireText(controllerIndex, "if (request.method !== 'POST')", 'internal evaluate method boundary');
+requireText(controllerIndex, "url.pathname !== '/evaluate' || url.search || url.hash", 'internal evaluate path boundary');
+requireText(releaseHealthRunbook, controllerConfig.vars.CONTROLLER_SOURCE_SHA256, 'controller source digest runbook binding');
+requireText(releaseHealthRunbook, controllerConfig.vars.CONTROLLER_ACTIVATION_PROFILE_SHA256, 'controller activation profile runbook binding');
+requireText(fallbackAdmission, 'ssai-release-health-fallback-envelope-v1\\0', 'versioned fallback HMAC domain');
+requireText(fallbackAdmission, 'writeUInt32BE', 'uint32be fallback envelope canonicalization');
+requireText(fallbackAdmission, 'fallbackRepositoryId = 1183552904', 'exact fallback repository ID');
+requireText(releaseHealthVerifier, "['SSAI_Shared:Scale Small AI Release Health Independent Fallback'", 'observe-only fallback no-history inventory allowance');
+requireText(releaseHealthVerifier, 'workflowId: releaseHealthMonitorWorkflowIdentities.fallback.workflowId', 'fallback no-history workflow ID binding');
+requireText(releaseHealthVerifier, 'observeStageExpiresAt: releaseHealthFallbackNoHistoryExpiresAt', 'fallback no-history absolute observe-stage expiry binding');
+requireText(releaseHealthVerifier, "name: 'Validate shared package'", 'fallback no-history validation witness');
+requireText(releaseHealthVerifier, "allowedEvents: ['push']", 'fallback no-history push-only witness');
+requireText(releaseHealthVerifier, "maxAgeHours: 30", 'fallback no-history witness freshness');
+requireText(releaseHealthUtils, 'Number(workflow.id) !== releaseHealthMonitorWorkflowIdentities.fallback.workflowId', 'exact observed fallback workflow ID enforcement');
+requireText(releaseHealthUtils, 'nowMs >= observeStageExpiresAtMs', 'fail-closed fallback no-history expiry enforcement');
+requireText(releaseHealthUtils, 'recovery_evidence: false', 'fallback no-history non-recovery evidence classification');
+requireText(releaseHealthVerifier, 'const exactFallbackProducer =', 'fallback self-deployment exact producer branch');
+requireText(releaseHealthVerifier, 'Number(status?.source_run_attempt) === 1', 'fallback self-deployment first-attempt restriction');
+requireText(releaseHealthFallbackRegistration, 'X-GitHub-Api-Version: 2026-03-10', 'exact fallback GitHub API version');
+rejectPattern(combined, /wrangler\s+(?:deploy|publish)|cloudflare\/wrangler-action/i, 'unrun F2b controller deployment workflow');
 
 assert.deepEqual(
   releaseHealthMonitorWorkflowIdentities,
@@ -218,8 +325,15 @@ assert.deepEqual(
       path: '.github/workflows/release-health-monitor.yml',
       events: ['schedule'],
     },
+    fallbackDispatch: {
+      kind: 'github-actions-workflow-run',
+      policy: 'independent-fallback-v1',
+      workflowId: 344170407,
+      path: '.github/workflows/release-health-monitor-fallback.yml',
+      events: ['workflow_dispatch'],
+    },
   },
-  'F2a must authorize only the native scheduled monitor as an incident-state producer',
+  'F2b must authorize the exact native schedule and independent fallback producers',
 );
 assert.deepEqual(
   releaseHealthMonitorJobNames,
@@ -406,41 +520,38 @@ const expectedReleaseHealthFallbackRegistrationSource = [
 ].join('\n');
 
 const assertReleaseHealthFallbackRegistration = (source) => {
-  assert.equal(
-    source,
-    expectedReleaseHealthFallbackRegistrationSource,
-    'the independent fallback registration must remain the exact inert Stage F1 source',
-  );
+  requireText(source, 'name: Scale Small AI Release Health Independent Fallback', 'activated independent fallback name');
+  requireText(source, '  workflow_dispatch:', 'fallback workflow_dispatch-only trigger');
+  requireText(source, '  queue: max', 'fallback lossless shared queue');
+  requireText(source, '    name: Admit exact independent fallback request', 'pre-secret fallback admission');
+  requireText(source, 'SSAI_RELEASE_MONITOR_FALLBACK_ADMISSION_HMAC_KEY', 'dedicated admission HMAC');
+  requireText(source, 'ssai-release-health-state-v6-v1-', 'shared producer-neutral v6 cache namespace');
+  assert.equal((source.match(/required: true/g) || []).length, 4, 'fallback must expose exactly four packed routing inputs');
+  for (const input of ['envelope_base64url', 'slot_epoch_minute', 'request_id', 'signature_sha256']) {
+    requireText(source, '      ' + input + ': { required: true, type: string }', 'exact packed fallback input ' + input);
+  }
+  requireText(source, "if: ${{ github.run_attempt == 1 }}", 'admission and scan rerun fence');
+  requireText(source, "always() && github.run_attempt == 1", 'delivery rerun fence');
+  requireText(source, 'Verify exact immutable slot claim visibility', 'exact claim post-save visibility');
+  requireText(source, 'Verify exact authenticated state visibility', 'exact state post-save visibility');
+  requireText(source, 'cmp --silent', 'fetched admission source byte comparison');
   rejectPattern(source, /^\s{2}(?:schedule|push|pull_request|pull_request_target|repository_dispatch|workflow_call):/m, 'fallback registration executable event trigger');
-  rejectPattern(source, /\b(?:uses:|secrets\.|github\.token|GITHUB_TOKEN|environment:|cache|https?:\/\/|curl\b|wget\b)/i, 'fallback registration credential, action, environment, cache, or network access');
+  rejectPattern(source, /^\s{2}(?:schedule|repository_dispatch):/m, 'fallback forbidden autonomous trigger');
 };
 
 assertReleaseHealthFallbackRegistration(releaseHealthFallbackRegistration);
-for (const [description, mutatedSource] of [
-  ['executable job', releaseHealthFallbackRegistration.replace('if: ${{ false }}', 'if: ${{ true }}')],
-  ['native schedule', releaseHealthFallbackRegistration.replace('  workflow_dispatch:\n', "  schedule:\n    - cron: '*/5 * * * *'\n")],
-  ['repository dispatch', releaseHealthFallbackRegistration.replace('  workflow_dispatch:', '  repository_dispatch:')],
-  ['workflow write permission', releaseHealthFallbackRegistration.replace('permissions: {}', 'permissions:\n  actions: write')],
-  ['job write permission', releaseHealthFallbackRegistration.replace('    permissions: {}', '    permissions:\n      contents: write')],
-  ['different concurrency group', releaseHealthFallbackRegistration.replace('scale-small-ai-release-health-monitor-v2', 'unregistered-fallback-group')],
-  ['environment access', releaseHealthFallbackRegistration.replace('    runs-on: ubuntu-24.04', '    environment: production\n    runs-on: ubuntu-24.04')],
-  ['secret access', `${releaseHealthFallbackRegistration}# \${{ secrets.UNTRUSTED_SECRET }}\n`],
-  ['action execution', releaseHealthFallbackRegistration.replace('    steps:\n', '    steps:\n      - uses: actions/checkout@untrusted\n')],
-  ['network access', releaseHealthFallbackRegistration.replace('          exit 1', '          curl https://example.invalid\n          exit 1')],
-]) {
-  assert.throws(
-    () => assertReleaseHealthFallbackRegistration(mutatedSource),
-    /fallback registration/,
-    `the Stage F1 contract must reject ${description}`,
-  );
-}
 const releaseHealthFallbackRegistrationSourceSha256 = createHash('sha256')
   .update(releaseHealthFallbackRegistration)
   .digest('hex');
 assert.equal(
   releaseHealthFallbackRegistrationSourceSha256,
-  '7dc0169828e640614cbced70dc21594ee1cc605118cd81ab5e40cafeab2994ac',
-  'the independent fallback registration source digest must remain exact',
+  '6fdb093c47e8631ea151b6f0a0aa5356db03c025a6813321f7f35e8bc6ed86b9',
+  'the activated independent fallback source digest must remain exact',
+);
+assert.equal(
+  releaseHealthFallbackNoHistoryExpiresAt,
+  '2026-09-30T23:59:59Z',
+  'fallback no-history expiry must remain the exact absolute observe-stage deadline',
 );
 requireText(releaseHealthRunbook, '## Scheduler identity recovery', 'bounded scheduler identity recovery procedure');
 requireText(releaseHealthRunbook, '`.github/workflows/release-health-monitor-v3.yml`', 'replacement workflow path');
@@ -755,6 +866,9 @@ requireText(releaseHealthVerifier, 'partitionWorkflowHealth(', 'exhaustive workf
 requireText(releaseHealthVerifier, 'workflow_categories_complete', 'workflow category completeness assertion');
 requireText(releaseHealthVerifier, 'unresolved_no_history_workflows', 'explicit unresolved no-history accounting');
 requireText(releaseHealthVerifier, 'allowed_no_history_evidence', 'auditable no-history evidence summary');
+requireText(releaseHealthVerifier, 'workflow_id: row.no_history_workflow_id', 'no-history workflow ID evidence handoff');
+requireText(releaseHealthVerifier, 'observe_stage_expires_at: row.no_history_observe_stage_expires_at', 'no-history expiry evidence handoff');
+requireText(releaseHealthVerifier, 'recovery_evidence: row.no_history_recovery_evidence', 'no-history recovery classification handoff');
 requireText(releaseHealthVerifier, 'verifyAuthorizedDisabledWorkflowHold(', 'source-hashed authorized disabled workflow hold');
 requireText(releaseHealthVerifier, 'authorized_disabled_workflow_hold_evidence', 'auditable disabled workflow hold summary');
 requireText(releaseHealthVerifier, "if (!isUtf8(source)) throw new Error(repoName + ' workflow source for ' + path + ' is not valid UTF-8.');", 'fail-closed workflow source encoding gate');
@@ -865,12 +979,12 @@ requireText(releaseHealthDelivery, 'releaseHealthIncidentProducerPolicies,', 'in
 requireText(releaseHealthDelivery, 'resolveReleaseHealthIncidentProducer,', 'incident delivery producer resolver import');
 requireText(releaseHealthDelivery, 'export const activeIncidentWorkflowId = releaseHealthIncidentProducerPolicies.nativeSchedule.workflowId;', 'derived authoritative incident workflow identity');
 requireText(releaseHealthDelivery, 'export const rejectedCanaryWorkflowId = releaseHealthMonitorWorkflowIdentities.canary.workflowId;', 'explicit canary incident delivery rejection identity');
-requireText(releaseHealthDelivery, 'export const rejectedFallbackWorkflowId = releaseHealthMonitorWorkflowIdentities.fallback.workflowId;', 'explicit fallback incident delivery rejection identity');
+requireText(releaseHealthDelivery, 'export const fallbackIncidentWorkflowId = releaseHealthIncidentProducerPolicies.fallbackDispatch.workflowId;', 'explicit fallback incident delivery authorization identity');
 requireText(releaseHealthDelivery, "'/attempts/' + runAttempt", 'exact issue-delivery run-attempt provider fetch');
 requireText(releaseHealthDelivery, 'compareAuthoritativeRuns(', 'authoritative stale issue-write ordering');
 requireText(releaseHealthDelivery, 'parseIssueDeliveryReference(', 'v1 and v2 managed issue marker decoder');
 requireText(releaseHealthDelivery, 'incidentDeliveryMarker(deliveryIdentity, producer.workflowId)', 'producer-authenticated v2 issue marker writer');
-requireText(releaseHealthVerifier, 'const incidentStateWorkflowId = releaseHealthIncidentProducerPolicies.nativeSchedule.workflowId;', 'native state workflow identity binding');
+requireText(releaseHealthVerifier, 'const exactNativeProducer = workflowId === releaseHealthMonitorWorkflowIdentities.active.workflowId', 'native self-deployment workflow identity binding');
 requireText(releaseHealthVerifier, 'source_run_attempt:', 'exact current run-attempt binding');
 requireText(releaseHealthVerifier, "'incident_delivery_identity=' + exactIncidentDeliveryIdentity", 'authenticated stable delivery identity output');
 requireText(releaseHealthVerifier, 'incidentDeliveryIdentity: state.delivery_identity', 'restored delivery identity reconciliation');
