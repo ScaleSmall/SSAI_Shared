@@ -19,6 +19,7 @@ export const releaseHealthMonitorWorkflowIdentities = Object.freeze({
   canary: schedulerCanaryWorkflowIdentity,
   fallback: fallbackWorkflowIdentity,
 });
+export const releaseHealthFallbackNoHistoryExpiresAt = '2026-09-30T23:59:59Z';
 export const releaseHealthIncidentProducerPolicies = Object.freeze({
   nativeSchedule: Object.freeze({
     kind: 'github-actions-workflow-run',
@@ -26,6 +27,13 @@ export const releaseHealthIncidentProducerPolicies = Object.freeze({
     workflowId: authoritativeNativeWorkflowIdentity.workflowId,
     path: authoritativeNativeWorkflowIdentity.path,
     events: Object.freeze(['schedule']),
+  }),
+  fallbackDispatch: Object.freeze({
+    kind: 'github-actions-workflow-run',
+    policy: 'independent-fallback-v1',
+    workflowId: fallbackWorkflowIdentity.workflowId,
+    path: fallbackWorkflowIdentity.path,
+    events: Object.freeze(['workflow_dispatch']),
   }),
 });
 export const releaseHealthMonitorJobNames = Object.freeze({
@@ -201,6 +209,37 @@ export function evaluateNoHistoryAllowance({
     return { allowed: false, reason: 'the workflow path does not match the explicitly approved release control' };
   }
 
+  const configuredWorkflowId = policy.workflowId === undefined ? null : Number(policy.workflowId);
+  if (configuredWorkflowId !== null
+    && (!Number.isSafeInteger(configuredWorkflowId) || configuredWorkflowId < 1
+      || Number(workflow.id) !== configuredWorkflowId)) {
+    return { allowed: false, reason: 'the workflow ID does not match the explicitly approved release control' };
+  }
+
+  const isFallbackObserveAllowance = expectedPath === releaseHealthMonitorWorkflowIdentities.fallback.path;
+  let observeStageExpiresAt = null;
+  if (isFallbackObserveAllowance) {
+    if (configuredWorkflowId !== releaseHealthMonitorWorkflowIdentities.fallback.workflowId
+      || Number(workflow.id) !== releaseHealthMonitorWorkflowIdentities.fallback.workflowId) {
+      return { allowed: false, reason: 'the fallback no-history allowance is not bound to the exact fallback workflow ID' };
+    }
+    observeStageExpiresAt = String(policy.observeStageExpiresAt || '').trim();
+    const observeStageExpiresAtMs = Date.parse(observeStageExpiresAt);
+    const canonicalObserveStageExpiry = Number.isFinite(observeStageExpiresAtMs)
+      ? new Date(observeStageExpiresAtMs).toISOString().replace('.000Z', 'Z')
+      : '';
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(observeStageExpiresAt)
+      || canonicalObserveStageExpiry !== observeStageExpiresAt) {
+      return { allowed: false, reason: 'the fallback observe-stage expiry is missing or non-canonical' };
+    }
+    if (observeStageExpiresAt !== releaseHealthFallbackNoHistoryExpiresAt) {
+      return { allowed: false, reason: 'the fallback observe-stage expiry does not match the approved absolute deadline' };
+    }
+    if (nowMs >= observeStageExpiresAtMs) {
+      return { allowed: false, reason: 'the fallback observe-stage no-history allowance has expired' };
+    }
+  }
+
   const expectedSourceSha256 = String(policy.sourceSha256 || '').trim().toLowerCase();
   const sourceBytes = typeof workflowSource === 'string' ? Buffer.from(workflowSource, 'utf8') : workflowSource;
   if (!/^[a-f0-9]{64}$/.test(expectedSourceSha256) || !Buffer.isBuffer(sourceBytes)) {
@@ -271,6 +310,9 @@ export function evaluateNoHistoryAllowance({
   return {
     allowed: true,
     reason,
+    workflow_id: Number(workflow.id),
+    observe_stage_expires_at: observeStageExpiresAt,
+    recovery_evidence: false,
     workflow_source_sha256: actualSourceSha256,
     witness: {
       workflow: witnessWorkflow.name,

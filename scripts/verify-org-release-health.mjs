@@ -39,6 +39,7 @@ import {
   recordActivityTime,
   recordOccurrenceTime,
   releaseHealthDeliveryIdentity,
+  releaseHealthFallbackNoHistoryExpiresAt,
   releaseHealthIncidentProducerPolicies,
   releaseHealthMonitorJobNames,
   releaseHealthMonitorWorkflowIdentities,
@@ -82,7 +83,6 @@ const predecessorIncidentStateSchema = 4;
 const previousIncidentStateSchema = 3;
 const legacyIncidentStateSchema = 2;
 const persistedNotificationClusterTokenCount = maxIncidentFingerprintIssues;
-const incidentStateWorkflowId = releaseHealthIncidentProducerPolicies.nativeSchedule.workflowId;
 
 class ScheduledIncidentStateReinitializationError extends Error {
   constructor() {
@@ -104,6 +104,10 @@ const currentRunId = numericIdentifier(process.env.GITHUB_RUN_ID);
 const currentRunAttempt = numericIdentifier(process.env.GITHUB_RUN_ATTEMPT);
 const currentTriggerEvent = String(process.env.GITHUB_EVENT_NAME || '').trim();
 const currentWorkflowHeadSha = String(process.env.GITHUB_SHA || '').trim().toLowerCase();
+const currentWorkflowRef = String(process.env.GITHUB_WORKFLOW_REF || '').trim();
+const currentWorkflowPath = currentWorkflowRef.startsWith(currentRepository + '/')
+  ? currentWorkflowRef.slice(currentRepository.length + 1).split('@')[0]
+  : '';
 export function releaseHealthPageLimits(mode) {
   if (!['continuous', 'incident'].includes(mode)) {
     throw new Error('Release-health page-limit mode is invalid.');
@@ -403,6 +407,20 @@ export function validateReleaseHealthActionsRunPage(
 const pageLimits = releaseHealthPageLimits(scanMode);
 
 const noHistoryPolicies = new Map([
+  ['SSAI_Shared:Scale Small AI Release Health Independent Fallback', {
+    workflowId: releaseHealthMonitorWorkflowIdentities.fallback.workflowId,
+    path: '.github/workflows/release-health-monitor-fallback.yml',
+    sourceSha256: '6fdb093c47e8631ea151b6f0a0aa5356db03c025a6813321f7f35e8bc6ed86b9',
+    observeStageExpiresAt: releaseHealthFallbackNoHistoryExpiresAt,
+    reason: 'The independent fallback remains observe-only. This source-bound allowance is inventory evidence only and cannot establish native recovery.',
+    witness: {
+      name: 'Validate shared package',
+      path: '.github/workflows/validate.yml',
+      headRepository: 'ScaleSmall/SSAI_Shared',
+      allowedEvents: ['push'],
+      maxAgeHours: 30,
+    },
+  }],
   ['SSAI_Analytics_Reporting:Deploy Production Analytics Pages', {
     path: '.github/workflows/deploy-production-pages.yml',
     sourceSha256: '1ffee267b32c9a5579455fc8b4684ab28c7be0d187a7f0a50257ce6ad1299cc6',
@@ -733,8 +751,11 @@ const summary = {
   allowed_no_history_evidence: allowedNoHistoryWorkflows.map((row) => ({
     repo: row.repo,
     workflow: row.name,
+    workflow_id: row.no_history_workflow_id,
     reason: row.no_history_reason,
     workflow_source_sha256: row.no_history_source_sha256,
+    observe_stage_expires_at: row.no_history_observe_stage_expires_at,
+    recovery_evidence: row.no_history_recovery_evidence,
     witness: row.no_history_witness,
   })),
   current_commit_checks: rows.reduce((total, row) => total + row.checks.length + row.statuses.length, 0),
@@ -824,7 +845,7 @@ async function inspectRepository(repo) {
   const recentBranchCommits = branchCommitGroups.flat();
   const recentPullCommits = pullCommitGroups.flat();
   const recentRuns = associateWorkflowRunsWithPulls(rawRecentRuns, recentPullCommits);
-  const incidentStateProducer = repo.name === currentRepoName && currentTriggerEvent === 'schedule'
+  const incidentStateProducer = repo.name === currentRepoName && scheduledStateEnabled
     ? validateScheduledIncidentProducerRun(
       recentRuns.find((run) => Number(run.id) === currentRunId
         && Number(run.run_attempt) === currentRunAttempt),
@@ -919,7 +940,10 @@ async function inspectRepository(repo) {
         url: workflow.html_url,
         allowed_no_history: allowance.allowed,
         no_history_reason: allowance.reason,
+        no_history_workflow_id: allowance.workflow_id || null,
         no_history_source_sha256: allowance.workflow_source_sha256 || null,
+        no_history_observe_stage_expires_at: allowance.observe_stage_expires_at || null,
+        no_history_recovery_evidence: allowance.recovery_evidence === false ? false : null,
         no_history_witness: allowance.witness,
       };
     }
@@ -2556,7 +2580,10 @@ export async function mapLimit(items, limit, worker) {
 }
 
 export function scheduledIncidentStateEnabled(mode, event) {
-  return mode === 'continuous' && event === 'schedule';
+  if (mode !== 'continuous') return false;
+  if (event === 'schedule') return true;
+  return event === 'workflow_dispatch'
+    && currentWorkflowPath === releaseHealthIncidentProducerPolicies.fallbackDispatch.path;
 }
 
 export function expectedInventoryDigest(repositories) {
@@ -2756,12 +2783,14 @@ export function validateScheduledIncidentProducerRun(run, expected) {
   const workflowId = Number(run.workflow_id);
   const event = String(run.event || '').trim();
   const repository = String(run.repository?.full_name || '').trim();
+  const repositoryId = Number(run.repository?.id);
+  const providerPath = String(run.path || '').replace(/@(?:main|refs\/heads\/main)$/, '');
   const headBranch = String(run.head_branch || '').trim();
   const headSha = String(run.head_sha || '').trim().toLowerCase();
   const createdAt = canonicalGitHubTimestamp(run.created_at);
   const producer = resolveReleaseHealthIncidentProducer({
     workflowId,
-    path: releaseHealthIncidentProducerPolicies.nativeSchedule.path,
+    path: providerPath,
     event,
   });
   if (!producer
@@ -2769,7 +2798,9 @@ export function validateScheduledIncidentProducerRun(run, expected) {
     || runId !== String(expected.runId || '')
     || !Number.isSafeInteger(runAttempt) || runAttempt < 1
     || runAttempt !== Number(expected.runAttempt)
+    || (producer?.policy === 'independent-fallback-v1' && runAttempt !== 1)
     || repository !== expected.repository
+    || repositoryId !== 1183552904
     || headBranch !== expected.defaultBranch
     || !/^[a-f0-9]{40}$/.test(headSha)
     || headSha !== String(expected.headSha || '').toLowerCase()
@@ -3184,8 +3215,9 @@ function scheduledIncidentStateContext(producerExecution = null) {
   }
   const event = String(process.env.GITHUB_EVENT_NAME || '').trim();
   const producer = resolveReleaseHealthIncidentProducer({
-    workflowId: releaseHealthIncidentProducerPolicies.nativeSchedule.workflowId,
-    path: releaseHealthIncidentProducerPolicies.nativeSchedule.path,
+    workflowId: Object.values(releaseHealthIncidentProducerPolicies)
+      .find((policy) => policy.path === currentWorkflowPath && policy.events.includes(event))?.workflowId,
+    path: currentWorkflowPath,
     event,
   });
   if (!producer) {
@@ -3267,6 +3299,8 @@ function validatePersistedIncidentState(state, context, cacheTimestamp, authenti
     || state.workflow_id !== producer.workflowId
     || state.workflow_ref !== context.repository + '/' + producer.path + '@' + context.ref
     || state.trigger_event !== producer.event
+    || (producer.policy === releaseHealthIncidentProducerPolicies.fallbackDispatch.policy
+      && Number(state.producer_run_attempt) !== 1)
     || producerRunIdentity !== 'run-' + String(state.producer_run_id)
       + '-attempt-' + String(state.producer_run_attempt)
     || !/^[a-f0-9]{40}$/.test(String(state.producer_head_sha || ''))
@@ -3274,9 +3308,7 @@ function validatePersistedIncidentState(state, context, cacheTimestamp, authenti
     || !Number.isFinite(producerCreatedAtMs)
     || !Number.isFinite(stateCreatedAtMs)
     || producerCreatedAtMs > stateCreatedAtMs
-    || producer.workflowId !== context.producer.workflowId
-    || producer.path !== context.producer.path
-    || producer.event !== context.producer.event) {
+    ) {
     throw new Error('Scheduled incident state failed provenance validation.');
   }
   validatePersistedNotificationClusterTokens(state, 'Scheduled incident state');
@@ -3286,8 +3318,8 @@ function validatePersistedIncidentState(state, context, cacheTimestamp, authenti
     cacheTimestamp,
     authenticationKey,
     incidentStateSchema,
-    context.workflowRef,
-    context.producer.event,
+    state.workflow_ref,
+    state.trigger_event,
     'Scheduled incident state',
   );
 }
@@ -3424,13 +3456,13 @@ function validateScheduledIncidentStateIdentityContext(context) {
   const hmacEpoch = String(context?.hmacEpoch || '');
   const expectedProducer = resolveReleaseHealthIncidentProducer(context?.producer || {});
   const expectedActiveRef = expectedRepository + '/'
+    + String(expectedProducer?.path || '') + '@' + ref;
+  const expectedPredecessorRef = expectedRepository + '/'
     + releaseHealthIncidentProducerPolicies.nativeSchedule.path + '@' + ref;
-  const expectedPredecessorRef = expectedActiveRef;
   if (context?.repository !== expectedRepository
     || !/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(ref)
     || !expectedProducer
-    || expectedProducer.policy !== releaseHealthIncidentProducerPolicies.nativeSchedule.policy
-    || context.workflowId !== releaseHealthIncidentProducerPolicies.nativeSchedule.workflowId
+    || context.workflowId !== expectedProducer.workflowId
     || context.workflowRef !== expectedActiveRef
     || context.predecessorWorkflowRef !== expectedPredecessorRef
     || hmacEpoch !== 'v1'
@@ -3459,6 +3491,7 @@ function validateScheduledIncidentProducerExecution(execution, expectedProducer)
     || resolved.event !== expectedProducer.event
     || !/^[1-9][0-9]{0,19}$/.test(runId)
     || !Number.isSafeInteger(runAttempt) || runAttempt < 1
+    || (resolved.policy === releaseHealthIncidentProducerPolicies.fallbackDispatch.policy && runAttempt !== 1)
     || !/^[a-f0-9]{40}$/.test(headSha)
     || !createdAt) {
     throw new Error('Scheduled incident producer execution is invalid.');
@@ -3708,8 +3741,12 @@ export function renderReleaseHealthStepSummary(result, environment = process.env
         ? ' Witness: [' + evidence.witness.workflow + ' run ' + evidence.witness.run_id + '](' + safeMarkdownUrl(evidence.witness.url) + ') on `'
           + evidence.witness.head_sha + '` via `' + evidence.witness.event + '` from `' + evidence.witness.head_repository + '`.'
         : '';
+      const expiry = evidence.observe_stage_expires_at
+        ? ' Observe-stage expiry: `' + evidence.observe_stage_expires_at + '`.'
+        : '';
       return '- ' + evidence.repo + ' / ' + evidence.workflow + ': ' + evidence.reason
-        + ' Approved source SHA-256: `' + evidence.workflow_source_sha256 + '`.' + witness;
+        + ' Workflow ID: `' + evidence.workflow_id + '`. Approved source SHA-256: `'
+        + evidence.workflow_source_sha256 + '`.' + expiry + ' Recovery evidence: `no`.' + witness;
     }));
   }
   const disabledHoldEvidence = result.authorized_disabled_workflow_hold_evidence || [];
@@ -3972,20 +4009,28 @@ function deploymentNotificationStreamDigest(status) {
 }
 
 export function isExactSelfMonitorEnvironmentDeployment(repoName, status, defaultBranch = 'main') {
+  const workflowId = Number(status?.source_workflow_id);
+  const event = String(status?.source_event || '');
+  const displayTitle = String(status?.source_run_display_title || '');
+  const exactNativeProducer = workflowId === releaseHealthMonitorWorkflowIdentities.active.workflowId
+    && ['schedule', 'workflow_dispatch'].includes(event)
+    && /^Release health monitor \[(?:continuous:\d+h|incident:168h)\]$/.test(displayTitle);
+  const exactFallbackProducer = workflowId === releaseHealthMonitorWorkflowIdentities.fallback.workflowId
+    && Number(status?.source_run_attempt) === 1
+    && event === 'workflow_dispatch'
+    && /^Release health independent fallback \[slot:(?:0|[1-9][0-9]{0,11}) request:[a-f0-9]{32}\]$/.test(displayTitle);
   return repoName === 'SSAI_Shared'
     && status?.environment === 'release-health-monitor'
     && status?.task === 'deploy'
     && status?.identity_source === 'github-actions-job'
-    && Number(status?.source_workflow_id) === incidentStateWorkflowId
     && Number.isSafeInteger(Number(status?.source_run_id))
     && Number(status.source_run_id) > 0
     && Number.isSafeInteger(Number(status?.source_check_run_id))
     && Number(status.source_check_run_id) > 0
     && status?.source_head_repository === 'ScaleSmall/SSAI_Shared'
     && status?.source_head_branch === defaultBranch
-    && ['schedule', 'workflow_dispatch'].includes(String(status?.source_event || ''))
     && status?.source_check_name === releaseHealthMonitorJobNames.scan
-    && /^Release health monitor \[(?:continuous:\d+h|incident:168h)\]$/.test(String(status?.source_run_display_title || ''));
+    && (exactNativeProducer || exactFallbackProducer);
 }
 
 function failureEpisodeAnchor(records, failedRecord, streamDigestFor, isSuccessful, evidenceAnchorFor) {

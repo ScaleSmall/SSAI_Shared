@@ -45,6 +45,7 @@ import {
   recordOccurrenceTime,
   rateHeadroomDecision,
   releaseHealthDeliveryIdentity,
+  releaseHealthFallbackNoHistoryExpiresAt,
   releaseHealthIncidentProducerPolicies,
   releaseHealthMonitorJobNames,
   releaseHealthMonitorWorkflowIdentities,
@@ -877,6 +878,49 @@ assert.equal(
   0,
   'the next scheduled scan must not turn exact self-generated environment deployments into a failure loop',
 );
+const fallbackSelfMonitorDeployment = {
+  ...selfMonitorDeployment,
+  deployment_id: 7005,
+  id: 7006,
+  source_workflow_id: releaseHealthMonitorWorkflowIdentities.fallback.workflowId,
+  source_run_id: 29799900003,
+  source_run_attempt: 1,
+  source_check_run_id: 88999000003,
+  source_event: 'workflow_dispatch',
+  source_run_display_title: 'Release health independent fallback [slot:123456 request:' + 'a'.repeat(32) + ']',
+};
+assert.equal(
+  isExactSelfMonitorEnvironmentDeployment('SSAI_Shared', fallbackSelfMonitorDeployment, 'main'),
+  true,
+  'the exact first-attempt fallback monitor deployment must be recognized as self-generated',
+);
+assert.equal(
+  [selfMonitorDeployment, fallbackSelfMonitorDeployment]
+    .filter((status) => !isExactSelfMonitorEnvironmentDeployment('SSAI_Shared', status, 'main')).length,
+  0,
+  'native and fallback monitor deployments must both be excluded from their own deployment inventory',
+);
+for (const [label, mutation] of [
+  ['fallback rerun', { source_run_attempt: 2 }],
+  ['fallback schedule event', { source_event: 'schedule' }],
+  ['native title under fallback ID', { source_run_display_title: 'Release health monitor [continuous:6h]' }],
+  ['uppercase fallback request', {
+    source_run_display_title: 'Release health independent fallback [slot:123456 request:' + 'A'.repeat(32) + ']',
+  }],
+  ['fallback title suffix', {
+    source_run_display_title: fallbackSelfMonitorDeployment.source_run_display_title + ' extra',
+  }],
+]) {
+  assert.equal(
+    isExactSelfMonitorEnvironmentDeployment(
+      'SSAI_Shared',
+      { ...fallbackSelfMonitorDeployment, ...mutation },
+      'main',
+    ),
+    false,
+    label + ' must remain visible in deployment health inventory',
+  );
+}
 assert.equal(
   isExactSelfMonitorEnvironmentDeployment(
     'SSAI_Shared',
@@ -928,14 +972,15 @@ assert.deepEqual(
     path: stateContext.producer.path,
     event: stateContext.producer.event,
   },
-  'F2a must authorize only the exact authoritative native schedule producer',
+  'F2b must preserve the exact authoritative native schedule producer',
 );
 const providerRunFixture = {
   id: Number(stateContext.producer.runId),
   run_attempt: stateContext.producer.runAttempt,
   workflow_id: stateContext.producer.workflowId,
+  path: stateContext.producer.path + '@refs/heads/main',
   event: stateContext.producer.event,
-  repository: { full_name: stateContext.repository },
+  repository: { id: 1183552904, full_name: stateContext.repository },
   head_branch: 'main',
   head_sha: stateContext.producer.headSha,
   created_at: stateContext.producer.createdAt,
@@ -968,11 +1013,12 @@ assert.deepEqual(
 );
 for (const [label, mutation] of [
   ['canary workflow', { workflow_id: releaseHealthMonitorWorkflowIdentities.canary.workflowId }],
-  ['fallback workflow', { workflow_id: releaseHealthMonitorWorkflowIdentities.fallback.workflowId, event: 'workflow_dispatch' }],
   ['wrong run ID', { id: Number(stateContext.producer.runId) + 1 }],
   ['wrong attempt', { run_attempt: 2 }],
   ['wrong head SHA', { head_sha: 'b'.repeat(40) }],
   ['missing creation time', { created_at: '' }],
+  ['wrong provider path', { path: '.github/workflows/wrong.yml' }],
+  ['wrong repository ID', { repository: { id: 1, full_name: stateContext.repository } }],
 ]) {
   assert.throws(
     () => validateScheduledIncidentProducerRun({ ...providerRunFixture, ...mutation }, providerRunExpected),
@@ -980,14 +1026,20 @@ for (const [label, mutation] of [
     label + ' must fail provider producer selection',
   );
 }
+assert.equal(
+  resolveReleaseHealthIncidentProducer({ ...releaseHealthMonitorWorkflowIdentities.fallback, event: 'workflow_dispatch' })?.policy,
+  'independent-fallback-v1',
+  'F2b must authorize only the exact fallback workflow_dispatch producer',
+);
 for (const rejectedProducer of [
   { ...releaseHealthMonitorWorkflowIdentities.canary, event: 'schedule' },
-  { ...releaseHealthMonitorWorkflowIdentities.fallback, event: 'workflow_dispatch' },
+  { ...releaseHealthMonitorWorkflowIdentities.fallback, event: 'schedule' },
+  { ...releaseHealthMonitorWorkflowIdentities.active, event: 'workflow_dispatch' },
 ]) {
   assert.equal(
     resolveReleaseHealthIncidentProducer(rejectedProducer),
     null,
-    'F2a must reject the reserved canary and fallback producer identities',
+    'F2b must reject canary and producer/event identity confusion',
   );
 }
 const stateRecord = createScheduledIncidentStateRecord(
@@ -1004,6 +1056,47 @@ const decodedState = decodeScheduledIncidentState(
   stateKey,
   stateContext,
   stateAuthenticationKey,
+);
+const fallbackProducer = Object.freeze({
+  kind: releaseHealthIncidentProducerPolicies.fallbackDispatch.kind,
+  policy: releaseHealthIncidentProducerPolicies.fallbackDispatch.policy,
+  workflowId: releaseHealthIncidentProducerPolicies.fallbackDispatch.workflowId,
+  path: releaseHealthIncidentProducerPolicies.fallbackDispatch.path,
+  event: 'workflow_dispatch',
+  runId: '30264003715',
+  runAttempt: 1,
+  headSha: 'e'.repeat(40),
+  createdAt: '2026-07-21T18:05:00Z',
+});
+const fallbackStateContext = {
+  ...stateContext,
+  workflowId: fallbackProducer.workflowId,
+  workflowRef: stateContext.repository + '/' + fallbackProducer.path + '@' + stateContext.ref,
+  producer: fallbackProducer,
+};
+const fallbackStateRecord = createScheduledIncidentStateRecord(
+  fingerprintA,
+  fallbackStateContext,
+  stateAuthenticationKey,
+  '2026-07-21T18:06:00.000Z',
+  releaseHealthDeliveryIdentity(fallbackProducer.runId, fallbackProducer.runAttempt),
+);
+const fallbackStateKey = stateContext.cachePrefix + 'at-2026-07-21T18-06-00-000Z';
+assert.equal(
+  decodeScheduledIncidentState(
+    Buffer.from(JSON.stringify(fallbackStateRecord) + '\n'),
+    fallbackStateKey,
+    stateContext,
+    stateAuthenticationKey,
+  ).producerAuthority.runId,
+  fallbackProducer.runId,
+  'native must restore authenticated fallback-authored v6 state from the shared namespace',
+);
+assert.equal(
+  decodeScheduledIncidentState(stateBytes, stateKey, fallbackStateContext, stateAuthenticationKey)
+    .producerAuthority.runId,
+  stateContext.producer.runId,
+  'fallback must restore authenticated native-authored v6 state from the shared namespace',
 );
 assert.equal(
   decodedState.notificationStateHmac,
@@ -1452,6 +1545,34 @@ const authenticallySignScheduledIncidentState = (record) => {
       .digest('hex'),
   };
 };
+const fallbackAttemptTwoState = authenticallySignScheduledIncidentState({
+  ...cloneScheduledIncidentStateRecord(fallbackStateRecord),
+  producer_run_attempt: 2,
+});
+assert.throws(
+  () => decodeScheduledIncidentState(
+    Buffer.from(JSON.stringify(fallbackAttemptTwoState) + '\n'),
+    fallbackStateKey,
+    stateContext,
+    stateAuthenticationKey,
+  ),
+  /failed provenance validation/,
+  'authenticated fallback-authored v6 state must reject a provider rerun attempt',
+);
+assert.throws(
+  () => createScheduledIncidentStateRecord(
+    fingerprintA,
+    {
+      ...fallbackStateContext,
+      producer: { ...fallbackStateContext.producer, runAttempt: 2 },
+    },
+    stateAuthenticationKey,
+    '2026-07-21T18:07:00.000Z',
+    releaseHealthDeliveryIdentity(fallbackProducer.runId, 2),
+  ),
+  /producer execution is invalid/,
+  'new fallback-authored v6 state must reject a provider rerun attempt before persistence',
+);
 const authenticatedV6ProducerNegativeCases = Object.freeze([
   Object.freeze({
     label: 'producer kind',
@@ -2819,6 +2940,98 @@ assert.equal(evaluateNoHistoryAllowance({
   nowMs: Date.parse('2026-07-18T14:00:00Z'),
 }).allowed, false, 'witness evidence from an unapproved repository must fail closed');
 
+const fallbackNoHistoryWorkflow = {
+  id: releaseHealthMonitorWorkflowIdentities.fallback.workflowId,
+  name: 'Scale Small AI Release Health Independent Fallback',
+  path: releaseHealthMonitorWorkflowIdentities.fallback.path,
+  state: 'active',
+};
+const fallbackNoHistorySource = 'name: Scale Small AI Release Health Independent Fallback\non:\n  workflow_dispatch:\n';
+const fallbackWitnessWorkflow = {
+  id: 803,
+  name: 'Validate shared package',
+  path: '.github/workflows/validate.yml',
+  state: 'active',
+};
+const fallbackWitnessRun = {
+  id: 804,
+  workflow_id: fallbackWitnessWorkflow.id,
+  head_branch: 'main',
+  head_sha: 'c'.repeat(40),
+  head_repository: { full_name: 'ScaleSmall/SSAI_Shared' },
+  event: 'push',
+  status: 'completed',
+  conclusion: 'success',
+  run_started_at: '2026-08-27T13:00:00Z',
+  html_url: 'https://github.com/ScaleSmall/SSAI_Shared/actions/runs/804',
+};
+const fallbackNoHistoryPolicy = {
+  workflowId: releaseHealthMonitorWorkflowIdentities.fallback.workflowId,
+  path: fallbackNoHistoryWorkflow.path,
+  sourceSha256: createHash('sha256').update(fallbackNoHistorySource).digest('hex'),
+  observeStageExpiresAt: releaseHealthFallbackNoHistoryExpiresAt,
+  reason: 'The fallback is observe-only and cannot establish native recovery.',
+  witness: {
+    name: fallbackWitnessWorkflow.name,
+    path: fallbackWitnessWorkflow.path,
+    headRepository: 'ScaleSmall/SSAI_Shared',
+    allowedEvents: ['push'],
+    maxAgeHours: 30,
+  },
+};
+const fallbackNoHistoryInput = {
+  workflow: fallbackNoHistoryWorkflow,
+  policy: fallbackNoHistoryPolicy,
+  workflowSource: fallbackNoHistorySource,
+  workflows: [fallbackNoHistoryWorkflow, fallbackWitnessWorkflow],
+  runs: [fallbackWitnessRun],
+  defaultBranch: 'main',
+  expectedHeadSha: 'c'.repeat(40),
+  nowMs: Date.parse('2026-08-27T14:00:00Z'),
+};
+const fallbackNoHistoryAllowance = evaluateNoHistoryAllowance(fallbackNoHistoryInput);
+assert.equal(fallbackNoHistoryAllowance.allowed, true, 'the exact unexpired fallback observe-stage allowance must pass');
+assert.equal(
+  fallbackNoHistoryAllowance.workflow_id,
+  releaseHealthMonitorWorkflowIdentities.fallback.workflowId,
+  'fallback no-history evidence must retain the exact observed workflow ID',
+);
+assert.equal(
+  fallbackNoHistoryAllowance.observe_stage_expires_at,
+  fallbackNoHistoryPolicy.observeStageExpiresAt,
+  'fallback no-history evidence must retain the absolute observe-stage expiry',
+);
+assert.equal(
+  fallbackNoHistoryAllowance.recovery_evidence,
+  false,
+  'fallback no-history evidence must be explicitly unusable as recovery evidence',
+);
+for (const [label, mutation] of [
+  ['wrong policy workflow ID', {
+    policy: { ...fallbackNoHistoryPolicy, workflowId: releaseHealthMonitorWorkflowIdentities.active.workflowId },
+  }],
+  ['wrong observed workflow ID', {
+    workflow: { ...fallbackNoHistoryWorkflow, id: releaseHealthMonitorWorkflowIdentities.active.workflowId },
+  }],
+  ['missing observe-stage expiry', {
+    policy: { ...fallbackNoHistoryPolicy, observeStageExpiresAt: undefined },
+  }],
+  ['non-canonical observe-stage expiry', {
+    policy: { ...fallbackNoHistoryPolicy, observeStageExpiresAt: '2026-09-30T23:59:59.000Z' },
+  }],
+  ['different canonical future expiry', {
+    policy: { ...fallbackNoHistoryPolicy, observeStageExpiresAt: '2099-09-30T23:59:59Z' },
+  }],
+  ['exact expiry instant', { nowMs: Date.parse(fallbackNoHistoryPolicy.observeStageExpiresAt) }],
+  ['after expiry', { nowMs: Date.parse('2026-10-01T00:00:00Z') }],
+]) {
+  assert.equal(
+    evaluateNoHistoryAllowance({ ...fallbackNoHistoryInput, ...mutation }).allowed,
+    false,
+    label + ' must fail the fallback no-history allowance closed',
+  );
+}
+
 const failedRun = {
   id: 301,
   workflow_id: 44,
@@ -3151,6 +3364,10 @@ for (const [label, monitorWorkflowIdentities] of [
   ['reversed roles', [
     releaseHealthMonitorWorkflowIdentities.predecessor,
     releaseHealthMonitorWorkflowIdentities.active,
+  ]],
+  ['fallback substituted for predecessor', [
+    releaseHealthMonitorWorkflowIdentities.active,
+    releaseHealthMonitorWorkflowIdentities.fallback,
   ]],
   ['wrong active ID', [
     { ...releaseHealthMonitorWorkflowIdentities.active, workflowId: 123 },

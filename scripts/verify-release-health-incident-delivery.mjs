@@ -9,7 +9,7 @@ import {
   incidentIssueMarker,
   incidentIssueTitle,
   rejectedCanaryWorkflowId,
-  rejectedFallbackWorkflowId,
+  fallbackIncidentWorkflowId,
   selectManagedIncidentIssue,
   syncReleaseHealthIncidentIssue,
 } from './sync-release-health-incident-issue.mjs';
@@ -21,7 +21,7 @@ assert.equal(
   'incident delivery must use the canonical active workflow identity',
 );
 assert.equal(rejectedCanaryWorkflowId, 344135917, 'the scheduler canary identity must remain explicitly rejected');
-assert.equal(rejectedFallbackWorkflowId, 344170407, 'the inert fallback identity must remain explicitly rejected');
+assert.equal(fallbackIncidentWorkflowId, 344170407, 'the independent fallback identity must be explicitly authorized');
 
 const repository = 'ScaleSmall/SSAI_Shared';
 const currentRunId = '33120000002';
@@ -79,6 +79,10 @@ function runFixture({
   workflowId = activeIncidentWorkflowId,
   event = 'schedule',
   fullName = repository,
+  repositoryId = 1183552904,
+  path = workflowId === fallbackIncidentWorkflowId
+    ? '.github/workflows/release-health-monitor-fallback.yml@main'
+    : '.github/workflows/release-health-monitor.yml@refs/heads/main',
   headBranch = 'main',
   headSha = currentHeadSha,
   createdAt = currentCreatedAt,
@@ -87,8 +91,9 @@ function runFixture({
     id,
     run_attempt: Number(runAttempt),
     workflow_id: workflowId,
+    path,
     event,
-    repository: { full_name: fullName },
+    repository: { id: repositoryId, full_name: fullName },
     head_branch: headBranch,
     head_sha: headSha,
     created_at: createdAt,
@@ -246,6 +251,15 @@ function assertFinalIssueReadImmediatelyPrecedesPatch(calls, number = 42) {
   assert.match(create.options.body.body, new RegExp(currentRunId));
   assert.ok(create.options.body.body.includes(incidentDeliveryMarker(deliveryIdentity())));
   assert.ok(create.options.body.body.includes(releaseHealthMonitorWorkflowIdentities.active.path));
+}
+
+// The existing v1 issue is migrated in place after its old registered run is attested.
+{
+  const fallbackRun = runFixture({ workflowId: fallbackIncidentWorkflowId, event: 'workflow_dispatch', runAttempt: '1' });
+  const harness = apiHarness({ issues: [], runs: [fallbackRun] });
+  assert.deepEqual(await sync(harness, { runAttempt: '1', deliveryIdentity: deliveryIdentity(currentRunId, '1') }), { action: 'created', issueNumber: 77 });
+  assert.match(harness.storedIssues[0].body, /Producer: independent fallback/);
+  assert.match(harness.storedIssues[0].body, /workflow-344170407/);
 }
 
 // The existing v1 issue is migrated in place after its old registered run is attested.
@@ -424,8 +438,7 @@ await assert.rejects(
 
 // Every active candidate metadata boundary is checked before any issue mutation.
 for (const [label, runMutation, expected] of [
-  ['canary workflow', { workflow_id: rejectedCanaryWorkflowId }, /registered delivery identity/],
-  ['fallback workflow', { workflow_id: rejectedFallbackWorkflowId }, /registered delivery identity/],
+  ['canary workflow', { workflow_id: rejectedCanaryWorkflowId }, /identity is not registered/],
   ['wrong event', { event: 'workflow_dispatch' }, /producer is not authorized/],
   ['wrong repository', { repository: { full_name: 'attacker/fork' } }, /outside the managed boundary/],
   ['wrong branch', { head_branch: 'release' }, /branch is not main/],
@@ -438,9 +451,9 @@ for (const [label, runMutation, expected] of [
   assert.deepEqual(mutationCalls(harness.calls), [], label + ' must fail before mutation');
 }
 
-// Canary and fallback identities are rejected even when a marker is syntactically valid.
+// Canary identities remain rejected even when a marker is syntactically valid.
 {
-  for (const rejectedWorkflowId of [rejectedCanaryWorkflowId, rejectedFallbackWorkflowId]) {
+  for (const rejectedWorkflowId of [rejectedCanaryWorkflowId]) {
     assert.throws(
       () => incidentDeliveryMarker(deliveryIdentity(priorRunId, priorRunAttempt), rejectedWorkflowId),
       /workflow ID is not registered/,

@@ -1,24 +1,158 @@
-name: Scale Small AI Release Health Independent Fallback (Registration)
-run-name: Release health independent fallback registration [inert]
-
+name: Scale Small AI Release Health Independent Fallback
+run-name: Release health independent fallback [slot:${{ inputs.slot_epoch_minute }} request:${{ inputs.request_id }}]
 on:
   workflow_dispatch:
-
+    inputs:
+      envelope_base64url: { required: true, type: string }
+      slot_epoch_minute: { required: true, type: string }
+      request_id: { required: true, type: string }
+      signature_sha256: { required: true, type: string }
 concurrency:
   group: scale-small-ai-release-health-monitor-v2
+  queue: max
   cancel-in-progress: false
-
 permissions: {}
-
+env: { FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true }
 jobs:
-  registration:
-    name: Register independent fallback workflow identity
-    if: ${{ false }}
-    permissions: {}
+  admission:
+    if: ${{ github.run_attempt == 1 }}
+    name: Admit exact independent fallback request
+    permissions: { actions: read, contents: read }
+    environment: { name: release-health-fallback-admission }
     runs-on: ubuntu-24.04
-    timeout-minutes: 1
+    timeout-minutes: 3
+    outputs: { claim_key: '${{ steps.admit.outputs.claim_key }}', expected_sha: '${{ steps.admit.outputs.expected_sha }}' }
     steps:
-      - name: Independent fallback remains inert until protected Stage F2
+      - name: Bootstrap exact protected-main admission source
+        id: bootstrap
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ENVELOPE: ${{ inputs.envelope_base64url }}
         run: |
-          echo "::error::Independent release-health fallback is not activated."
-          exit 1
+          set -euo pipefail
+          test '${{ github.repository }}' = 'ScaleSmall/SSAI_Shared'
+          test '${{ github.repository_id }}' = '1183552904'
+          test '${{ github.event_name }}' = 'workflow_dispatch'
+          test '${{ github.ref }}' = 'refs/heads/main'
+          test '${{ github.ref_protected }}' = 'true'
+          test '${{ github.run_attempt }}' = '1'
+          test '${{ github.sha }}' = '${{ github.workflow_sha }}'
+          test "${#ENVELOPE}" -ge 1
+          test "${#ENVELOPE}" -le 8192
+          python3 - <<'PY'
+          import base64,os,struct
+          raw=os.environ['ENVELOPE']; pad='='*((4-len(raw)%4)%4)
+          data=base64.urlsafe_b64decode(raw+pad); prefix=b'ssai-release-health-fallback-envelope-v1\0'
+          if not data.startswith(prefix): raise SystemExit(1)
+          p=len(prefix); value=None
+          for expected in ['version','repository','repository_id','workflow_id','workflow_path','ref','expected_sha','slot_epoch_minute','request_id','issued_at_epoch_second','expires_at_epoch_second']:
+            n=struct.unpack('>I',data[p:p+4])[0];p+=4;name=data[p:p+n].decode();p+=n
+            m=struct.unpack('>I',data[p:p+4])[0];p+=4;v=data[p:p+m].decode();p+=m
+            if name!=expected: raise SystemExit(1)
+            if name=='expected_sha': value=v
+          if p!=len(data) or value!=os.environ['GITHUB_SHA']: raise SystemExit(1)
+          open(os.environ['RUNNER_TEMP']+'/expected_sha','w').write(value)
+          PY
+          expected_sha="$(cat "$RUNNER_TEMP/expected_sha")"
+          test "$expected_sha" = '${{ github.sha }}'
+          curl --fail --silent --show-error --max-time 10 --proto '=https' \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github.raw+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "https://api.github.com/repos/ScaleSmall/SSAI_Shared/contents/scripts/verify-release-health-fallback-admission.mjs?ref=$expected_sha" \
+            -o "$RUNNER_TEMP/fallback-admission.mjs"
+      - name: Validate signed request and exact provider attempt
+        id: admit
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          GITHUB_EVENT_SENDER_ID: ${{ github.event.sender.id }}
+          INPUT_ENVELOPE_BASE64URL: ${{ inputs.envelope_base64url }}
+          INPUT_SLOT_EPOCH_MINUTE: ${{ inputs.slot_epoch_minute }}
+          INPUT_REQUEST_ID: ${{ inputs.request_id }}
+          INPUT_SIGNATURE_SHA256: ${{ inputs.signature_sha256 }}
+          SSAI_FALLBACK_ADMISSION_HMAC_KEY: ${{ secrets.SSAI_RELEASE_MONITOR_FALLBACK_ADMISSION_HMAC_KEY }}
+          SSAI_FALLBACK_EXPECTED_ACTOR_LOGIN: ${{ secrets.SSAI_RELEASE_MONITOR_FALLBACK_ACTOR_LOGIN }}
+          SSAI_FALLBACK_EXPECTED_ACTOR_ID: ${{ secrets.SSAI_RELEASE_MONITOR_FALLBACK_ACTOR_ID }}
+          SSAI_FALLBACK_EXPECTED_SENDER_ID: ${{ secrets.SSAI_RELEASE_MONITOR_FALLBACK_SENDER_ID }}
+        run: node "$RUNNER_TEMP/fallback-admission.mjs"
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        with: { ref: '${{ steps.admit.outputs.expected_sha }}', persist-credentials: false }
+      - name: Verify fetched admission source against checkout
+        run: cmp --silent "$RUNNER_TEMP/fallback-admission.mjs" scripts/verify-release-health-fallback-admission.mjs
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: restore_claim
+        with: { path: '${{ runner.temp }}/fallback-claim/claim', key: 'ssai-release-health-fallback-claim-v1-${{ steps.admit.outputs.claim_key }}', lookup-only: true }
+      - if: ${{ steps.restore_claim.outputs.cache-hit == 'true' }}
+        run: exit 1
+      - run: mkdir -p '${{ runner.temp }}/fallback-claim' && printf '%s\n' '${{ inputs.slot_epoch_minute }}' > '${{ runner.temp }}/fallback-claim/claim'
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with: { path: '${{ runner.temp }}/fallback-claim/claim', key: 'ssai-release-health-fallback-claim-v1-${{ steps.admit.outputs.claim_key }}' }
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: verify_claim
+        with: { path: '${{ runner.temp }}/fallback-claim/claim', key: 'ssai-release-health-fallback-claim-v1-${{ steps.admit.outputs.claim_key }}', lookup-only: true, fail-on-cache-miss: true }
+      - name: Verify exact immutable slot claim visibility
+        run: test '${{ steps.verify_claim.outputs.cache-hit }}' = true && test '${{ steps.verify_claim.outputs.cache-matched-key }}' = 'ssai-release-health-fallback-claim-v1-${{ steps.admit.outputs.claim_key }}'
+  scan:
+    if: ${{ github.run_attempt == 1 }}
+    name: Verify current organization release health
+    needs: admission
+    permissions: { contents: read }
+    environment: { name: release-health-monitor }
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    outputs:
+      scan_completed: ${{ steps.reconcile.outputs.scan_completed }}
+      health_degraded: ${{ steps.reconcile.outputs.health_degraded }}
+      state_persistence_required: ${{ steps.reconcile.outputs.state_persistence_required }}
+      incident_state: ${{ steps.reconcile.outputs.incident_state }}
+      notification_outcome: ${{ steps.reconcile.outputs.notification_outcome }}
+      notification_reconciliation_required: ${{ steps.reconcile.outputs.notification_reconciliation_required }}
+      incident_delivery_identity: ${{ steps.reconcile.outputs.incident_delivery_identity }}
+    env: { SSAI_RELEASE_MONITOR_STATE_HMAC_EPOCH: v1, SSAI_RELEASE_MONITOR_MODE: continuous, SSAI_RELEASE_MONITOR_LOOKBACK_HOURS: '6', SSAI_RELEASE_MONITOR_STUCK_MINUTES: '45', SSAI_RELEASE_MONITOR_MAX_REQUESTS: '600', SSAI_RELEASE_MONITOR_RATE_RESERVE: '1000', SSAI_RELEASE_MONITOR_API_CONCURRENCY: '6' }
+    steps:
+      - name: Verify scan execution identity
+        run: test '${{ github.run_attempt }}' = 1 && test '${{ github.sha }}' = '${{ needs.admission.outputs.expected_sha }}' && test '${{ github.workflow_sha }}' = '${{ needs.admission.outputs.expected_sha }}'
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        with: { ref: '${{ needs.admission.outputs.expected_sha }}', persist-credentials: false }
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with: { node-version: '24' }
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        id: app_token
+        with: { client-id: '${{ secrets.SSAI_RELEASE_MONITOR_APP_CLIENT_ID }}', private-key: '${{ secrets.SSAI_RELEASE_MONITOR_APP_PRIVATE_KEY }}', owner: ScaleSmall, permission-actions: read, permission-checks: read, permission-contents: read, permission-deployments: read, permission-metadata: read, permission-pull-requests: read, permission-statuses: read }
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: restore_state
+        with: { path: '${{ runner.temp }}/ssai-release-health-monitor/state.json', key: ssai-release-health-state-v6-v1-lookup, restore-keys: "ssai-release-health-state-v6-v1-\nssai-release-health-state-v4-v1-\nssai-release-health-state-v3-v1-\nssai-release-health-state-v2-v1-" }
+      - id: reconcile
+        env: { SSAI_RELEASE_MONITOR_GITHUB_TOKEN: '${{ steps.app_token.outputs.token }}', SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256: '${{ secrets.SSAI_RELEASE_MONITOR_EXPECTED_INVENTORY_SHA256 }}', SSAI_RELEASE_MONITOR_STATE_HMAC_KEY: '${{ secrets.SSAI_RELEASE_MONITOR_STATE_HMAC_KEY }}', SSAI_RELEASE_MONITOR_STATE_CACHE_MATCHED_KEY: '${{ steps.restore_state.outputs.cache-matched-key }}', SSAI_RELEASE_MONITOR_STATE_CACHE_PREFIX: ssai-release-health-state-v6-v1-, SSAI_RELEASE_MONITOR_DEFAULT_BRANCH: main, SSAI_RELEASE_MONITOR_STATE_PATH: '${{ runner.temp }}/ssai-release-health-monitor/state.json', SSAI_RELEASE_MONITOR_DEFER_DEGRADED_EXIT: 'true' }
+        run: node scripts/verify-org-release-health.mjs
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: ${{ always() && steps.reconcile.outputs.state_persistence_required == 'true' }}
+        with: { path: '${{ runner.temp }}/ssai-release-health-monitor/state.json', key: '${{ steps.reconcile.outputs.incident_state_cache_key }}' }
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: verify_state
+        if: ${{ always() && steps.reconcile.outputs.state_persistence_required == 'true' }}
+        with: { path: '${{ runner.temp }}/ssai-release-health-monitor/state.json', key: '${{ steps.reconcile.outputs.incident_state_cache_key }}', lookup-only: true, fail-on-cache-miss: true }
+      - name: Verify exact authenticated state visibility
+        if: ${{ always() && steps.reconcile.outputs.state_persistence_required == 'true' }}
+        run: test '${{ steps.verify_state.outputs.cache-hit }}' = true && test '${{ steps.verify_state.outputs.cache-matched-key }}' = '${{ steps.reconcile.outputs.incident_state_cache_key }}'
+  deliver:
+    if: ${{ always() && github.run_attempt == 1 && needs.scan.result == 'success' && needs.scan.outputs.scan_completed == 'true' }}
+    name: Deliver managed incident and conclude
+    needs: [admission, scan]
+    permissions: { actions: read, contents: read, issues: write }
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Verify delivery execution identity
+        run: test '${{ github.run_attempt }}' = 1 && test '${{ github.sha }}' = '${{ needs.admission.outputs.expected_sha }}' && test '${{ github.workflow_sha }}' = '${{ needs.admission.outputs.expected_sha }}'
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        with: { ref: '${{ needs.admission.outputs.expected_sha }}', persist-credentials: false }
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with: { node-version: '24' }
+      - if: ${{ needs.scan.outputs.notification_reconciliation_required == 'true' }}
+        env: { GITHUB_TOKEN: '${{ github.token }}', SSAI_RELEASE_MONITOR_INCIDENT_STATE: '${{ needs.scan.outputs.incident_state }}', SSAI_RELEASE_MONITOR_NOTIFICATION_OUTCOME: '${{ needs.scan.outputs.notification_outcome }}', SSAI_RELEASE_MONITOR_DELIVERY_IDENTITY: '${{ needs.scan.outputs.incident_delivery_identity }}' }
+        run: node scripts/sync-release-health-incident-issue.mjs
+      - if: ${{ always() && needs.scan.outputs.health_degraded == 'true' }}
+        run: exit 1

@@ -11,12 +11,14 @@ export const incidentIssueLabel = 'release-health-monitor';
 export const incidentIssueMarker = '<!-- ssai-release-health-monitor:v1 -->';
 export const activeIncidentWorkflowId = releaseHealthIncidentProducerPolicies.nativeSchedule.workflowId;
 export const rejectedCanaryWorkflowId = releaseHealthMonitorWorkflowIdentities.canary.workflowId;
-export const rejectedFallbackWorkflowId = releaseHealthMonitorWorkflowIdentities.fallback.workflowId;
+export const fallbackIncidentWorkflowId = releaseHealthIncidentProducerPolicies.fallbackDispatch.workflowId;
 
 const expectedRepository = 'ScaleSmall/SSAI_Shared';
+const expectedRepositoryId = 1183552904;
 const expectedBranch = 'main';
 const allowedIncidentWorkflowIds = new Set([
   activeIncidentWorkflowId,
+  fallbackIncidentWorkflowId,
 ]);
 const allowedOutcomes = new Set([
   'new-or-worsened-incident',
@@ -236,8 +238,13 @@ function normalizeRunMetadata(run, {
     }
     const producer = producerPolicyForRun(workflowId, run.event);
     if (!producer) throw new Error('workflow run producer is not authorized.');
-    if (run.repository?.full_name !== expectedRepository) {
+    const providerPath = String(run.path || '').replace(/@(?:main|refs\/heads\/main)$/, '');
+    if (providerPath !== producer.path) throw new Error('workflow run path is outside its registered producer boundary.');
+    if (run.repository?.id !== expectedRepositoryId || run.repository?.full_name !== expectedRepository) {
       throw new Error('workflow run repository is outside the managed boundary.');
+    }
+    if (producer.policy === 'independent-fallback-v1' && Number(runAttempt) !== 1) {
+      throw new Error('fallback workflow attempts must be exactly 1.');
     }
     if (run.head_branch !== expectedBranch) throw new Error('workflow run branch is not main.');
     if (expectedHeadSha !== null && headSha !== expectedHeadSha) {
@@ -274,7 +281,7 @@ async function validateCandidateRun(api, input) {
   return normalizeRunMetadata(run, {
     expectedRunId: input.runId,
     expectedRunAttempt: input.runAttempt,
-    expectedWorkflowId: activeIncidentWorkflowId,
+    expectedWorkflowId: null,
     expectedHeadSha: input.headSha,
   });
 }
@@ -335,6 +342,9 @@ function incidentBody(
     '',
     'Authoritative reconciliation run: ' + url,
     'Run attempt: ' + deliveryRunAttempt,
+    'Producer: ' + (producer.policy === releaseHealthIncidentProducerPolicies.fallbackDispatch.policy
+      ? 'independent fallback'
+      : 'native GitHub schedule'),
     '',
     'The public incident surface is intentionally aggregate-only. Use the protected run and operator evidence path for bounded diagnosis.',
     '',
