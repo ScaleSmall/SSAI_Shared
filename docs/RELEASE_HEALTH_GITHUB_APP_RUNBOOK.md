@@ -184,9 +184,9 @@ recorded producer independently, so either authorized producer can restore the o
 Legacy v4, v3, v2, and v1 issue markers remain native historical formats.
 
 The zero-dependency Cloudflare controller is under `workers/release-health-controller`. Its
-canonical sorted-source digest is `0ddf4e81be2fe5c815112d1624f76a9af1f53c57f9f66394d9028e8773607ac0`.
+canonical sorted-source digest is `2ebf1e68002676aeca95bd75ed31633562210f59d5089591f548ab02619a18f2`.
 Its activation-profile digest is
-`9aec66b1f432659232b80c1efa646b3a9c4ea53884218854d728e4226bbb822b`. The checked-in
+`7c33bb9451f67921f04e6ee21a46b059a546615e75872ebc2e04834c40a2f0d9`. The checked-in
 configuration is `MODE=observe`, has no public route, and schedules evaluation every minute.
 Logical slots are minutes 1, 16, 31, and 46. Evaluation occurs only at ages 10 through 14 minutes
 to provide five bounded same-slot recovery opportunities, and never backfills a new dispatch. A

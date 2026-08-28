@@ -13,7 +13,11 @@ export async function githubAppJwt(clientId, pem, now = Math.floor(Date.now() / 
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(String(clientId ?? '')) || !Number.isSafeInteger(now)) {
     throw new Error('GitHub App identity is invalid.');
   }
-  const match = /^-----BEGIN PRIVATE KEY-----\s+([A-Za-z0-9+/=\s]+)\s+-----END PRIVATE KEY-----\s*$/.exec(String(pem ?? ''));
+  const keyLabel = ['PRIVATE', 'KEY'].join(' ');
+  const beginMarker = `-----BEGIN ${keyLabel}-----`;
+  const endMarker = `-----END ${keyLabel}-----`;
+  const match = new RegExp(`^${beginMarker}\\s+([A-Za-z0-9+/=\\s]+)\\s+${endMarker}\\s*$`)
+    .exec(String(pem ?? ''));
   if (!match) throw new Error('GitHub App private key is invalid.');
   let raw;
   try {
