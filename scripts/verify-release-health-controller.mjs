@@ -235,7 +235,7 @@ const sourceHash = createHash('sha256');
 for (const name of sourceNames) {
   const source = await readFile(new URL(`../workers/release-health-controller/src/${name}`, import.meta.url), 'utf8');
   assert.doesNotMatch(source, /from ['"](?!\.\/|node:)/);
-  sourceHash.update(`${name}\0`).update(source).update('\0');
+  sourceHash.update(`${name}\0`).update(source.replace(/\r\n?/g, '\n')).update('\0');
 }
 const controllerSourceDigest = sourceHash.digest('hex');
 const controllerConfig = JSON.parse(await readFile(

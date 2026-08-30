@@ -469,6 +469,45 @@ const noHistoryPolicies = new Map([
       maxAgeHours: 30,
     },
   }],
+  ['SSAI_Dashboard:Prove Shared update release', {
+    workflowId: 319513883,
+    path: '.github/workflows/prove-shared-update-release.yml',
+    sourceSha256: 'b923e5d10b1a47514c276edcc9ff20af41e9f0714e3877e7cc5cfe52bff3b679',
+    reason: 'This pull-request-closed proof only runs after a protected Shared dependency update is merged; the current Dashboard main revision is instead proven by its full repository gate.',
+    witness: {
+      name: 'Dashboard full gate',
+      path: '.github/workflows/dashboard-full-gate.yml',
+      headRepository: 'ScaleSmall/SSAI_Dashboard',
+      allowedEvents: ['push'],
+      maxAgeHours: 168,
+    },
+  }],
+  ['SSAI_Connect:Prove Shared update release', {
+    workflowId: 325199090,
+    path: '.github/workflows/prove-shared-update-release.yml',
+    sourceSha256: 'c928cf671d724a788e56a91a65c2eb6a4555e56e6e6d57b6931faadc3cd3787c',
+    reason: 'This pull-request-closed proof only runs after a protected Shared dependency update is merged; the current Connect main revision is instead proven by its complete validation workflow.',
+    witness: {
+      name: 'Validate Connect app',
+      path: '.github/workflows/validate.yml',
+      headRepository: 'ScaleSmall/SSAI_Connect',
+      allowedEvents: ['push'],
+      maxAgeHours: 168,
+    },
+  }],
+  ['SSAI_PoW:Trusted PR boundaries', {
+    workflowId: 342400655,
+    path: '.github/workflows/trusted-pr-boundaries.yml',
+    sourceSha256: '1d9f006139fa9586541b66fdad000893adebbed725d4cd37122f2075693fce4e',
+    reason: 'This pull-request-only trust boundary has no default-branch run until a qualifying pull request exists; the current PoW main revision is instead proven by its full boundary validation workflow.',
+    witness: {
+      name: 'Validate boundaries',
+      path: '.github/workflows/validate-boundaries.yml',
+      headRepository: 'ScaleSmall/SSAI_PoW',
+      allowedEvents: ['push'],
+      maxAgeHours: 168,
+    },
+  }],
 ]);
 const authorizedDisabledWorkflowHolds = new Map([
   ['SSAI_Production_QA:299211649', {
@@ -577,7 +616,7 @@ const forwardFixRecoveryPolicies = new Map([
   ['SSAI_RR:289080389', {
     workflowId: 289080389,
     path: '.github/workflows/deploy-supabase-functions.yml',
-    sourceSha256: '203a0ca93974b02a3b97b0ce52f642c991050d8051391f795712e5f0a6d22faa',
+    sourceSha256: '44fcccc745924b8c70d75ca999ac7fad8cdb8ecdfa521e34018884bcf754e972',
     headRepository: 'ScaleSmall/SSAI_RR',
     failedEvents: ['push'],
     recoveryEvents: ['workflow_dispatch'],
@@ -593,6 +632,30 @@ const forwardFixRecoveryPolicies = new Map([
     recoveryEvents: ['workflow_dispatch'],
     jobNames: ['verify-production'],
     recoveryDisplayTitles: ['Production n8n workflow exactness'],
+  }],
+  // The manual NAP release failed in the pre-deployment readiness gate. The
+  // later protected-main push fixed that gate and completed the same deploy job.
+  ['SSAI_NAP_Entity:281872550', {
+    workflowId: 281872550,
+    path: '.github/workflows/deploy.yml',
+    sourceSha256: 'c9498d70b4ad923090329e50872bee115d5bda50e512a64a0c0b4a94fb0aa8cb',
+    headRepository: 'ScaleSmall/SSAI_NAP_Entity',
+    failedEvents: ['workflow_dispatch'],
+    recoveryEvents: ['push'],
+    jobNames: ['deploy'],
+    recoveryDisplayTitles: ['fix: adopt canonical production inventory verifier'],
+  }],
+  // A bounded manual report-recovery attempt failed on the pre-fix main
+  // revision. The current scheduled collection completed the same crawler job.
+  ['SSAI_Analytics_Reporting:296737111', {
+    workflowId: 296737111,
+    path: '.github/workflows/monthly-reporting.yml',
+    sourceSha256: '4fbc2bc41f5aad6bae046ae058c9ba31147f0c2df34df4bb0537af130b0d6ff0',
+    headRepository: 'ScaleSmall/SSAI_Analytics_Reporting',
+    failedEvents: ['workflow_dispatch'],
+    recoveryEvents: ['schedule'],
+    jobNames: ['full-crawler'],
+    recoveryDisplayTitles: ['Monthly Reporting Collection'],
   }],
   [activeReleaseHealthPolicyKey, {
     workflowId: releaseHealthMonitorWorkflowIdentities.active.workflowId,
