@@ -935,7 +935,7 @@ rejectPattern(
 const rrPolicyFields = [
   ['workflowId: 289080389', 'workflow identity'],
   ["path: '.github/workflows/deploy-supabase-functions.yml'", 'workflow path'],
-  ["sourceSha256: '203a0ca93974b02a3b97b0ce52f642c991050d8051391f795712e5f0a6d22faa'", 'current-main source digest'],
+  ["sourceSha256: '44fcccc745924b8c70d75ca999ac7fad8cdb8ecdfa521e34018884bcf754e972'", 'current-main source digest'],
   ["headRepository: 'ScaleSmall/SSAI_RR'", 'repository boundary'],
   ["failedEvents: ['push']", 'failed trigger boundary'],
   ["recoveryEvents: ['workflow_dispatch']", 'recovery trigger boundary'],
@@ -943,6 +943,77 @@ const rrPolicyFields = [
   ["recoveryDisplayTitles: ['Deploy R&R Supabase Functions']", 'recovery run identity'],
 ];
 requireRecoveryPolicyBlock(releaseHealthVerifier, 'SSAI_RR:289080389', rrPolicyFields);
+const dashboardSharedProofNoHistoryFields = [
+  ['workflowId: 319513883', 'workflow identity'],
+  ["path: '.github/workflows/prove-shared-update-release.yml'", 'workflow path'],
+  ["sourceSha256: 'b923e5d10b1a47514c276edcc9ff20af41e9f0714e3877e7cc5cfe52bff3b679'", 'current-main source digest'],
+  ["name: 'Dashboard full gate'", 'witness workflow name'],
+  ["path: '.github/workflows/dashboard-full-gate.yml'", 'witness workflow path'],
+  ["headRepository: 'ScaleSmall/SSAI_Dashboard'", 'witness repository boundary'],
+  ["allowedEvents: ['push']", 'witness trigger boundary'],
+  ['maxAgeHours: 168', 'witness freshness boundary'],
+];
+requireRecoveryPolicyBlock(
+  releaseHealthVerifier,
+  'SSAI_Dashboard:Prove Shared update release',
+  dashboardSharedProofNoHistoryFields,
+);
+const connectSharedProofNoHistoryFields = [
+  ['workflowId: 325199090', 'workflow identity'],
+  ["path: '.github/workflows/prove-shared-update-release.yml'", 'workflow path'],
+  ["sourceSha256: 'c928cf671d724a788e56a91a65c2eb6a4555e56e6e6d57b6931faadc3cd3787c'", 'current-main source digest'],
+  ["name: 'Validate Connect app'", 'witness workflow name'],
+  ["path: '.github/workflows/validate.yml'", 'witness workflow path'],
+  ["headRepository: 'ScaleSmall/SSAI_Connect'", 'witness repository boundary'],
+  ["allowedEvents: ['push']", 'witness trigger boundary'],
+  ['maxAgeHours: 168', 'witness freshness boundary'],
+];
+requireRecoveryPolicyBlock(
+  releaseHealthVerifier,
+  'SSAI_Connect:Prove Shared update release',
+  connectSharedProofNoHistoryFields,
+);
+const powTrustedPrNoHistoryFields = [
+  ['workflowId: 342400655', 'workflow identity'],
+  ["path: '.github/workflows/trusted-pr-boundaries.yml'", 'workflow path'],
+  ["sourceSha256: '1d9f006139fa9586541b66fdad000893adebbed725d4cd37122f2075693fce4e'", 'current-main source digest'],
+  ["name: 'Validate boundaries'", 'witness workflow name'],
+  ["path: '.github/workflows/validate-boundaries.yml'", 'witness workflow path'],
+  ["headRepository: 'ScaleSmall/SSAI_PoW'", 'witness repository boundary'],
+  ["allowedEvents: ['push']", 'witness trigger boundary'],
+  ['maxAgeHours: 168', 'witness freshness boundary'],
+];
+requireRecoveryPolicyBlock(
+  releaseHealthVerifier,
+  'SSAI_PoW:Trusted PR boundaries',
+  powTrustedPrNoHistoryFields,
+);
+const napEntityForwardFixFields = [
+  ['workflowId: 281872550', 'workflow identity'],
+  ["path: '.github/workflows/deploy.yml'", 'workflow path'],
+  ["sourceSha256: 'c9498d70b4ad923090329e50872bee115d5bda50e512a64a0c0b4a94fb0aa8cb'", 'current-main source digest'],
+  ["headRepository: 'ScaleSmall/SSAI_NAP_Entity'", 'repository boundary'],
+  ["failedEvents: ['workflow_dispatch']", 'failed trigger boundary'],
+  ["recoveryEvents: ['push']", 'recovery trigger boundary'],
+  ["jobNames: ['deploy']", 'failed production job boundary'],
+  ["recoveryDisplayTitles: ['fix: adopt canonical production inventory verifier']", 'recovery run identity'],
+];
+requireRecoveryPolicyBlock(releaseHealthVerifier, 'SSAI_NAP_Entity:281872550', napEntityForwardFixFields);
+const analyticsMonthlyForwardFixFields = [
+  ['workflowId: 296737111', 'workflow identity'],
+  ["path: '.github/workflows/monthly-reporting.yml'", 'workflow path'],
+  ["sourceSha256: '4fbc2bc41f5aad6bae046ae058c9ba31147f0c2df34df4bb0537af130b0d6ff0'", 'current-main source digest'],
+  ["headRepository: 'ScaleSmall/SSAI_Analytics_Reporting'", 'repository boundary'],
+  ["failedEvents: ['workflow_dispatch']", 'failed trigger boundary'],
+  ["recoveryEvents: ['schedule']", 'recovery trigger boundary'],
+  ["jobNames: ['full-crawler']", 'failed production job boundary'],
+  ["recoveryDisplayTitles: ['Monthly Reporting Collection']", 'recovery run identity'],
+];
+requireRecoveryPolicyBlock(
+  releaseHealthVerifier,
+  'SSAI_Analytics_Reporting:296737111',
+  analyticsMonthlyForwardFixFields,
+);
 assert.throws(
   () => assertRecoveryPolicyFields(
     productionQaPolicyBlock.replace("state: 'disabled_manually'", "state: 'active'"),
