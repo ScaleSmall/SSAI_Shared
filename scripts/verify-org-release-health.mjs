@@ -741,7 +741,7 @@ if (rateDecision === 'defer') {
   await writeStepSummary(deferredSummary);
 } else {
 failureStage = 'repository-scan';
-await mapLimit(repositories, 4, inspectRepository);
+await mapLimit(repositories, 4, (repo) => inspectRepository(repo, scheduledStateEnabled));
 
 failureStage = 'aggregate-build';
 if (requestStats.requests > Math.floor(maxRequests * 0.8)) {
@@ -868,7 +868,10 @@ await writeStepSummary(summary);
 }
 }
 
-async function inspectRepository(repo) {
+async function inspectRepository(repo, scheduledStateEnabled) {
+  if (typeof scheduledStateEnabled !== 'boolean') {
+    throw new TypeError('scheduled incident state gate must be a boolean');
+  }
   const defaultBranch = String(repo.default_branch || 'main');
   const [allWorkflows, commit, rawRecentRuns, recentCommits, recentPulls, branches, deploymentCollection] = await Promise.all([
     collectWorkflows(repo.name),

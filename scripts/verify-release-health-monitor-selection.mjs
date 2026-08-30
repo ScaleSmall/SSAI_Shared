@@ -889,6 +889,7 @@ for (const mode of ['continuous', 'incident']) {
   assert.equal(manual.enabled, false, 'manual ' + mode + ' scans must not enable deduplication');
   assert.equal(manual.suppressed, false, 'manual ' + mode + ' scans must remain fail-closed');
 }
+assert.equal(scheduledIncidentStateEnabled('continuous', 'schedule'), true, 'scheduled continuous scans must enable incident-state persistence');
 assert.equal(scheduledIncidentStateEnabled('incident', 'schedule'), false, 'incident scans must never deduplicate');
 
 const selfMonitorDeployment = {
