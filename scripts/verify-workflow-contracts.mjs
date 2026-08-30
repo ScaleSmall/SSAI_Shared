@@ -1022,6 +1022,9 @@ for (const field of [
 requireText(releaseHealthVerifier, 'const createdAt = canonicalGitHubTimestamp(run.created_at);', 'authoritative provider run creation time');
 requireText(releaseHealthVerifier, "const currentWorkflowHeadSha = String(process.env.GITHUB_SHA || '').trim().toLowerCase();", 'immutable executing workflow SHA binding');
 requireText(releaseHealthVerifier, 'headSha: currentWorkflowHeadSha', 'provider evidence bound to immutable GITHUB_SHA');
+requireText(releaseHealthVerifier, 'await mapLimit(repositories, 4, (repo) => inspectRepository(repo, scheduledStateEnabled));', 'scheduled incident-state gate passed explicitly into repository scans');
+requireText(releaseHealthVerifier, 'async function inspectRepository(repo, scheduledStateEnabled)', 'repository scan scheduled-state gate parameter');
+requireText(releaseHealthVerifier, "if (typeof scheduledStateEnabled !== 'boolean')", 'repository scan scheduled-state gate type guard');
 requireText(releaseHealthVerifier, 'incident_state_producer: incidentStateProducer', 'provider record threaded into repository scan output');
 requireText(releaseHealthVerifier, 'const stateProducers = rows.map((row) => row.incident_state_producer).filter(Boolean);', 'single provider-attested producer selection');
 requireText(releaseHealthVerifier, 'stateProducers.length !== 1', 'fail-closed producer cardinality');
