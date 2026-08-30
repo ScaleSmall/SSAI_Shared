@@ -83,6 +83,42 @@ const predecessorIncidentStateSchema = 4;
 const previousIncidentStateSchema = 3;
 const legacyIncidentStateSchema = 2;
 const persistedNotificationClusterTokenCount = maxIncidentFingerprintIssues;
+const releaseHealthMonitorFailureStages = new Set([
+  'configuration',
+  'state-restore',
+  'inventory-preflight',
+  'repository-scan',
+  'aggregate-build',
+  'state-transition',
+  'aggregate-output',
+]);
+const releaseHealthMonitorFailureStageSymbol = Symbol('releaseHealthMonitorFailureStage');
+
+export function releaseHealthMonitorStageError(stage, cause) {
+  if (!releaseHealthMonitorFailureStages.has(stage)) {
+    throw new Error('Release-health monitor failure stage is invalid.');
+  }
+  const failure = new Error('Release-health monitor failed within an allowlisted stage.', { cause });
+  failure.name = 'ReleaseHealthMonitorStageError';
+  Object.defineProperty(failure, releaseHealthMonitorFailureStageSymbol, {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: stage,
+  });
+  return failure;
+}
+
+function releaseHealthMonitorFailureStageOrNull(caught) {
+  const stage = caught?.[releaseHealthMonitorFailureStageSymbol];
+  return releaseHealthMonitorFailureStages.has(stage) ? stage : null;
+}
+
+function releaseHealthMonitorLocalDiagnostic(caught) {
+  return releaseHealthMonitorFailureStageOrNull(caught) && caught?.cause
+    ? caught.cause
+    : caught;
+}
 
 class ScheduledIncidentStateReinitializationError extends Error {
   constructor() {
@@ -648,6 +684,8 @@ const isDirectExecution = Boolean(process.argv[1])
 if (isDirectExecution) await executeReleaseHealthMonitorEntryPoint(runReleaseHealthMonitor);
 
 export async function runReleaseHealthMonitor() {
+let failureStage = 'configuration';
+try {
 requiredSecret(token, 'SSAI_RELEASE_MONITOR_GITHUB_TOKEN');
 requiredSecret(stateHmacKey, 'SSAI_RELEASE_MONITOR_STATE_HMAC_KEY');
 safeName(owner, 'SSAI_RELEASE_MONITOR_OWNER');
@@ -662,12 +700,14 @@ if (!/^[a-f0-9]{64}$/.test(expectedInventorySha256)) {
 }
 const triggerEvent = currentTriggerEvent;
 const scheduledStateEnabled = scheduledIncidentStateEnabled(scanMode, triggerEvent);
+failureStage = 'state-restore';
 const previousIncidentState = scheduledStateEnabled ? await loadScheduledIncidentState() : null;
 
 // GitHub's /rate_limit endpoint can be served from a different cache/rate
 // context than repository APIs. Probe the installation repository endpoint so
 // the preflight verifies both the App credential type and the quota bucket the
 // inventory will actually consume.
+failureStage = 'inventory-preflight';
 const installationProbe = await api('/installation/repositories?per_page=1&page=1');
 validateInstallationRepositoryPage(installationProbe, null, 0);
 const installationRepositories = await listRepositories();
@@ -695,12 +735,15 @@ if (rateDecision === 'fail') {
 }
 if (rateDecision === 'defer') {
   const deferredSummary = deferredRateSummary(repositories.length);
+  failureStage = 'aggregate-output';
   console.log(JSON.stringify(releaseHealthLogPayload(deferredSummary), null, 2));
   console.error('::warning::Continuous release-health scan deferred until GitHub API quota resets; repository scope was attested, but no health was reported.');
   await writeStepSummary(deferredSummary);
 } else {
+failureStage = 'repository-scan';
 await mapLimit(repositories, 4, inspectRepository);
 
+failureStage = 'aggregate-build';
 if (requestStats.requests > Math.floor(maxRequests * 0.8)) {
   warnings.push('GitHub API use exceeded 80% of the configured per-run request budget.');
 }
@@ -790,6 +833,7 @@ const summary = {
   warnings,
 };
 
+failureStage = 'state-transition';
 const stateProducers = rows.map((row) => row.incident_state_producer).filter(Boolean);
 if (scheduledStateEnabled && stateProducers.length !== 1) {
   throw new Error('Scheduled incident state requires exactly one provider-attested producer run.');
@@ -811,12 +855,16 @@ if (notificationState.suppressed) {
   }
 }
 
+failureStage = 'aggregate-output';
 console.log(JSON.stringify(releaseHealthLogPayload(summary), null, 2));
 await writeStepSummary(summary);
 
   if (shouldSetDegradedExitCode(failures.length, notificationState.suppressed)) {
     process.exitCode = 1;
   }
+}
+} catch (caught) {
+  throw releaseHealthMonitorStageError(failureStage, caught);
 }
 }
 
@@ -3675,9 +3723,12 @@ export async function executeReleaseHealthMonitorEntryPoint(
     await runner();
   } catch (caught) {
     if (isHostedPublicReleaseHealthOutput(environment)) {
-      error('::error::Release-health monitor failed closed before aggregate reporting.');
+      const failureStage = releaseHealthMonitorFailureStageOrNull(caught);
+      const stageSuffix = failureStage ? ` (stage=${failureStage})` : '';
+      error(`::error::Release-health monitor failed closed before aggregate reporting${stageSuffix}.`);
     } else {
-      error(caught instanceof Error ? caught.stack || caught.message : String(caught));
+      const diagnostic = releaseHealthMonitorLocalDiagnostic(caught);
+      error(diagnostic instanceof Error ? diagnostic.stack || diagnostic.message : String(diagnostic));
     }
     setExitCode(1);
   }

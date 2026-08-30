@@ -65,6 +65,7 @@ import {
   evaluateIncidentNotification,
   expectedInventoryDigest,
   executeReleaseHealthMonitorEntryPoint,
+  releaseHealthMonitorStageError,
   fingerprintReleaseHealthIncident,
   incidentStateOutputLines,
   isExactManualIncidentRecoveryCheck,
@@ -527,8 +528,8 @@ assert.equal(bootstrapProbe.status, 1, 'hosted bootstrap must fail nonzero on mo
 assert.equal(bootstrapProbe.stdout, '', 'hosted bootstrap module-initialization failures must not write stdout');
 assert.equal(
   bootstrapProbe.stderr,
-  '::error::Release-health monitor failed closed before aggregate reporting.\n',
-  'hosted bootstrap must redact an invalid top-level configuration exception and stack',
+  '::error::Release-health monitor failed closed before aggregate reporting (stage=configuration).\n',
+  'hosted bootstrap must classify configuration while redacting its exception and stack',
 );
 const directHostedProbe = spawnSync(process.execPath, ['scripts/verify-org-release-health.mjs'], {
   cwd: fileURLToPath(new URL('..', import.meta.url)),
@@ -548,8 +549,8 @@ assert.equal(directHostedProbe.status, 1, 'direct hosted execution must fail non
 assert.equal(directHostedProbe.stdout, '', 'direct hosted configuration failures must not write stdout');
 assert.equal(
   directHostedProbe.stderr,
-  '::error::Release-health monitor failed closed before aggregate reporting.\n',
-  'direct hosted execution must also redact configuration errors and stacks',
+  '::error::Release-health monitor failed closed before aggregate reporting (stage=configuration).\n',
+  'direct hosted execution must classify configuration while redacting its exception and stack',
 );
 const sensitiveMarkers = [
   'SSAI_Private_Fleet',
@@ -717,6 +718,33 @@ assert.deepEqual(hostedExitCodes, [1], 'hosted exceptions must fail closed');
 assert.equal(hostedErrors.join('\n').includes(injectedExceptionMarker), false, 'hosted exception output must redact the raw error and stack');
 assert.deepEqual(hostedErrors, ['::error::Release-health monitor failed closed before aggregate reporting.']);
 
+const stagedHostedErrors = [];
+await executeReleaseHealthMonitorEntryPoint(
+  async () => {
+    throw releaseHealthMonitorStageError('repository-scan', new Error(injectedExceptionMarker));
+  },
+  {
+    environment: hostedPublicEnvironment,
+    error: (message) => stagedHostedErrors.push(String(message)),
+    setExitCode: () => {},
+  },
+);
+assert.equal(
+  stagedHostedErrors.join('\n').includes(injectedExceptionMarker),
+  false,
+  'hosted stage diagnostics must never expose the protected exception or stack',
+);
+assert.deepEqual(
+  stagedHostedErrors,
+  ['::error::Release-health monitor failed closed before aggregate reporting (stage=repository-scan).'],
+  'hosted stage diagnostics must expose only one allowlisted bounded cause category',
+);
+assert.throws(
+  () => releaseHealthMonitorStageError('SSAI_Private_Fleet', new Error(injectedExceptionMarker)),
+  /failure stage is invalid/,
+  'non-allowlisted stage labels must fail closed before they can reach hosted output',
+);
+
 const renamedHostedErrors = [];
 await executeReleaseHealthMonitorEntryPoint(
   async () => { throw new Error(injectedExceptionMarker); },
@@ -742,6 +770,23 @@ await executeReleaseHealthMonitorEntryPoint(
   },
 );
 assert.equal(localErrors.join('\n').includes(injectedExceptionMarker), true, 'local diagnostics may retain the original exception');
+
+const stagedLocalErrors = [];
+await executeReleaseHealthMonitorEntryPoint(
+  async () => {
+    throw releaseHealthMonitorStageError('state-transition', new Error(injectedExceptionMarker));
+  },
+  {
+    environment: {},
+    error: (message) => stagedLocalErrors.push(String(message)),
+    setExitCode: () => {},
+  },
+);
+assert.equal(
+  stagedLocalErrors.join('\n').includes(injectedExceptionMarker),
+  true,
+  'local staged diagnostics must retain the protected underlying cause for operators',
+);
 
 const firstA = evaluateIncidentNotification('continuous', 'schedule', null, [incidentFailureA]);
 assert.deepEqual(

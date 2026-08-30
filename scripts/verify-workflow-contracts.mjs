@@ -1157,7 +1157,8 @@ requireText(releaseHealthVerifier, 'releaseHealthLogPayload(deferredSummary)', '
 requireText(releaseHealthVerifier, 'releaseHealthLogPayload(summary)', 'aggregate-only completed stdout');
 requireText(releaseHealthVerifier, 'renderReleaseHealthStepSummary(result)', 'hosted-public step-summary renderer');
 requireText(releaseHealthVerifier, 'executeReleaseHealthMonitorEntryPoint(runReleaseHealthMonitor)', 'redacted direct monitor entry point');
-requireText(releaseHealthVerifier, 'Release-health monitor failed closed before aggregate reporting.', 'generic hosted-public fail-closed error');
+requireText(releaseHealthVerifier, 'const releaseHealthMonitorFailureStages = new Set([', 'closed hosted-public failure-stage allowlist');
+requireText(releaseHealthVerifier, 'Release-health monitor failed closed before aggregate reporting${stageSuffix}.', 'allowlisted staged hosted-public fail-closed error');
 rejectPattern(releaseHealthVerifier, /console\.log\(JSON\.stringify\((?:deferredSummary|summary),/, 'unredacted release-health JSON stdout');
 
 requireBalancedExpressions(releaseHealth, 'release-health workflow');
