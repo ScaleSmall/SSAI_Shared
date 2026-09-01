@@ -65,7 +65,7 @@ for (const required of [
   '{enabled:false,previews_enabled:true}', 'wait_domain_absent bootstrap-post-deploy',
   '/workers/domains', '/deployments', '/versions/$candidate_version_id', '/settings', '/secrets', '/subdomain',
   'workers/domains?service=$GATEWAY_NAME', 'workers/domains?hostname=$GATEWAY_DOMAIN', 'domain_list_complete()', 'script_routes_absent()', 'workers/scripts',
-  'has("result_info")|not', '.result_info.total_pages>=0 and .result_info.total_pages<=1', 'domain_preexisting=true', 'domain_attach_attempted=true', 'domain_created_by_run=true', 'reconcile_domain_attach_response()',
+  'has("result_info")|not', '(.result_info|has("page")|not)', '(.result_info|has("per_page")|not)', '(.result_info|has("count")|not)', '(.result_info|has("total_pages")|not)', '(.result_info.total_pages|floor)==.result_info.total_pages', 'domain_preexisting=true', 'domain_attach_attempted=true', 'domain_created_by_run=true', 'reconcile_domain_attach_response()',
   '(.result.zone_id|type)=="string"', '.result.zone_id|test("^[a-f0-9]{32}$")',
   '(.result.cert_id|type)=="string"', '.result.cert_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")',
   'test "$domain_created_by_run" != true || ! valid_domain_id "$candidate_domain_id"',
@@ -396,18 +396,34 @@ assert.equal(settingsBindingViewAccepted(['ALERT_HMAC_KEY', 'ALERT_INGEST_RATE_L
 
 const domainInventoryComplete = (payload) => {
   const { result, result_info: info } = payload;
-  return Array.isArray(result) && (!Object.hasOwn(payload, 'result_info') || (info?.page === 1
-    && Number.isFinite(info?.per_page)
-    && info.per_page >= result.length
-    && info.count === result.length
-    && Number.isFinite(info?.total_pages)
-    && info.total_pages >= 0
-    && info.total_pages <= 1));
+  if (!Array.isArray(result)) return false;
+  if (!Object.hasOwn(payload, 'result_info') || info === null) return true;
+  if (typeof info !== 'object' || Array.isArray(info)) return false;
+  return (!Object.hasOwn(info, 'page') || (Number.isInteger(info.page) && info.page === 1))
+    && (!Object.hasOwn(info, 'per_page') || (Number.isInteger(info.per_page) && info.per_page >= result.length))
+    && (!Object.hasOwn(info, 'count') || (Number.isInteger(info.count) && info.count === result.length))
+    && (!Object.hasOwn(info, 'total_pages') || (Number.isInteger(info.total_pages) && info.total_pages >= 0 && info.total_pages <= 1 && (result.length === 0 || info.total_pages === 1)));
 };
 assert.equal(domainInventoryComplete({ result: [] }), true, 'The pinned Worker Domains API is an authoritative single-page result without pagination metadata');
 assert.equal(domainInventoryComplete({ result: [], result_info: { page: 1, per_page: 20, count: 0, total_pages: 0 } }), true, 'A complete empty service-filtered domain inventory must pass');
-assert.equal(domainInventoryComplete({ result: [], result_info: null }), false, 'Malformed optional pagination metadata must fail closed');
+assert.equal(domainInventoryComplete({ result: [], result_info: null }), true, 'Null non-contract pagination metadata must not invalidate an authoritative single-page result');
+assert.equal(domainInventoryComplete({ result: [], result_info: {} }), true, 'Non-contract metadata fields are not required by the pinned single-page endpoint');
+assert.equal(domainInventoryComplete({ result: [], result_info: 'unexpected' }), false, 'A non-object metadata extension must fail closed');
+assert.equal(domainInventoryComplete({ result: [], result_info: { total_pages: '1' } }), false, 'An explicitly malformed page count must fail closed');
+assert.equal(domainInventoryComplete({ result: [], result_info: { total_pages: null } }), false, 'An explicitly null page count must fail closed');
+assert.equal(domainInventoryComplete({ result: [], result_info: { total_pages: false } }), false, 'An explicitly boolean page count must fail closed');
+assert.equal(domainInventoryComplete({ result: [], result_info: { total_pages: 0.5 } }), false, 'An explicitly fractional page count must fail closed');
 assert.equal(domainInventoryComplete({ result: [], result_info: { page: 1, per_page: 20, count: 0, total_pages: 2 } }), false, 'A truncated domain inventory must fail closed');
+assert.equal(domainInventoryComplete({ result: [], result_info: { page: 2 } }), false, 'An explicitly contradictory page must fail closed');
+assert.equal(domainInventoryComplete({ result: [], result_info: { count: 1 } }), false, 'An explicitly contradictory result count must fail closed');
+assert.equal(domainInventoryComplete({ result: [{}], result_info: { per_page: 0 } }), false, 'An explicitly insufficient page size must fail closed');
+assert.equal(domainInventoryComplete({ result: [{}], result_info: { total_pages: 0 } }), false, 'Zero explicit pages must contradict and reject a non-empty inventory');
+assert.equal(domainInventoryComplete({ result: [], result_info: { page: 1, per_page: 0, count: 0 } }), true, 'Consistent optional pagination metadata must be accepted');
+const domainListCompleteLine = workflow.split('\n').find((line) => line.includes('domain_list_complete()'));
+assert.ok(domainListCompleteLine, 'The Worker Domain single-page validator must exist');
+for (const field of ['page', 'per_page', 'count', 'total_pages']) {
+  assert.match(domainListCompleteLine, new RegExp(`\\.result_info\\|has\\("${field}"\\)\\|not`), `Optional ${field} metadata must be validated only when present`);
+}
 const routedDomain = {
   id: 'a'.repeat(32),
   cert_id: '11111111-1111-4111-8111-111111111111',
