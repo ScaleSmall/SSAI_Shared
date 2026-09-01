@@ -413,11 +413,11 @@ rejectPattern(alertGatewayDeployment, /["']force["']\s*:\s*true/i, 'forced alert
 assert.equal((alertGatewayDeployment.match(/\?force=true/g) ?? []).length, 1, 'only the exact alert-gateway rollback helper may force a deployment');
 const alertGatewayRollbackFunction = alertGatewayDeployment.split('          reconcile_traffic_rollback() {')[1].split('          attest_rollback_active() {')[0];
 assert.ok(alertGatewayRollbackFunction.includes('deployments?force=true'), 'forced alert-gateway rollback must remain scoped to the provenance-gated helper');
-const alertGatewayDomainSnapshotLine = alertGatewayDeployment.split('\n').find((line) => line.includes('domain_snapshot()'));
-assert.ok(alertGatewayDomainSnapshotLine, 'alert-gateway routing snapshot helper must exist');
-rejectPattern(alertGatewayDomainSnapshotLine, /\b(?:cert_id|zone_id)\b/, 'provider-issued certificate or zone identifier in immutable alert-gateway routing identity');
-for (const field of ['id', 'hostname', 'service', 'zone_name', 'environment']) {
-  requireText(alertGatewayDomainSnapshotLine, field, `alert-gateway immutable routing identity field ${field}`);
+rejectPattern(alertGatewayDeployment, /\b(?:domain_snapshot|previous_domain_snapshot)\b/, 'redundant serialized alert-gateway domain snapshot');
+const alertGatewayDomainOkLine = alertGatewayDeployment.split('\n').find((line) => line.includes('domain_ok()'));
+assert.ok(alertGatewayDomainOkLine, 'alert-gateway direct domain identity validator must exist');
+for (const fieldCheck of ['.result.id==$id', '.result.hostname==$h', '.result.service==$s', '.result.zone_name==$z', '(.result.environment//"production")=="production"']) {
+  requireText(alertGatewayDomainOkLine, fieldCheck, `alert-gateway direct routing identity check ${fieldCheck}`);
 }
 rejectPattern(alertGatewayDeployment, /^\s+(?:traffic_mutated|domain_attach_attempted|domain_created_by_run|bootstrap_mutation_attempted)=false\s*$/m, 'sequential alert-gateway rollback disarm');
 rejectPattern(alertGatewayDeployment, /actions\/workflows\/\d+\/dispatches|gh\s+workflow\s+run/i, 'workflow dispatch from alert-gateway deployment');

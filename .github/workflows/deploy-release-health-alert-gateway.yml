@@ -105,7 +105,7 @@ jobs:
           promotion_message="promote ${GITHUB_SHA}"
           domain_inventory_path="accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains?service=$GATEWAY_NAME"
           hostname_inventory_path="accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains?hostname=$GATEWAY_DOMAIN"
-          previous_deployment_id= previous_version_id= previous_domain_id= previous_domain_snapshot= candidate_deployment_id= candidate_version_id= candidate_domain_id= candidate_secrets= bootstrap_dir= bootstrap_config= bootstrap_secrets=
+          previous_deployment_id= previous_version_id= previous_domain_id= candidate_deployment_id= candidate_version_id= candidate_domain_id= candidate_secrets= bootstrap_dir= bootstrap_config= bootstrap_secrets=
           traffic_mutated=false domain_preexisting=false domain_attach_attempted=false domain_created_by_run=false bootstrap=false bootstrap_mutation_attempted=false committed=false legacy_contained_previous=false rollback_mode=false
           rollback_message="automatic rollback after ${GITHUB_SHA}"
           request_timeout_seconds() {
@@ -213,8 +213,6 @@ jobs:
           rollback_deployment_ok() { if test "$2" = "$previous_deployment_id"; then deployment_ok "$1" "$2" "$previous_version_id"; else promoted_deployment_ok "$1" "$2" "$previous_version_id" "$rollback_message"; fi; }
           observability_ok() { jq -e '.result.observability.enabled==true and .result.observability.head_sampling_rate==1 and .result.observability.logs.enabled==true and .result.observability.logs.head_sampling_rate==1 and .result.observability.logs.invocation_logs==true and .result.logpush==false and ((.result.tail_consumers//[])|length)==0' "$1" >/dev/null; }
           domain_ok() { jq -e --arg id "$2" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" '.result.id==$id and .result.hostname==$h and .result.service==$s and .result.zone_name==$z and (.result.zone_id|type)=="string" and (.result.zone_id|test("^[a-f0-9]{32}$")) and (.result.cert_id|type)=="string" and (.result.cert_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")) and (.result.environment//"production")=="production"' "$1" >/dev/null; }
-          # Only the domain id is documented immutable. Validate provider-issued zone/certificate IDs above, but compare routing identity through the immutable id and expected names/service.
-          domain_snapshot() { jq -cS '.result|{id,hostname,service,zone_name,environment:(.environment//"production")}' "$1"; }
           domain_list_complete() { jq -e '(.result|type)=="array" and ((has("result_info")|not) or ((.result_info|type)=="object" and .result_info.page==1 and (.result_info.per_page|type)=="number" and .result_info.per_page>=(.result|length) and .result_info.count==(.result|length) and (.result_info.total_pages|type)=="number" and .result_info.total_pages>=0 and .result_info.total_pages<=1))' "$1" >/dev/null; }
           script_routes_absent() {
             local input="$1" expected_present="$2"
@@ -426,7 +424,6 @@ jobs:
             jq -e --arg id "$candidate_domain_id" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" >/dev/null || return 1
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$candidate_domain_id" "$RUNNER_TEMP/gateway-${label}-domain.json" || return 1
             domain_ok "$RUNNER_TEMP/gateway-${label}-domain.json" "$candidate_domain_id" || return 1
-            if test "$domain_preexisting" = true; then test "$(domain_snapshot "$RUNNER_TEMP/gateway-${label}-domain.json")" = "$previous_domain_snapshot" || return 1; fi
           }
           attest_candidate_provider_state() {
             local label="$1" active_deployment active_version observed_domain
@@ -464,7 +461,6 @@ jobs:
             if test "$domain_preexisting" = true; then
               observed_domain="$(wait_domain "$previous_domain_id" "${label}-domain")" || return 1
               test "$observed_domain" = "$previous_domain_id" || return 1
-              test "$(domain_snapshot "$RUNNER_TEMP/gateway-${label}-domain-domain.json")" = "$previous_domain_snapshot" || return 1
               wait_health "https://$GATEWAY_DOMAIN/healthz" "${label}-health" "$previous_version_id" || return 1
             else
               wait_domain_absent "${label}-no-ingress" || return 1
@@ -495,7 +491,6 @@ jobs:
               jq -e --arg id "$previous_domain_id" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" >/dev/null || return 1
               api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$previous_domain_id" "$RUNNER_TEMP/gateway-${label}-domain-final.json" || return 1
               domain_ok "$RUNNER_TEMP/gateway-${label}-domain-final.json" "$previous_domain_id" || return 1
-              test "$(domain_snapshot "$RUNNER_TEMP/gateway-${label}-domain-final.json")" = "$previous_domain_snapshot" || return 1
             else
               api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-${label}-service-domains.json" || return 1
               domain_list_complete "$RUNNER_TEMP/gateway-${label}-service-domains.json" || return 1
@@ -567,7 +562,6 @@ jobs:
             jq -e --arg id "$previous_domain_id" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s' "$RUNNER_TEMP/gateway-hostname-preflight-list.json" >/dev/null
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$previous_domain_id" "$RUNNER_TEMP/gateway-domain-preflight.json"
             domain_ok "$RUNNER_TEMP/gateway-domain-preflight.json" "$previous_domain_id"
-            previous_domain_snapshot="$(domain_snapshot "$RUNNER_TEMP/gateway-domain-preflight.json")"
           elif test "$domain_count" = 0; then
             test "$hostname_domain_count" = 0
           else
@@ -623,7 +617,6 @@ jobs:
           fi
           if test "$domain_preexisting" = true; then
             test "$(wait_domain "$previous_domain_id" preflight-existing)" = "$previous_domain_id"
-            test "$(domain_snapshot "$RUNNER_TEMP/gateway-preflight-existing-domain.json")" = "$previous_domain_snapshot"
             wait_health "https://$GATEWAY_DOMAIN/healthz" preflight-live "$previous_version_id"
           fi
           if test -n "$bootstrap_secrets"; then rm -f -- "$bootstrap_secrets"; bootstrap_secrets=; fi
@@ -680,7 +673,6 @@ jobs:
           if test "$domain_preexisting" = true; then
             candidate_domain_id="$(wait_domain "$previous_domain_id" post-existing)"
             test "$candidate_domain_id" = "$previous_domain_id"
-            test "$(domain_snapshot "$RUNNER_TEMP/gateway-post-existing-domain.json")" = "$previous_domain_snapshot"
           else
             api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-domain-attach-service-preflight.json"
             domain_list_complete "$RUNNER_TEMP/gateway-domain-attach-service-preflight.json"
