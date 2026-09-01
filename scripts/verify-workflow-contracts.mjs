@@ -381,6 +381,9 @@ requireText(alertGatewayDeployment, '.result.zone_id|test("^[a-f0-9]{32}$")', 'w
 requireText(alertGatewayDeployment, '(.result.cert_id|type)=="string"', 'validated provider-managed alert-gateway TLS certificate identity');
 requireText(alertGatewayDeployment, '.result.cert_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")', 'well-formed provider-managed alert-gateway TLS certificate identity');
 requireText(alertGatewayDeployment, 'script_routes_absent()', 'account-level alert-gateway ordinary-route attestation');
+requireText(alertGatewayDeployment, 'domain_list_complete "$input" || return 1', 'complete single-page Worker script inventory');
+requireText(alertGatewayDeployment, '($matches[0]|has("routes")|not)', 'documented omitted Worker route metadata');
+requireText(alertGatewayDeployment, '$matches[0].routes==null', 'documented null Worker route metadata');
 requireText(alertGatewayDeployment, 'api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts"', 'documented account Worker inventory');
 requireText(alertGatewayDeployment, 'domain_attach_attempted=true', 'pre-armed alert-gateway domain rollback');
 requireText(alertGatewayDeployment, 'api_put_json "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains"', 'documented alert-gateway domain attach API');

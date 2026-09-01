@@ -64,7 +64,7 @@ for (const required of [
   'bootstrap_mutation_attempted=true', 'contain_bootstrap()', 'contain_bootstrap bootstrap-containment', 'bootstrap_version_owned()',
   '{enabled:false,previews_enabled:true}', 'wait_domain_absent bootstrap-post-deploy',
   '/workers/domains', '/deployments', '/versions/$candidate_version_id', '/settings', '/secrets', '/subdomain',
-  'workers/domains?service=$GATEWAY_NAME', 'workers/domains?hostname=$GATEWAY_DOMAIN', 'domain_list_complete()', 'script_routes_absent()', 'workers/scripts',
+  'workers/domains?service=$GATEWAY_NAME', 'workers/domains?hostname=$GATEWAY_DOMAIN', 'domain_list_complete()', 'script_routes_absent()', 'domain_list_complete "$input" || return 1', 'workers/scripts',
   'has("result_info")|not', '(.result_info|has("page")|not)', '(.result_info|has("per_page")|not)', '(.result_info|has("count")|not)', '(.result_info|has("total_pages")|not)', '(.result_info.total_pages|floor)==.result_info.total_pages', 'domain_preexisting=true', 'domain_attach_attempted=true', 'domain_created_by_run=true', 'reconcile_domain_attach_response()',
   '(.result.zone_id|type)=="string"', '.result.zone_id|test("^[a-f0-9]{32}$")',
   '(.result.cert_id|type)=="string"', '.result.cert_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")',
@@ -444,6 +444,34 @@ assert.ok(domainListCompleteLine, 'The Worker Domain single-page validator must 
 for (const field of ['page', 'per_page', 'count', 'total_pages']) {
   assert.match(domainListCompleteLine, new RegExp(`\\.result_info\\|has\\("${field}"\\)\\|not`), `Optional ${field} metadata must be validated only when present`);
 }
+const scriptRouteInventoryAccepted = (payload, expectedPresent) => {
+  if (!domainInventoryComplete(payload)) return false;
+  const matches = payload.result.filter((item) => item?.id === config.name);
+  if (!expectedPresent) return matches.length === 0;
+  if (matches.length !== 1) return false;
+  const [script] = matches;
+  return !Object.hasOwn(script, 'routes') || script.routes === null || (Array.isArray(script.routes) && script.routes.length === 0);
+};
+const containedScript = { id: config.name };
+assert.equal(scriptRouteInventoryAccepted({ result: [containedScript] }, true), true, 'The documented omitted routes field must represent no ordinary routes');
+assert.equal(scriptRouteInventoryAccepted({ result: [{ ...containedScript, routes: null }] }, true), true, 'The documented null routes field must represent no ordinary routes');
+assert.equal(scriptRouteInventoryAccepted({ result: [{ ...containedScript, routes: [] }] }, true), true, 'An explicit empty routes inventory must pass');
+assert.equal(scriptRouteInventoryAccepted({ result: [{ id: 'unrelated' }, containedScript] }, true), true, 'Unrelated Workers must not invalidate the exact target route proof');
+assert.equal(scriptRouteInventoryAccepted({ result: [] }, true), false, 'A missing target Worker must fail closed when presence is required');
+assert.equal(scriptRouteInventoryAccepted({ result: [containedScript, containedScript] }, true), false, 'Duplicate target Workers must fail closed');
+for (const routes of [false, 'unexpected', {}, [{ pattern: 'scalesmall.ai/*' }]]) {
+  assert.equal(scriptRouteInventoryAccepted({ result: [{ ...containedScript, routes }] }, true), false, 'Malformed or non-empty route metadata must fail closed');
+}
+assert.equal(scriptRouteInventoryAccepted({ result: [{ id: 'unrelated' }] }, false), true, 'Target absence must pass when only unrelated Workers exist');
+assert.equal(scriptRouteInventoryAccepted({ result: [containedScript] }, false), false, 'Any exact target match must fail when absence is required');
+assert.equal(scriptRouteInventoryAccepted({ result: [containedScript], result_info: { total_pages: 2 } }, true), false, 'A contradictory multi-page script inventory must fail closed');
+assert.equal(scriptRouteInventoryAccepted({ result: null }, true), false, 'A malformed script inventory must fail closed');
+const scriptRoutesFunction = workflow.split('          script_routes_absent() {')[1].split('          timestamp_gte() {')[0];
+assert.ok(scriptRoutesFunction.includes('domain_list_complete "$input" || return 1'), 'Script route absence must reject incomplete or contradictory list metadata');
+assert.ok(scriptRoutesFunction.includes('($matches[0]|has("routes")|not)'), 'The documented omitted routes representation must be accepted explicitly');
+assert.ok(scriptRoutesFunction.includes('$matches[0].routes==null'), 'The documented null routes representation must be accepted explicitly');
+assert.ok(scriptRoutesFunction.includes('($matches[0].routes|type)=="array" and ($matches[0].routes|length)==0'), 'Only explicit empty route arrays may pass');
+assert.doesNotMatch(scriptRoutesFunction, /routes\s*\/\/\s*\[\]/, 'Defaulting route metadata must not hide malformed false values');
 const routedDomain = {
   id: 'a'.repeat(32),
   cert_id: '11111111-1111-4111-8111-111111111111',
