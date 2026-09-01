@@ -215,7 +215,7 @@ jobs:
           binding_ok() { jq -e --arg ns "$RATE_LIMITER_NAMESPACE_ID" '((.result.resources.bindings//.result.bindings//[])|length)==3 and any((.result.resources.bindings//.result.bindings//[])[];.=={name:"ALERT_INGEST_RATE_LIMITER",type:"ratelimit",namespace_id:$ns,simple:{limit:60,period:60}}) and any((.result.resources.bindings//.result.bindings//[])[];.name=="ALERT_HMAC_KEY" and .type=="secret_text") and any((.result.resources.bindings//.result.bindings//[])[];.=={name:"CF_VERSION_METADATA",type:"version_metadata"})' "$1" >/dev/null; }
           legacy_binding_ok() { jq -e --arg ns "$RATE_LIMITER_NAMESPACE_ID" '((.result.resources.bindings//.result.bindings//[])|length)==2 and any((.result.resources.bindings//.result.bindings//[])[];.=={name:"ALERT_INGEST_RATE_LIMITER",type:"ratelimit",namespace_id:$ns,simple:{limit:60,period:60}}) and any((.result.resources.bindings//.result.bindings//[])[];.name=="ALERT_HMAC_KEY" and .type=="secret_text")' "$1" >/dev/null; }
           known_settings_binding_ok() { binding_ok "$1" || legacy_binding_ok "$1"; }
-          exact_secret_ok() { jq -e '[.result[]|select(.name=="ALERT_HMAC_KEY" and .type=="secret_text")]|length==1 and (.result|length)==1' "$1" >/dev/null; }
+          exact_secret_ok() { jq -e '(.result|type)=="array" and (.result|length)==1 and .result[0].name=="ALERT_HMAC_KEY" and .result[0].type=="secret_text"' "$1" >/dev/null; }
           bootstrap_version_owned() { jq -e --arg id "$2" --arg sha "$GITHUB_SHA" '.result.id==$id and ((.result.annotations//.result.metadata.annotations//{}) as $a|$a["workers/tag"]==$sha and $a["workers/message"]==("contained bootstrap "+$sha))' "$1" >/dev/null; }
           legacy_contained_version_ok() { jq -e --arg id "$2" '.result.id==$id and ((.result.annotations//.result.metadata.annotations//{}) as $a|($a["workers/tag"]|type)=="string" and ($a["workers/tag"]|test("^[a-f0-9]{40}$")) and $a["workers/message"]==("contained bootstrap "+$a["workers/tag"]))' "$1" >/dev/null && legacy_binding_ok "$1"; }
           candidate_version_ok() { jq -e --arg id "$2" --arg sha "$GITHUB_SHA" --arg msg "$message" --arg alias "$alias" '.result.metadata as $metadata|(.result.annotations//.result.metadata.annotations//{}) as $annotations|([$metadata.hasPreview?,$metadata.has_preview?]|map(select(type=="boolean"))) as $preview_flags|.result.id==$id and ($metadata.created_on|type)=="string" and ($preview_flags|length)>=1 and all($preview_flags[];.==true) and $annotations["workers/tag"]==$sha and $annotations["workers/message"]==$msg and $annotations["workers/alias"]==$alias' "$1" >/dev/null && binding_ok "$1"; }
@@ -730,7 +730,7 @@ jobs:
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/secrets" "$RUNNER_TEMP/gateway-secrets.json"
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/subdomain" "$RUNNER_TEMP/gateway-subdomain.json"
           binding_ok "$RUNNER_TEMP/gateway-settings.json"; observability_ok "$RUNNER_TEMP/gateway-settings.json"
-          jq -e '[.result[]|select(.name=="ALERT_HMAC_KEY" and .type=="secret_text")]|length==1 and (.result|length)==1' "$RUNNER_TEMP/gateway-secrets.json" >/dev/null
+          exact_secret_ok "$RUNNER_TEMP/gateway-secrets.json"
           jq -e '.result.enabled==false and .result.previews_enabled==true' "$RUNNER_TEMP/gateway-subdomain.json" >/dev/null
           if test "$domain_preexisting" = true; then
             candidate_domain_id="$(wait_domain "$previous_domain_id" post-existing)"

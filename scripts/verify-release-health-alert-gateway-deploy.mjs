@@ -106,6 +106,26 @@ assert.ok(domainOkLine, 'The exact custom-domain identity validator must exist')
 for (const requiredIdentityCheck of ['.result.id==$id', '.result.hostname==$h', '.result.service==$s', '.result.zone_name==$z', '(.result.environment//"production")=="production"']) {
   assert.ok(domainOkLine.includes(requiredIdentityCheck), `Domain identity must retain ${requiredIdentityCheck}`);
 }
+const exactSecretFunction = workflow.split('          exact_secret_ok() {')[1].split('\n')[0];
+for (const requiredSecretCheck of ['(.result|type)=="array"', '(.result|length)==1', '.result[0].name=="ALERT_HMAC_KEY"', '.result[0].type=="secret_text"']) {
+  assert.ok(exactSecretFunction.includes(requiredSecretCheck), `Exact secret inventory must retain ${requiredSecretCheck}`);
+}
+assert.doesNotMatch(workflow, /\[\.result\[\]\|select\([^']+\)\]\|length==1 and \(\.result\|length\)==1/, 'A jq pipeline must not replace the response object before the total secret count is evaluated');
+assert.equal((workflow.match(/^\s+exact_secret_ok "\$RUNNER_TEMP\/gateway-secrets\.json"$/gm) ?? []).length, 2, 'Preflight and final evidence must share the exact secret validator');
+assert.equal((workflow.match(/^\s+exact_secret_ok "\$RUNNER_TEMP\/gateway-[^"]+"(?: \|\| return 1)?$/gm) ?? []).length, 5, 'All five secret attestations must use the single exact validator');
+const exactSecretInventory = (payload) => Array.isArray(payload?.result)
+  && payload.result.length === 1
+  && payload.result[0]?.name === 'ALERT_HMAC_KEY'
+  && payload.result[0]?.type === 'secret_text';
+assert.equal(exactSecretInventory({ result: [{ name: 'ALERT_HMAC_KEY', type: 'secret_text', provider_metadata: 'ignored' }] }), true, 'The exact required secret inventory must pass with harmless provider metadata');
+assert.equal(exactSecretInventory({}), false, 'A missing result inventory must fail closed');
+assert.equal(exactSecretInventory({ result: null }), false, 'A null result inventory must fail closed');
+assert.equal(exactSecretInventory({ result: [] }), false, 'A missing required secret must fail closed');
+assert.equal(exactSecretInventory({ result: [{ name: 'ALERT_HMAC_KEY', type: 'secret_text' }, { name: 'EXTRA', type: 'secret_text' }] }), false, 'An additional script secret must fail closed');
+assert.equal(exactSecretInventory({ result: [{ name: 'ALERT_HMAC_KEY', type: 'secret_text' }, { name: 'ALERT_HMAC_KEY', type: 'secret_text' }] }), false, 'Duplicate authorized entries must fail closed');
+assert.equal(exactSecretInventory({ result: [{ name: 'WRONG', type: 'secret_text' }] }), false, 'A substituted secret name must fail closed');
+assert.equal(exactSecretInventory({ result: [{ name: 'ALERT_HMAC_KEY', type: 'plain_text' }] }), false, 'A non-secret binding type must fail closed');
+assert.equal(exactSecretInventory({ result: { name: 'ALERT_HMAC_KEY', type: 'secret_text' } }), false, 'A malformed non-array inventory must fail closed');
 assert.equal((workflow.match(/-X DELETE/g) ?? []).length, 1, 'Only the exact-ID domain rollback helper may issue DELETE');
 assert.equal((workflow.match(/api_delete "accounts\/\$CLOUDFLARE_ACCOUNT_ID\/workers\/domains\/\$observed_domain"/g) ?? []).length, 1);
 assert.ok(workflow.indexOf('traffic_mutated=true') < workflow.indexOf('api_post_json "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-promotion-body.json"'));
