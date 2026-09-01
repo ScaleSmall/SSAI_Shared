@@ -214,7 +214,7 @@ jobs:
           latest_deployment_id() { jq -er '.result.deployments|select(type=="array" and length>0)|.[0]|select((.versions|type)=="array" and (.versions|length)==1 and .versions[0].percentage==100)|.id|select(type=="string")' "$1"; }
           latest_version_id() { jq -er '.result.deployments|select(type=="array" and length>0)|.[0]|select((.versions|type)=="array" and (.versions|length)==1 and .versions[0].percentage==100)|.versions[0].version_id|select(type=="string")' "$1"; }
           valid_uuid() { [[ "$1" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]; }
-          valid_domain_id() { [[ "$1" =~ ^[a-f0-9]{32}$ ]]; }
+          valid_domain_id() { [[ "$1" =~ ^[a-f0-9]{32}$ || "$1" =~ ^[a-f0-9]{40}$ ]] || valid_uuid "$1"; }
           deployment_ok() { jq -e --arg deployment "$2" --arg version "$3" '.result.id==$deployment and (.result.versions|type)=="array" and (.result.versions|length)==1 and .result.versions[0].version_id==$version and .result.versions[0].percentage==100' "$1" >/dev/null; }
           promoted_deployment_ok() { jq -e --arg deployment "$2" --arg version "$3" --arg message "$4" '.result.id==$deployment and .result.source=="api" and .result.strategy=="percentage" and (.result.created_on|type)=="string" and (.result.versions|type)=="array" and (.result.versions|length)==1 and .result.versions[0].version_id==$version and .result.versions[0].percentage==100 and .result.annotations["workers/message"]==$message' "$1" >/dev/null; }
           binding_inventory_ok() {

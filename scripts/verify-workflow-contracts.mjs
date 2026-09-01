@@ -390,6 +390,7 @@ requireText(alertGatewayDeployment, 'api_put_json "accounts/$CLOUDFLARE_ACCOUNT_
 requireText(alertGatewayDeployment, 'reconcile_domain_attach_response()', 'bounded idempotent alert-gateway domain response reconciliation');
 requireText(alertGatewayDeployment, 'reconcile_owned_domain_rollback()', 'bounded alert-gateway domain rollback reconciliation');
 requireText(alertGatewayDeployment, 'test "$domain_created_by_run" != true || ! valid_domain_id "$candidate_domain_id"', 'owned immutable alert-gateway domain rollback gate');
+requireText(alertGatewayDeployment, 'valid_domain_id() { [[ "$1" =~ ^[a-f0-9]{32}$ || "$1" =~ ^[a-f0-9]{40}$ ]] || valid_uuid "$1"; }', 'bounded Cloudflare alert-gateway domain identity contract');
 requireText(alertGatewayDeployment, 'api_delete "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$observed_domain"', 'exact immutable alert-gateway domain rollback');
 requireText(alertGatewayDeployment, 'attest_previous_provider_state()', 'final alert-gateway rollback provider proof');
 requireText(alertGatewayDeployment, 'attest_candidate_ingress()', 'post-health alert-gateway ingress proof');
