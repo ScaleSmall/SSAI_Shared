@@ -184,10 +184,14 @@ recorded producer independently, so either authorized producer can restore the o
 Legacy v4, v3, v2, and v1 issue markers remain native historical formats.
 
 The zero-dependency Cloudflare controller is under `workers/release-health-controller`. Its
-canonical sorted-source digest is `2ebf1e68002676aeca95bd75ed31633562210f59d5089591f548ab02619a18f2`.
+canonical sorted-source digest is `7076478a2b98f986c153551942ce9698ad81c730cf02560b60e26e975c2b8379`.
 Its activation-profile digest is
-`7c33bb9451f67921f04e6ee21a46b059a546615e75872ebc2e04834c40a2f0d9`. The checked-in
-configuration is `MODE=observe`, has no public route, and schedules evaluation every minute.
+`7130eed4e555d404b150a8a71af1be6e5a4e5398e8a8179bae9059a0046f9615`. The checked-in
+configuration is `MODE=observe`, exposes only exact public GET
+`https://release-health-controller.scalesmall.ai/healthz`, disables `workers.dev`, and
+schedules evaluation every minute. The health response has no secret or per-request state and
+returns 503 when the current generation has no completed tick within 300 seconds, the last tick
+has any terminal failure classification, or any alert is dead.
 Logical slots are minutes 1, 16, 31, and 46. Evaluation occurs only at ages 10 through 14 minutes
 to provide five bounded same-slot recovery opportunities, and never backfills a new dispatch. A
 final exact native/canary lookup, stable main SHA, and one
@@ -226,6 +230,63 @@ deterministic alert body commit before delivery. The HMAC signature is derived o
 time and is never persisted. Sink failure leaves the original evidence and outbox record pending
 for bounded retry under the same alert ID. Rollback first disables controller evaluation, then
 proves no fallback run is queued or active, and only then disables the fallback workflow.
+
+### Protected controller deployment
+
+Deploy only with `.github/workflows/deploy-release-health-controller.yml` at an exact protected
+`main` SHA. The `release-health-controller-production` environment must require production
+review and contain the Cloudflare account/token plus the controller GitHub App client ID, private
+key, and installation ID. Observe deployment binds only those three App credentials and requests
+only Actions read, Contents read, and Metadata read. Do not provision the dispatch HMAC, alert key,
+or activation proof to an observe deployment.
+
+Run `scripts/verify-release-health-controller-deploy.mjs` to record the LF-normalized config
+SHA-256 and current source/profile digests. Supply those exact non-secret values with
+`deploy-observe`. The workflow pins Wrangler 4.127.1, converts the protected App key to PKCS#8
+without logging it, performs read-only App and Cloudflare capability probes, uses a temporary
+mode-bound config and secret file, and never invokes the fallback workflow. Acceptance requires
+the exact custom domain, exact one-minute cron, a deployment newer than the operation start, and a
+healthy current-generation tick. Retain the protected workflow run, deployment ID, version ID,
+health body, domain record, cron record, source/profile/config digests, and approval as evidence.
+
+For the first deployment only, set `bootstrap=true` with `deploy-observe` and leave every rollback
+input empty. The workflow accepts this path only when official Cloudflare responses prove the
+Worker has no deployments, versions, settings, schedules, custom domain, or service traffic. It
+uploads a SHA-tagged immutable observe candidate without active-only secrets, verifies its preview
+health schema and exact source/profile/config/Durable Object bindings before traffic, promotes
+that exact version, and then applies the exact domain and cron. If final verification fails, it
+withdraws only the domain and cron proven absent before this run, preserves the Worker/version as
+diagnostic evidence, and fails visibly. Never use bootstrap when any Worker history exists.
+
+Active promotion is a separate `deploy-active` operation against the same protected source/profile
+generation after two consecutive observe slots produced the exact activation proof. Before the
+operation, the signed alert gateway health endpoint must be healthy and the dedicated fallback
+admission environment must contain the same HMAC value and exact App actor/login/sender pins.
+Active preflight requests an Actions-write installation token but exercises it only through
+allowlisted GETs. Only the active-only step receives and binds
+`SSAI_RELEASE_CONTROLLER_ADMISSION_HMAC_KEY`,
+`SSAI_RELEASE_CONTROLLER_ALERT_SIGNING_KEY`, and
+`SSAI_RELEASE_CONTROLLER_ACTIVATION_PROOF`. A missing, malformed, or mismatched prerequisite
+fails before deployment.
+
+For emergency code rollback, select `rollback-observe` with one exact known-good Cloudflare
+version UUID, that version's recorded source/profile/config digests, and its protected-main
+attestation SHA. The rollback config digest is independent of the current workflow config digest;
+never substitute the current digest for it. Before mutation, the workflow proves the exact target
+reports `MODE=observe`, carries the
+expected signed deployment annotations and `SLOT_LEDGER` binding, and has no active-only binding.
+Observe promotion explicitly removes all active-only bindings before creating the final attested
+version. A failed post-deployment check automatically restores this pre-attested observe target.
+The workflow uses Cloudflare version rollback rather than deletion or a fresh Durable Object
+migration, then verifies liveness and the unchanged `SLOT_LEDGER` binding. It does not delete
+controller storage, routes, schedules, or fallback history. Disabling the
+fallback workflow remains a later ordered action after controller dispatch is disabled and zero
+fallback runs are queued or active.
+
+Every final deployment check requires the official live deployment to contain exactly one version
+at 100 percent traffic. The workflow retrieves that exact version and matches its ID, protected SHA
+tag/message, mode, source/profile/config bindings, Durable Object binding, global settings, and
+health body. Split traffic, multiple live versions, or a newer external mutation fails closed.
 
 While observe-only, exact fallback workflow ID `344170407` and its exact source digest have a
 temporary no-history inventory allowance. It requires a successful current-main

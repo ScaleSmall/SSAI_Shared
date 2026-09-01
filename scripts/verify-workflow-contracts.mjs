@@ -213,6 +213,21 @@ const controllerSources = await Promise.all(controllerSourceNames.map((name) => 
 const controllerSourceByName = new Map(controllerSourceNames.map((name, index) => [name, controllerSources[index]]));
 const propagationRetirementRunbook = await readSource('docs', 'SHARED_PROPAGATION_RETIREMENT.md');
 const combined = [...workflowSources.values()].join('\n');
+const controllerDeployment = requireWorkflowSource(
+  workflowSources,
+  'deploy-release-health-controller.yml',
+);
+const alertGatewayDeployment = requireWorkflowSource(
+  workflowSources,
+  'deploy-release-health-alert-gateway.yml',
+);
+const workflowsWithoutControllerDeployment = [...workflowSources.entries()]
+  .filter(([name]) => ![
+    'deploy-release-health-controller.yml',
+    'deploy-release-health-alert-gateway.yml',
+  ].includes(name))
+  .map(([, source]) => source)
+  .join('\n');
 
 assert.equal(controllerConfig.vars.MODE, 'observe', 'F2b controller must remain observe-only');
 assert.equal(controllerConfig.workers_dev, false, 'F2b controller must have no public workers.dev route');
@@ -303,7 +318,22 @@ requireText(releaseHealthUtils, 'recovery_evidence: false', 'fallback no-history
 requireText(releaseHealthVerifier, 'const exactFallbackProducer =', 'fallback self-deployment exact producer branch');
 requireText(releaseHealthVerifier, 'Number(status?.source_run_attempt) === 1', 'fallback self-deployment first-attempt restriction');
 requireText(releaseHealthFallbackRegistration, 'X-GitHub-Api-Version: 2026-03-10', 'exact fallback GitHub API version');
-rejectPattern(combined, /wrangler\s+(?:deploy|publish)|cloudflare\/wrangler-action/i, 'unrun F2b controller deployment workflow');
+rejectPattern(
+  workflowsWithoutControllerDeployment,
+  /wrangler\s+(?:deploy|publish)|cloudflare\/wrangler-action/i,
+  'controller deployment outside the exact protected workflow',
+);
+requireText(controllerDeployment, 'environment:\n      name: release-health-controller-production', 'protected controller deployment environment');
+requireText(controllerDeployment, 'github.workflow_sha == inputs.expected_sha', 'exact controller deployment workflow SHA');
+requireText(controllerDeployment, 'cancel-in-progress: false', 'non-cancelling controller deployment concurrency');
+requireText(controllerDeployment, 'wrangler deploy', 'controller deployment command');
+requireText(controllerDeployment, 'wrangler rollback', 'controller observe rollback command');
+rejectPattern(controllerDeployment, /actions\/workflows\/\d+\/dispatches|gh\s+workflow\s+run/i, 'workflow dispatch from controller deployment');
+requireText(alertGatewayDeployment, 'environment:\n      name: release-health-controller-production', 'protected alert-gateway deployment environment');
+requireText(alertGatewayDeployment, 'github.workflow_sha == inputs.expected_sha', 'exact alert-gateway deployment workflow SHA');
+requireText(alertGatewayDeployment, 'cancel-in-progress: false', 'non-cancelling alert-gateway deployment concurrency');
+requireText(alertGatewayDeployment, 'wrangler deploy', 'alert-gateway deployment command');
+rejectPattern(alertGatewayDeployment, /actions\/workflows\/\d+\/dispatches|gh\s+workflow\s+run/i, 'workflow dispatch from alert-gateway deployment');
 
 assert.deepEqual(
   releaseHealthMonitorWorkflowIdentities,

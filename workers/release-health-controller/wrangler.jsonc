@@ -3,13 +3,29 @@
   "main": "src/index.mjs",
   "compatibility_date": "2026-08-27",
   "workers_dev": false,
+  "preview_urls": true,
+  "routes": [
+    {
+      "pattern": "release-health-controller.scalesmall.ai",
+      "custom_domain": true
+    }
+  ],
   "triggers": {
     "crons": ["* * * * *"]
   },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true
+    }
+  },
   "vars": {
     "MODE": "observe",
-    "CONTROLLER_SOURCE_SHA256": "2ebf1e68002676aeca95bd75ed31633562210f59d5089591f548ab02619a18f2",
-    "CONTROLLER_ACTIVATION_PROFILE_SHA256": "7c33bb9451f67921f04e6ee21a46b059a546615e75872ebc2e04834c40a2f0d9",
+    "CONTROLLER_SOURCE_SHA256": "7076478a2b98f986c153551942ce9698ad81c730cf02560b60e26e975c2b8379",
+    "CONTROLLER_ACTIVATION_PROFILE_SHA256": "7130eed4e555d404b150a8a71af1be6e5a4e5398e8a8179bae9059a0046f9615",
     "REPOSITORY": "ScaleSmall/SSAI_Shared",
     "REPOSITORY_ID": "1183552904",
     "DEFAULT_BRANCH": "main",
@@ -19,6 +35,8 @@
     "LOGICAL_SLOT_MINUTES": "1,16,31,46",
     "NATIVE_MINUTES": "9,24,39,54",
     "GRACE_MINUTES": "10",
+    "HEALTH_ROUTE": "https://release-health-controller.scalesmall.ai/healthz",
+    "HEALTH_STALE_AFTER_SECONDS": "300",
     "CIRCUIT_FAILURE_LIMIT": "4",
     "CIRCUIT_WINDOW_MINUTES": "60",
     "CIRCUIT_COOLDOWN_MINUTES": "60",

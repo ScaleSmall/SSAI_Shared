@@ -12,6 +12,8 @@ const exactEnvironment = Object.freeze({
   FALLBACK_WORKFLOW_ID: '344170407',
   GITHUB_APP_CREDENTIAL_EPOCH: 'github-app-credential-v1',
   GRACE_MINUTES: '10',
+  HEALTH_ROUTE: 'https://release-health-controller.scalesmall.ai/healthz',
+  HEALTH_STALE_AFTER_SECONDS: '300',
   LOGICAL_SLOT_MINUTES: '1,16,31,46',
   NATIVE_MINUTES: '9,24,39,54',
   NATIVE_WORKFLOW_ID: '315630665',
@@ -39,6 +41,8 @@ export function activationProfile(env) {
     fallback_workflow: `${env.FALLBACK_WORKFLOW_ID}:.github/workflows/release-health-monitor-fallback.yml`,
     github_app_credential_epoch: env.GITHUB_APP_CREDENTIAL_EPOCH,
     grace_window: `${env.GRACE_MINUTES}-15-minutes`,
+    health_route: env.HEALTH_ROUTE,
+    health_stale_after: `${env.HEALTH_STALE_AFTER_SECONDS}-seconds`,
     logical_slot_minutes: env.LOGICAL_SLOT_MINUTES,
     native_workflow: `${env.NATIVE_WORKFLOW_ID}:.github/workflows/release-health-monitor.yml`,
     native_workflow_minutes: env.NATIVE_MINUTES,
@@ -46,7 +50,7 @@ export function activationProfile(env) {
     protected_ref: `refs/heads/${env.DEFAULT_BRANCH}`,
     repository: env.REPOSITORY,
     repository_id: Number(env.REPOSITORY_ID),
-    schema: 'ssai-release-health-controller-activation-profile-v2',
+    schema: 'ssai-release-health-controller-activation-profile-v3',
     source_digest: env.CONTROLLER_SOURCE_SHA256,
   });
 }

@@ -1,0 +1,32 @@
+{
+  "name": "ssai-release-health-alert-gateway",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-08-31",
+  "workers_dev": false,
+  "preview_urls": true,
+  "routes": [
+    {
+      "pattern": "alerts.scalesmall.ai",
+      "custom_domain": true
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "ALERT_INGEST_RATE_LIMITER",
+      "namespace_id": "735104001",
+      "simple": {
+        "limit": 60,
+        "period": 60
+      }
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true
+    }
+  }
+}

@@ -707,8 +707,133 @@ assert.equal(alertAttempts[0]['X-SSAI-Alert-Id'], alertAttempts[1]['X-SSAI-Alert
 assert.equal(alertAttempts[0]['X-SSAI-Alert-Signature'], alertAttempts[1]['X-SSAI-Alert-Signature']);
 assert.equal(circuitHarness.database.prepare('PRAGMA table_info(alert_outbox)').all().some((column) => /signature/i.test(column.name)), false);
 
-// Actual Durable Object /evaluate boundary, serialization, observe activation, and active dispatch.
-assert.equal(worker.fetch, undefined);
+// Public /healthz and internal Durable Object /evaluate boundaries.
+assert.equal(typeof worker.fetch, 'function');
+let healthClock = at('2026-08-27T20:02:00Z');
+const healthHarness = sqliteHarness();
+const healthLogs = [];
+const healthEnv = controllerEnv('observe', {
+  CLOCK_NOW: () => healthClock,
+  STRUCTURED_LOG: (line) => healthLogs.push(JSON.parse(line)),
+});
+const healthObject = new ReleaseHealthControllerObject(healthHarness.state, healthEnv);
+healthEnv.SLOT_LEDGER = {
+  idFromName(name) {
+    assert.equal(name, 'ssai-release-health-controller-v2');
+    return 'singleton';
+  },
+  get(id) {
+    assert.equal(id, 'singleton');
+    return {
+      fetch: (input, init) => healthObject.fetch(
+        input instanceof Request ? input : new Request(input, init),
+      ),
+    };
+  },
+};
+const publicHealthRequest = () => new Request(
+  'https://release-health-controller.scalesmall.ai/healthz',
+);
+assert.equal((await worker.fetch(publicHealthRequest(), healthEnv)).status, 503);
+assert.equal((await worker.fetch(new Request(
+  'https://release-health-controller.scalesmall.ai/healthz?verbose=true',
+), healthEnv)).status, 404);
+assert.equal((await worker.fetch(new Request(
+  'https://release-health-controller.scalesmall.ai/healthz', { method: 'POST' },
+), healthEnv)).status, 405);
+assert.equal((await worker.fetch(new Request(
+  'https://other.example/healthz',
+), healthEnv)).status, 404);
+const completedTick = await healthObject.fetch(boundaryRequest(healthClock, healthClock));
+assert.equal(completedTick.status, 200);
+assert.equal((await completedTick.json()).decision, 'outside-window');
+let publicHealth = await worker.fetch(publicHealthRequest(), healthEnv);
+let publicHealthBody = await publicHealth.json();
+assert.equal(publicHealth.status, 200, JSON.stringify(publicHealthBody));
+assert.equal(publicHealthBody.status, 'healthy');
+assert.equal(publicHealthBody.mode, 'observe');
+assert.equal(publicHealthBody.last_completed_tick, new Date(healthClock).toISOString());
+assert.equal(publicHealthBody.last_decision, 'outside-window');
+assert.equal(publicHealthBody.source_digest, controllerSourceDigest);
+assert.equal(publicHealthBody.profile_digest, controllerProfileDigest);
+assert.equal(publicHealthBody.config_digest, null);
+assert.deepEqual(publicHealthBody.alerts, { pending: 0, dead: 0 });
+assert.deepEqual(publicHealthBody.checks, {
+  fresh: true,
+  no_dead_alerts: true,
+  no_terminal_failure: true,
+  no_internal_failure: true,
+});
+assert.doesNotMatch(JSON.stringify(publicHealthBody), /credential|hmac|private|signature|token/i);
+healthClock += 301_000;
+publicHealth = await worker.fetch(publicHealthRequest(), healthEnv);
+publicHealthBody = await publicHealth.json();
+assert.equal(publicHealth.status, 503);
+assert.equal(publicHealthBody.checks.fresh, false);
+
+const unhealthyHarness = sqliteHarness();
+const unhealthyEnv = controllerEnv('invalid', { CLOCK_NOW: () => healthClock });
+const unhealthyObject = new ReleaseHealthControllerObject(unhealthyHarness.state, unhealthyEnv);
+const failedTick = await unhealthyObject.fetch(boundaryRequest(healthClock, healthClock));
+assert.equal(failedTick.status, 503);
+assert.equal((await failedTick.json()).failure_class, 'internal');
+const unhealthy = await unhealthyObject.fetch(new Request('https://controller.internal/healthz'));
+assert.equal(unhealthy.status, 503);
+const unhealthyBody = await unhealthy.json();
+assert.equal(unhealthyBody.checks.no_terminal_failure, false);
+assert.equal(unhealthyBody.checks.no_internal_failure, false);
+
+for (const failureClass of [
+  'provider-evidence',
+  'transport',
+  'rate-limit',
+  'dispatch-unknown',
+  'circuit-open',
+  'configuration',
+  'prepared-expired',
+]) {
+  const failureHarness = sqliteHarness();
+  const failureStore = new ReleaseHealthSlotLedger(failureHarness.state, healthEnv);
+  await failureStore.recordCompletedTick({
+    scheduledTime: healthClock,
+    completedAt: healthClock,
+    sourceDigest: controllerSourceDigest,
+    profileDigest: controllerProfileDigest,
+    decision: 'failed-closed',
+    failureClass,
+  });
+  const status = await failureStore.healthStatus(
+    healthClock,
+    controllerSourceDigest,
+    controllerProfileDigest,
+    300_000,
+  );
+  assert.equal(status.healthy, false, failureClass);
+  assert.equal(status.terminal_failure, true, failureClass);
+}
+
+healthHarness.database.prepare(`INSERT INTO alert_outbox(
+  alert_id,slot,source_digest,profile_digest,body,state,attempts,next_attempt_ms,
+  created_at_ms,updated_at_ms
+) VALUES(?,?,?,?,?,'dead',8,?,?,?)`).run(
+  'f'.repeat(64),
+  baseSlot,
+  controllerSourceDigest,
+  controllerProfileDigest,
+  '{}',
+  healthClock,
+  healthClock,
+  healthClock,
+);
+healthClock = at('2026-08-27T20:02:30Z');
+publicHealth = await worker.fetch(publicHealthRequest(), healthEnv);
+publicHealthBody = await publicHealth.json();
+assert.equal(publicHealth.status, 503);
+assert.equal(publicHealthBody.alerts.dead, 1);
+assert.equal(publicHealthBody.checks.no_dead_alerts, false);
+assert.ok(healthLogs.some((entry) => entry.event === 'health-check' && entry.status === 503));
+
+// Actual Durable Object /evaluate serialization, observe activation, and active dispatch.
 const boundaryHarness = sqliteHarness();
 const observeApi = apiHarness();
 const authModes = [];
@@ -745,7 +870,10 @@ const secondBoundaryResult = await secondBoundary.json();
 assert.match(secondBoundaryResult.activation_proof, /^[a-f0-9]{64}$/);
 assert.deepEqual([...new Set(authModes)], ['read']);
 assert.equal(observeApi.calls.some((call) => call.method === 'POST'), false);
-assert.ok(logs.every((line) => Object.keys(line).sort().join(',') === 'activation_proof,component,decision'));
+assert.ok(logs.every((line) => (
+  Object.keys(line).sort().join(',') === 'activation_proof,component,decision,event'
+  && line.event === 'evaluation-completed'
+)));
 
 const activeApi = apiHarness({
   fallbackInventories: [[]],
@@ -948,5 +1076,14 @@ assert.equal(controllerConfig.vars.CONTROLLER_ACTIVATION_PROFILE_SHA256, control
 assert.equal(controllerConfig.vars.MODE, 'observe');
 assert.deepEqual(controllerConfig.triggers.crons, ['* * * * *']);
 assert.equal(controllerConfig.workers_dev, false);
+assert.deepEqual(controllerConfig.routes, [{
+  pattern: 'release-health-controller.scalesmall.ai',
+  custom_domain: true,
+}]);
+assert.equal(controllerConfig.observability.enabled, true);
+assert.equal(controllerConfig.observability.logs.enabled, true);
+assert.equal(controllerConfig.observability.logs.invocation_logs, true);
+assert.equal(controllerConfig.vars.HEALTH_ROUTE, 'https://release-health-controller.scalesmall.ai/healthz');
+assert.equal(controllerConfig.vars.HEALTH_STALE_AFTER_SECONDS, '300');
 
 console.log('Release-health controller deterministic tests passed.');
