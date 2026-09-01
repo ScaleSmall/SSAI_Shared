@@ -45,7 +45,13 @@ includesAll(scripts['check:contracts'] ?? '', [
   'verify-connect-panel-contract.mjs',
   'verify-shared-api-contract.mjs',
   'verify-workflow-contracts.mjs',
+  'verify-release-health-alert-gateway-deploy.mjs',
 ], 'shared contract gate');
+
+includesAll(scripts['check:release-health-alert-gateway'] ?? '', [
+  'verify-release-health-alert-gateway.mjs',
+  'verify-release-health-alert-gateway-deploy.mjs',
+], 'release-health alert gateway gate');
 
 includesAll(indexSource, [
   "export * from './api.js'",

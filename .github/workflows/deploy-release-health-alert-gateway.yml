@@ -81,7 +81,7 @@ jobs:
           api=https://api.cloudflare.com/client/v4
           alias="c-${GITHUB_SHA:0:12}"
           message="release-health-alert-gateway ${GITHUB_SHA} config=${EXPECTED_CONFIG_SHA256} source=${EXPECTED_SOURCE_SHA256}"
-          previous_version_id= candidate_version_id= traffic_mutated=false bootstrap=false
+          previous_version_id= candidate_version_id= bootstrap_dir= bootstrap_config= traffic_mutated=false bootstrap=false
           api_get() { curl --fail --silent --show-error --max-time 20 --proto '=https' -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api/$1" -o "$2"; jq -e '.success==true' "$2" >/dev/null; }
           sole_version() { jq -r '[(.result.deployments//.result//[])[]]|sort_by(.created_on)|last|select((.versions|length)==1 and .versions[0].percentage==100)|.versions[0].version_id//empty' "$1"; }
           binding_ok() { jq -e --arg ns "$RATE_LIMITER_NAMESPACE_ID" '((.result.resources.bindings//.result.bindings//[])|length)==2 and any((.result.resources.bindings//.result.bindings//[])[];.=={name:"ALERT_INGEST_RATE_LIMITER",type:"ratelimit",namespace_id:$ns,simple:{limit:60,period:60}}) and any((.result.resources.bindings//.result.bindings//[])[];.name=="ALERT_HMAC_KEY" and .type=="secret_text")' "$1" >/dev/null; }
@@ -93,7 +93,8 @@ jobs:
               api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-rollback.json"
               test "$(sole_version "$RUNNER_TEMP/gateway-rollback.json")" = "$previous_version_id" || exit 98
             fi
-            rm -rf -- "$RUNNER_TEMP/gateway-dry-run" "$RUNNER_TEMP/gateway-bootstrap.jsonc"
+            rm -rf -- "$RUNNER_TEMP/gateway-dry-run" "$RUNNER_TEMP/gateway-bootstrap-dry-run"
+            test -z "$bootstrap_dir" || rm -rf -- "$bootstrap_dir"
             rm -f -- "$RUNNER_TEMP"/gateway-*.json "$RUNNER_TEMP"/gateway-*.jsonl "$RUNNER_TEMP"/gateway-*.headers
             exit "$rc"
           }
@@ -114,9 +115,14 @@ jobs:
             test "$ALLOW_FIRST_BOOTSTRAP" = true; bootstrap=true
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" "$RUNNER_TEMP/gateway-domains.json"
             jq -e --arg h "$GATEWAY_DOMAIN" '[.result[]|select(.hostname==$h)]|length==0' "$RUNNER_TEMP/gateway-domains.json" >/dev/null
-            jq '.routes=[]' "$GATEWAY_CONFIG" > "$RUNNER_TEMP/gateway-bootstrap.jsonc"
-            ./node_modules/.bin/wrangler deploy --config "$RUNNER_TEMP/gateway-bootstrap.jsonc" --name "$GATEWAY_NAME" --message "contained bootstrap ${GITHUB_SHA}" --tag "$GITHUB_SHA"
-            printf '%s' "$ALERT_HMAC_KEY" | ./node_modules/.bin/wrangler secret put ALERT_HMAC_KEY --config "$RUNNER_TEMP/gateway-bootstrap.jsonc" --name "$GATEWAY_NAME"
+            bootstrap_dir="$RUNNER_TEMP/gateway-bootstrap"
+            install -d -m 700 -- "$bootstrap_dir"
+            cp -R -- "$(dirname "$GATEWAY_CONFIG")/." "$bootstrap_dir/"
+            bootstrap_config="$bootstrap_dir/$(basename "$GATEWAY_CONFIG")"
+            jq '.routes=[]' "$GATEWAY_CONFIG" > "$bootstrap_config"
+            ./node_modules/.bin/wrangler deploy --config "$bootstrap_config" --name "$GATEWAY_NAME" --dry-run --outdir "$RUNNER_TEMP/gateway-bootstrap-dry-run" >/dev/null
+            ./node_modules/.bin/wrangler deploy --config "$bootstrap_config" --name "$GATEWAY_NAME" --message "contained bootstrap ${GITHUB_SHA}" --tag "$GITHUB_SHA"
+            printf '%s' "$ALERT_HMAC_KEY" | ./node_modules/.bin/wrangler secret put ALERT_HMAC_KEY --config "$bootstrap_config" --name "$GATEWAY_NAME"
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-preflight.json"
             previous_version_id="$(sole_version "$RUNNER_TEMP/gateway-preflight.json")"; [[ "$previous_version_id" =~ ^[a-f0-9-]{36}$ ]]
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" "$RUNNER_TEMP/gateway-domains.json"

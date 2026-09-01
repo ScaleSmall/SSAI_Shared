@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFile, readdir } from 'node:fs/promises';
+import { cp, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const root = new URL('../', import.meta.url);
 const normalizeLf = (value) => value.replace(/\r\n?/g, '\n');
@@ -33,7 +37,14 @@ for (const required of [
   'RATE_LIMITER_NAMESPACE_ID: \'735104001\'', 'X-SSAI-Preview-Health-Host:', 'metadata.has_preview==true',
   'workers/alias', 'previous_version_id', 'traffic_mutated=true', 'automatic rollback after',
   'versions deploy "${previous_version_id}@100%"', 'versions deploy "${candidate_version_id}@100%"',
-  'wrangler triggers deploy', 'jq \'.routes=[]\'', 'test "$ALLOW_FIRST_BOOTSTRAP" = true',
+  'wrangler triggers deploy', 'test "$ALLOW_FIRST_BOOTSTRAP" = true',
+  'bootstrap_dir="$RUNNER_TEMP/gateway-bootstrap"', 'install -d -m 700 -- "$bootstrap_dir"',
+  'cp -R -- "$(dirname "$GATEWAY_CONFIG")/." "$bootstrap_dir/"',
+  'bootstrap_config="$bootstrap_dir/$(basename "$GATEWAY_CONFIG")"',
+  'jq \'.routes=[]\' "$GATEWAY_CONFIG" > "$bootstrap_config"',
+  'wrangler deploy --config "$bootstrap_config" --name "$GATEWAY_NAME" --dry-run --outdir "$RUNNER_TEMP/gateway-bootstrap-dry-run"',
+  'wrangler deploy --config "$bootstrap_config"', 'wrangler secret put ALERT_HMAC_KEY --config "$bootstrap_config"',
+  'test -z "$bootstrap_dir" || rm -rf -- "$bootstrap_dir"',
   '/workers/domains', '/deployments', '/versions/$candidate_version_id', '/settings', '/secrets', '/subdomain',
   'wrangler secret put ALERT_HMAC_KEY', 'name=="ALERT_HMAC_KEY" and .type=="secret_text"',
   'expected_secret_names:["ALERT_HMAC_KEY"]', '.result.enabled==false and .result.previews_enabled==true', 'ssai-release-health-alert-gateway-deployment-evidence-v2',
@@ -51,6 +62,32 @@ assert.doesNotMatch(workflow, /cloudflare\/wrangler-action|npx\s+wrangler|npm\s+
 assert.doesNotMatch(workflow, /wrangler\s+(?:delete|rollback|triggers\s+delete|secret\s+delete)/i);
 assert.doesNotMatch(workflow, /\bDELETE\b|workers\/domains[^\n]*(?:delete|remove)/i);
 assert.doesNotMatch(workflow, /SSAI_RELEASE_CONTROLLER_(?:GITHUB|ADMISSION|ACTIVATION)/);
+assert.doesNotMatch(workflow, /\$RUNNER_TEMP\/gateway-bootstrap\.jsonc/);
+
+const bootstrapRoot = await mkdtemp(join(tmpdir(), 'ssai-alert-gateway-bootstrap-'));
+try {
+  const stagedDirectory = join(bootstrapRoot, 'gateway');
+  const stagedConfigPath = join(stagedDirectory, 'wrangler.jsonc');
+  const dryRunDirectory = join(bootstrapRoot, 'dry-run');
+  await cp(fileURLToPath(new URL('workers/release-health-alert-gateway/', root)), stagedDirectory, { recursive: true, errorOnExist: true });
+  await writeFile(stagedConfigPath, `${JSON.stringify({ ...config, routes: [] }, null, 2)}\n`, { mode: 0o600 });
+  const stagedConfig = JSON.parse(await readFile(stagedConfigPath, 'utf8'));
+  assert.equal(stagedConfig.main, config.main);
+  assert.deepEqual(stagedConfig.routes, []);
+  await readFile(join(stagedDirectory, stagedConfig.main));
+  execFileSync(process.execPath, [
+    fileURLToPath(new URL('node_modules/wrangler/bin/wrangler.js', root)),
+    'deploy', '--config', stagedConfigPath, '--name', config.name, '--dry-run', '--outdir', dryRunDirectory,
+  ], {
+    cwd: fileURLToPath(root),
+    env: { ...process.env, WRANGLER_SEND_METRICS: 'false' },
+    stdio: 'pipe',
+    timeout: 60_000,
+  });
+  assert.ok((await readdir(dryRunDirectory)).length > 0, 'Staged bootstrap dry-run must emit a bundle');
+} finally {
+  await rm(bootstrapRoot, { recursive: true, force: true });
+}
 
 const expectedConfig = process.env.SSAI_EXPECTED_ALERT_GATEWAY_CONFIG_SHA256;
 const expectedSource = process.env.SSAI_EXPECTED_ALERT_GATEWAY_SOURCE_SHA256;
