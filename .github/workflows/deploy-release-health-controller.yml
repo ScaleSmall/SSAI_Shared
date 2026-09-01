@@ -53,6 +53,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: release-health-controller-production-deployment
@@ -71,9 +72,10 @@ jobs:
     environment:
       name: release-health-controller-production
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      CLOUDFLARE_ACCOUNT_ID: 7b68f149b6054718ad2c6ff0634ae145
       CONTROLLER_CONFIG: workers/release-health-controller/wrangler.jsonc
       CONTROLLER_NAME: ssai-release-health-controller
       CONTROLLER_HEALTH_URL: https://release-health-controller.scalesmall.ai/healthz
@@ -82,6 +84,7 @@ jobs:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
         with:
           ref: ${{ inputs.expected_sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
@@ -99,6 +102,9 @@ jobs:
           ROLLBACK_PROFILE: ${{ inputs.rollback_profile_sha256 }}
           ROLLBACK_CONFIG: ${{ inputs.rollback_config_sha256 }}
           ROLLBACK_ATTESTATION_SHA: ${{ inputs.rollback_attestation_sha }}
+          EXPECTED_SOURCE: ${{ inputs.expected_target_source_sha256 }}
+          EXPECTED_PROFILE: ${{ inputs.expected_target_profile_sha256 }}
+          EXPECTED_CONFIG: ${{ inputs.expected_config_sha256 }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = 'ScaleSmall/SSAI_Shared'
@@ -109,6 +115,9 @@ jobs:
           test '${{ github.ref_protected }}' = 'true'
           test '${{ github.run_attempt }}' = '1'
           git diff --exit-code
+          [[ "$EXPECTED_SOURCE" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$EXPECTED_PROFILE" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$EXPECTED_CONFIG" =~ ^[a-f0-9]{64}$ ]]
           case "$OPERATION" in deploy-observe|deploy-active|rollback-observe) ;; *) exit 1 ;; esac
           if test "$BOOTSTRAP" = true; then
             test "$OPERATION" = deploy-observe
@@ -121,8 +130,8 @@ jobs:
             [[ "$ROLLBACK_ATTESTATION_SHA" =~ ^[a-f0-9]{40}$ ]]
           fi
           if test "$OPERATION" = rollback-observe; then
-            test "$ROLLBACK_SOURCE" = '${{ inputs.expected_target_source_sha256 }}'
-            test "$ROLLBACK_PROFILE" = '${{ inputs.expected_target_profile_sha256 }}'
+            test "$ROLLBACK_SOURCE" = "$EXPECTED_SOURCE"
+            test "$ROLLBACK_PROFILE" = "$EXPECTED_PROFILE"
           fi
 
       - name: Install exact locked toolchain
@@ -142,7 +151,6 @@ jobs:
       - name: Verify Cloudflare account capability
         shell: bash
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
         run: |
           set -euo pipefail
@@ -157,36 +165,235 @@ jobs:
             '.success == true and .result.id == $id' \
             "$RUNNER_TEMP/cloudflare-account.json" >/dev/null
 
-      - name: Prove bootstrap has no Worker history or traffic
+      - name: Capture fallback inventory before bootstrap
+        id: fallback_before
+        if: ${{ inputs.bootstrap }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --method GET \
+            'repos/ScaleSmall/SSAI_Shared/actions/workflows/344170407/runs?event=workflow_dispatch&branch=main&per_page=1' \
+            > "$RUNNER_TEMP/bootstrap-fallback-before.json"
+          fallback_id="$(jq -er '
+            select((.workflow_runs | type) == "array" and (.workflow_runs | length) <= 1)
+            | if (.workflow_runs | length) == 0 then "absent"
+              else (.workflow_runs[0]
+                | select(.workflow_id == 344170407 and .event == "workflow_dispatch" and .head_branch == "main")
+                | (.id | tostring))
+              end
+          ' "$RUNNER_TEMP/bootstrap-fallback-before.json")"
+          [[ "$fallback_id" == absent || "$fallback_id" =~ ^[1-9][0-9]*$ ]]
+          printf 'latest_run_id=%s\n' "$fallback_id" >> "$GITHUB_OUTPUT"
+
+      - name: Classify exact resumable bootstrap state
         id: bootstrap_absence
         if: ${{ inputs.bootstrap }}
         shell: bash
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+          EXPECTED_SOURCE: ${{ inputs.expected_target_source_sha256 }}
+          EXPECTED_PROFILE: ${{ inputs.expected_target_profile_sha256 }}
+          EXPECTED_CONFIG: ${{ inputs.expected_config_sha256 }}
         run: |
           set -euo pipefail
           api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          valid_uuid() { [[ "$1" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]; }
+          valid_domain_id() { [[ "$1" =~ ^[a-f0-9]{32}$ || "$1" =~ ^[a-f0-9]{40}$ ]] || valid_uuid "$1"; }
+          deployments_code= versions_code= settings_code= schedules_code=
           for resource in deployments versions settings schedules; do
+            resource_url="$api/workers/scripts/$CONTROLLER_NAME/$resource"
+            if test "$resource" = versions; then resource_url="${resource_url}?deployable=true"; fi
             code="$(curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
               -o "$RUNNER_TEMP/bootstrap-$resource.json" -w '%{http_code}' \
-              "$api/workers/scripts/$CONTROLLER_NAME/$resource")"
-            test "$code" = 404
+              "$resource_url")"
+            [[ "$code" =~ ^(200|404)$ ]]
+            printf -v "${resource}_code" '%s' "$code"
           done
           curl --fail --silent --show-error --max-time 15 --proto '=https' \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            "$api/workers/domains" -o "$RUNNER_TEMP/bootstrap-domains-before.json"
-          jq -e '.success == true and (.result | all(
-            .hostname != "release-health-controller.scalesmall.ai"
-            and .service != "ssai-release-health-controller"
-          ))' "$RUNNER_TEMP/bootstrap-domains-before.json" >/dev/null
+            "$api/workers/domains?service=$CONTROLLER_NAME" \
+            -o "$RUNNER_TEMP/bootstrap-service-domains-before.json"
           curl --fail --silent --show-error --max-time 15 --proto '=https' \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            "$api/workers/subdomain" -o "$RUNNER_TEMP/bootstrap-subdomain.json"
-          subdomain="$(jq -er '.result.subdomain | select(test("^[a-z0-9-]{1,63}$"))' \
-            "$RUNNER_TEMP/bootstrap-subdomain.json")"
-          printf 'subdomain=%s\n' "$subdomain" >> "$GITHUB_OUTPUT"
+            "$api/workers/domains?hostname=release-health-controller.scalesmall.ai" \
+            -o "$RUNNER_TEMP/bootstrap-hostname-domains-before.json"
+          jq -e '.success == true and (.result | type) == "array" and (.result | length) <= 1' \
+            "$RUNNER_TEMP/bootstrap-service-domains-before.json" >/dev/null
+          jq -e '.success == true and (.result | type) == "array" and (.result | length) <= 1' \
+            "$RUNNER_TEMP/bootstrap-hostname-domains-before.json" >/dev/null
+          service_count="$(jq -er '.result | length' "$RUNNER_TEMP/bootstrap-service-domains-before.json")"
+          hostname_count="$(jq -er '.result | length' "$RUNNER_TEMP/bootstrap-hostname-domains-before.json")"
+          if test "$deployments_code$versions_code$settings_code$schedules_code" = 404404404404; then
+            test "$service_count" = 0
+            test "$hostname_count" = 0
+            printf 'state=absent\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          test "$deployments_code$versions_code$settings_code$schedules_code" = 200200200200
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/scripts/$CONTROLLER_NAME/subdomain" \
+            -o "$RUNNER_TEMP/bootstrap-subdomain-before.json"
+          jq -e '.success == true and .result.enabled == false and .result.previews_enabled == false' \
+            "$RUNNER_TEMP/bootstrap-subdomain-before.json" >/dev/null
+          deployment_id="$(jq -er '
+            select(.success == true)
+            | (.result.deployments // .result) as $deployments
+            | select(($deployments | type) == "array" and ($deployments | length) > 0)
+            | $deployments[0]
+            | select((.versions | type) == "array" and (.versions | length) == 1)
+            | select((.versions[0].percentage | tonumber) == 100)
+            | .id
+          ' "$RUNNER_TEMP/bootstrap-deployments.json")"
+          candidate="$(jq -er '
+            (.result.deployments // .result)[0].versions[0].version_id
+          ' "$RUNNER_TEMP/bootstrap-deployments.json")"
+          valid_uuid "$deployment_id"
+          valid_uuid "$candidate"
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/scripts/$CONTROLLER_NAME/deployments/$deployment_id" \
+            -o "$RUNNER_TEMP/bootstrap-live-deployment-before.json"
+          deployment_created_on="$(jq -er --arg deployment "$deployment_id" --arg version "$candidate" '
+            select(.success == true and .result.id == $deployment)
+            | .result
+            | select((.versions | type) == "array" and (.versions | length) == 1)
+            | select(.versions[0].version_id == $version and (.versions[0].percentage | tonumber) == 100)
+            | .created_on
+            | select(type == "string" and length > 0)
+          ' "$RUNNER_TEMP/bootstrap-live-deployment-before.json")"
+          node -e '
+            const value = process.argv[1];
+            if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value)
+              || !Number.isFinite(Date.parse(value))) process.exit(1);
+          ' "$deployment_created_on"
+          jq -e --arg id "$candidate" '
+            .success == true and (.result.items | type) == "array"
+            and ([.result.items[] | select(.id == $id)] | length) == 1
+          ' "$RUNNER_TEMP/bootstrap-versions.json" >/dev/null
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/scripts/$CONTROLLER_NAME/versions/$candidate" \
+            -o "$RUNNER_TEMP/bootstrap-live-version-before.json"
+          candidate_sha="$(jq -er '
+            (.result.annotations // .result.metadata.annotations // {})["workers/tag"]
+            | select(type == "string" and test("^[a-f0-9]{40}$"))
+          ' "$RUNNER_TEMP/bootstrap-live-version-before.json")"
+          candidate_message="$(jq -er '
+            (.result.annotations // .result.metadata.annotations // {})["workers/message"]
+            | select(type == "string")
+          ' "$RUNNER_TEMP/bootstrap-live-version-before.json")"
+          IFS=: read -r message_prefix message_sha candidate_source candidate_profile message_extra <<< "$candidate_message"
+          test "$message_prefix" = protected-observe
+          test "$message_sha" = "$candidate_sha"
+          test -z "${message_extra:-}"
+          [[ "$candidate_source" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$candidate_profile" =~ ^[a-f0-9]{64}$ ]]
+          git cat-file -e "${candidate_sha}^{commit}"
+          git merge-base --is-ancestor "$candidate_sha" "$GITHUB_SHA"
+          candidate_config="$(jq -er '
+            (.result.resources.bindings // .result.bindings // [])
+            | [.[] | select(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text")]
+            | select(length == 1) | .[0].text | select(test("^[a-f0-9]{64}$"))
+          ' "$RUNNER_TEMP/bootstrap-live-version-before.json")"
+          jq -e --arg id "$candidate" --arg tag "$candidate_sha" --arg message "$candidate_message" \
+            --arg source "$candidate_source" --arg profile "$candidate_profile" --arg config "$candidate_config" '
+            (.result.resources.bindings // .result.bindings // []) as $bindings
+            | .success == true and .result.id == $id
+            and (.result.annotations // .result.metadata.annotations // {})["workers/tag"] == $tag
+            and (.result.annotations // .result.metadata.annotations // {})["workers/message"] == $message
+            and ([$bindings[] | select(.name == "MODE" and .type == "plain_text" and .text == "observe")] | length) == 1
+            and ([$bindings[] | select(.name == "CONTROLLER_SOURCE_SHA256" and .type == "plain_text" and .text == $source)] | length) == 1
+            and ([$bindings[] | select(.name == "CONTROLLER_ACTIVATION_PROFILE_SHA256" and .type == "plain_text" and .text == $profile)] | length) == 1
+            and ([$bindings[] | select(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config)] | length) == 1
+            and ([$bindings[] | select(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject")] | length) == 1
+            and ([$bindings[] | select(.name == "GITHUB_APP_CLIENT_ID" and .type == "secret_text")] | length) == 1
+            and ([$bindings[] | select(.name == "GITHUB_APP_PRIVATE_KEY" and .type == "secret_text")] | length) == 1
+            and ([$bindings[] | select(.name == "GITHUB_INSTALLATION_ID" and .type == "secret_text")] | length) == 1
+            and ([$bindings[] | select(.type == "secret_text") | .name] | sort)
+              == ["GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"]
+          ' "$RUNNER_TEMP/bootstrap-live-version-before.json" >/dev/null
+          jq -e --arg source "$candidate_source" --arg profile "$candidate_profile" --arg config "$candidate_config" '
+            .result.bindings as $bindings
+            | .success == true and ($bindings | type) == "array"
+            and ([$bindings[] | select(.name == "MODE" and .type == "plain_text" and .text == "observe")] | length) == 1
+            and ([$bindings[] | select(.name == "CONTROLLER_SOURCE_SHA256" and .type == "plain_text" and .text == $source)] | length) == 1
+            and ([$bindings[] | select(.name == "CONTROLLER_ACTIVATION_PROFILE_SHA256" and .type == "plain_text" and .text == $profile)] | length) == 1
+            and ([$bindings[] | select(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config)] | length) == 1
+            and ([$bindings[] | select(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject")] | length) == 1
+            and ([$bindings[] | select(.name == "GITHUB_APP_CLIENT_ID" and .type == "secret_text")] | length) == 1
+            and ([$bindings[] | select(.name == "GITHUB_APP_PRIVATE_KEY" and .type == "secret_text")] | length) == 1
+            and ([$bindings[] | select(.name == "GITHUB_INSTALLATION_ID" and .type == "secret_text")] | length) == 1
+            and ([$bindings[] | select(.type == "secret_text") | .name] | sort)
+              == ["GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"]
+          ' "$RUNNER_TEMP/bootstrap-settings.json" >/dev/null
+          schedule_count="$(jq -er '
+            (.result.schedules // .result // []) as $schedules
+            | select(.success == true and ($schedules | type) == "array" and ($schedules | length) <= 1)
+            | $schedules | length
+          ' "$RUNNER_TEMP/bootstrap-schedules.json")"
+          if test "$schedule_count" = 1; then
+            jq -e '(.result.schedules // .result // [])[0].cron == "* * * * *"' "$RUNNER_TEMP/bootstrap-schedules.json" >/dev/null
+          fi
+          test "$service_count" = "$hostname_count"
+          domain_id=
+          if test "$service_count" = 1; then
+            domain_id="$(jq -er '.result[0].id' "$RUNNER_TEMP/bootstrap-service-domains-before.json")"
+            hostname_domain_id="$(jq -er '.result[0].id' "$RUNNER_TEMP/bootstrap-hostname-domains-before.json")"
+            test "$domain_id" = "$hostname_domain_id"
+            valid_domain_id "$domain_id"
+            for file in bootstrap-service-domains-before bootstrap-hostname-domains-before; do
+              jq -e --arg id "$domain_id" '
+                (.result | length) == 1 and .result[0].id == $id
+                and .result[0].hostname == "release-health-controller.scalesmall.ai"
+                and .result[0].service == "ssai-release-health-controller"
+                and .result[0].zone_name == "scalesmall.ai"
+                and (.result[0].zone_id | type) == "string"
+                and (.result[0].zone_id | test("^[a-f0-9]{32}$"))
+                and (.result[0].environment // "production") == "production"
+              ' "$RUNNER_TEMP/$file.json" >/dev/null
+            done
+            curl --fail --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/domains/$domain_id" -o "$RUNNER_TEMP/bootstrap-domain-before.json"
+            jq -e --arg id "$domain_id" '
+              .success == true and .result.id == $id
+              and .result.hostname == "release-health-controller.scalesmall.ai"
+              and .result.service == "ssai-release-health-controller"
+              and .result.zone_name == "scalesmall.ai"
+              and (.result.zone_id | type) == "string"
+              and (.result.zone_id | test("^[a-f0-9]{32}$"))
+              and (.result.environment // "production") == "production"
+            ' "$RUNNER_TEMP/bootstrap-domain-before.json" >/dev/null
+          fi
+          if test "$service_count" = 0 && test "$schedule_count" = 0; then
+            state=contained
+            if test "$candidate_source" != "$EXPECTED_SOURCE" \
+              || test "$candidate_profile" != "$EXPECTED_PROFILE" \
+              || test "$candidate_config" != "$EXPECTED_CONFIG"; then
+              state=stale-contained
+            fi
+          elif test "$service_count" = 1 && test "$schedule_count" = 0; then
+            state=domain
+          elif test "$service_count" = 1 && test "$schedule_count" = 1; then
+            state=scheduled
+          else
+            exit 1
+          fi
+          if test "$state" != stale-contained; then
+            test "$candidate_source" = "$EXPECTED_SOURCE"
+            test "$candidate_profile" = "$EXPECTED_PROFILE"
+            test "$candidate_config" = "$EXPECTED_CONFIG"
+          fi
+          printf 'state=%s\n' "$state" >> "$GITHUB_OUTPUT"
+          printf 'candidate_version_id=%s\n' "$candidate" >> "$GITHUB_OUTPUT"
+          printf 'candidate_deployment_id=%s\n' "$deployment_id" >> "$GITHUB_OUTPUT"
+          printf 'deployment_created_on=%s\n' "$deployment_created_on" >> "$GITHUB_OUTPUT"
+          printf 'attestation_sha=%s\n' "$candidate_sha" >> "$GITHUB_OUTPUT"
+          printf 'domain_id=%s\n' "$domain_id" >> "$GITHUB_OUTPUT"
 
       - name: Prepare and validate runtime credentials without disclosure
         if: ${{ inputs.operation != 'rollback-observe' }}
@@ -308,71 +515,414 @@ jobs:
             --config workers/release-health-controller/.wrangler-deployment.jsonc \
             --dry-run --outdir "$RUNNER_TEMP/controller-dry-run" >/dev/null
 
-      - name: Upload and preverify immutable bootstrap observe candidate
-        id: bootstrap_candidate
-        if: ${{ inputs.bootstrap && steps.bootstrap_absence.outcome == 'success' }}
+      - name: Create contained bootstrap observe candidate
+        id: create_bootstrap_candidate
+        if: ${{ inputs.bootstrap && steps.bootstrap_absence.outcome == 'success' && (steps.bootstrap_absence.outputs.state == 'absent' || steps.bootstrap_absence.outputs.state == 'stale-contained') }}
+        continue-on-error: true
+        timeout-minutes: 12
         shell: bash
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+          EXPECTED_SOURCE: ${{ inputs.expected_target_source_sha256 }}
+          EXPECTED_PROFILE: ${{ inputs.expected_target_profile_sha256 }}
+          PREFLIGHT_STATE: ${{ steps.bootstrap_absence.outputs.state }}
+        run: |
+          set -euo pipefail
+          case "$PREFLIGHT_STATE" in absent|stale-contained) ;; *) exit 1 ;; esac
+          message="protected-observe:${GITHUB_SHA}:${EXPECTED_SOURCE}:${EXPECTED_PROFILE}"
+          bootstrap_config="workers/release-health-controller/.wrangler-bootstrap-deployment.jsonc"
+          node scripts/materialize-release-health-controller-bootstrap.mjs \
+            workers/release-health-controller/.wrangler-deployment.jsonc \
+            "$bootstrap_config"
+          test "$(stat -c '%a' "$bootstrap_config")" = 600
+          started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          printf 'started_at=%s\n' "$started_at" >> "$GITHUB_OUTPUT"
+          deploy_args=(
+            --config "$bootstrap_config"
+            --secrets-file "$RUNNER_TEMP/controller-secrets.json"
+            --message "$message"
+            --tag "$GITHUB_SHA"
+          )
+          if test "$PREFLIGHT_STATE" = absent; then
+            deploy_args+=(--strict)
+          fi
+          timeout --signal=TERM --kill-after=15s 10m ./node_modules/.bin/wrangler deploy \
+            "${deploy_args[@]}"
+
+      - name: Attest private bootstrap observe candidate
+        id: bootstrap_candidate
+        if: ${{ inputs.bootstrap && steps.bootstrap_absence.outcome == 'success' && ((steps.bootstrap_absence.outputs.state != 'absent' && steps.bootstrap_absence.outputs.state != 'stale-contained') || steps.create_bootstrap_candidate.outcome == 'success') }}
+        timeout-minutes: 5
+        shell: bash
+        env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
           EXPECTED_SOURCE: ${{ inputs.expected_target_source_sha256 }}
           EXPECTED_PROFILE: ${{ inputs.expected_target_profile_sha256 }}
           EXPECTED_CONFIG: ${{ inputs.expected_config_sha256 }}
-          ACCOUNT_SUBDOMAIN: ${{ steps.bootstrap_absence.outputs.subdomain }}
+          PREFLIGHT_STATE: ${{ steps.bootstrap_absence.outputs.state }}
+          RESUME_CANDIDATE: ${{ steps.bootstrap_absence.outputs.candidate_version_id }}
+          RESUME_DEPLOYMENT: ${{ steps.bootstrap_absence.outputs.candidate_deployment_id }}
+          RESUME_CREATED_ON: ${{ steps.bootstrap_absence.outputs.deployment_created_on }}
+          RESUME_ATTESTATION_SHA: ${{ steps.bootstrap_absence.outputs.attestation_sha }}
+          RESUME_DOMAIN_ID: ${{ steps.bootstrap_absence.outputs.domain_id }}
         run: |
           set -euo pipefail
-          alias="bootstrap-${GITHUB_SHA:0:12}"
-          message="protected-observe:${GITHUB_SHA}:${EXPECTED_SOURCE}:${EXPECTED_PROFILE}"
-          ./node_modules/.bin/wrangler versions upload \
-            --config workers/release-health-controller/.wrangler-deployment.jsonc \
-            --secrets-file "$RUNNER_TEMP/controller-secrets.json" \
-            --preview-alias "$alias" --message "$message" --tag "$GITHUB_SHA"
           api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          state="$PREFLIGHT_STATE"
+          attestation_sha="$RESUME_ATTESTATION_SHA"
+          if test "$PREFLIGHT_STATE" = absent || test "$PREFLIGHT_STATE" = stale-contained; then
+            state=contained
+            attestation_sha="$GITHUB_SHA"
+          fi
+          [[ "$attestation_sha" =~ ^[a-f0-9]{40}$ ]]
+          git cat-file -e "${attestation_sha}^{commit}"
+          git merge-base --is-ancestor "$attestation_sha" "$GITHUB_SHA"
+          message="protected-observe:${attestation_sha}:${EXPECTED_SOURCE}:${EXPECTED_PROFILE}"
           curl --fail --silent --show-error --max-time 15 --proto '=https' \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            "$api/workers/scripts/$CONTROLLER_NAME/versions" \
-            -o "$RUNNER_TEMP/bootstrap-versions-after.json"
-          candidate="$(jq -er --arg tag "$GITHUB_SHA" --arg message "$message" '
-            [.result[] | select(
-              .metadata.annotations["workers/tag"] == $tag
-              and .metadata.annotations["workers/message"] == $message
-            )] | select(length == 1) | .[0].id
-          ' "$RUNNER_TEMP/bootstrap-versions-after.json")"
-          [[ "$candidate" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$ ]]
+            "$api/workers/scripts/$CONTROLLER_NAME/deployments" \
+            -o "$RUNNER_TEMP/bootstrap-deployments-after.json"
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/scripts/$CONTROLLER_NAME/schedules" \
+            -o "$RUNNER_TEMP/bootstrap-schedules-after.json"
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/scripts/$CONTROLLER_NAME/subdomain" \
+            -o "$RUNNER_TEMP/bootstrap-subdomain-after.json"
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/scripts/$CONTROLLER_NAME/settings" \
+            -o "$RUNNER_TEMP/bootstrap-settings-after.json"
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/domains?service=$CONTROLLER_NAME" \
+            -o "$RUNNER_TEMP/bootstrap-service-domains-after.json"
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/domains?hostname=release-health-controller.scalesmall.ai" \
+            -o "$RUNNER_TEMP/bootstrap-hostname-domains-after.json"
+          deployment_id="$(jq -er '
+            select(.success == true)
+            | (.result.deployments // .result) as $deployments
+            | select(($deployments | type) == "array" and ($deployments | length) > 0)
+            | $deployments[0]
+            | select((.versions | type) == "array" and (.versions | length) == 1)
+            | select((.versions[0].percentage | tonumber) == 100)
+            | .id
+          ' "$RUNNER_TEMP/bootstrap-deployments-after.json")"
+          candidate="$(jq -er '(.result.deployments // .result)[0].versions[0].version_id' \
+            "$RUNNER_TEMP/bootstrap-deployments-after.json")"
+          [[ "$deployment_id" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]
+          [[ "$candidate" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]
+          if test "$PREFLIGHT_STATE" != absent && test "$PREFLIGHT_STATE" != stale-contained; then
+            test "$candidate" = "$RESUME_CANDIDATE"
+            test "$deployment_id" = "$RESUME_DEPLOYMENT"
+          fi
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/scripts/$CONTROLLER_NAME/deployments/$deployment_id" \
+            -o "$RUNNER_TEMP/bootstrap-deployment-after.json"
+          deployment_created_on="$(jq -er --arg deployment "$deployment_id" --arg version "$candidate" '
+            select(.success == true and .result.id == $deployment)
+            | .result
+            | select((.versions | type) == "array" and (.versions | length) == 1)
+            | select(.versions[0].version_id == $version and (.versions[0].percentage | tonumber) == 100)
+            | .created_on | select(type == "string" and length > 0)
+          ' "$RUNNER_TEMP/bootstrap-deployment-after.json")"
+          node -e '
+            const value = process.argv[1];
+            if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value)
+              || !Number.isFinite(Date.parse(value))) process.exit(1);
+          ' "$deployment_created_on"
+          if test -n "$RESUME_CREATED_ON" && test "$PREFLIGHT_STATE" != stale-contained; then
+            test "$deployment_created_on" = "$RESUME_CREATED_ON"
+          fi
+          schedule_count="$(jq -er '
+            (.result.schedules // .result // []) as $schedules
+            | select(.success == true and ($schedules | type) == "array" and ($schedules | length) <= 1)
+            | $schedules | length
+          ' "$RUNNER_TEMP/bootstrap-schedules-after.json")"
+          if test "$schedule_count" = 1; then
+            jq -e '(.result.schedules // .result // [])[0].cron == "* * * * *"' "$RUNNER_TEMP/bootstrap-schedules-after.json" >/dev/null
+          fi
+          jq -e '.success == true and .result.enabled == false and .result.previews_enabled == false' \
+            "$RUNNER_TEMP/bootstrap-subdomain-after.json" >/dev/null
+          jq -e '.success == true and (.result | type) == "array" and (.result | length) <= 1' \
+            "$RUNNER_TEMP/bootstrap-service-domains-after.json" >/dev/null
+          jq -e '.success == true and (.result | type) == "array" and (.result | length) <= 1' \
+            "$RUNNER_TEMP/bootstrap-hostname-domains-after.json" >/dev/null
+          service_count="$(jq -er '.result | length' "$RUNNER_TEMP/bootstrap-service-domains-after.json")"
+          hostname_count="$(jq -er '.result | length' "$RUNNER_TEMP/bootstrap-hostname-domains-after.json")"
+          test "$service_count" = "$hostname_count"
+          case "$state" in
+            contained) test "$service_count$schedule_count" = 00 ;;
+            domain) test "$service_count$schedule_count" = 10 ;;
+            scheduled) test "$service_count$schedule_count" = 11 ;;
+            *) exit 1 ;;
+          esac
+          domain_id=
+          if test "$service_count" = 1; then
+            domain_id="$(jq -er '.result[0].id' "$RUNNER_TEMP/bootstrap-service-domains-after.json")"
+            hostname_domain_id="$(jq -er '.result[0].id' "$RUNNER_TEMP/bootstrap-hostname-domains-after.json")"
+            test "$domain_id" = "$hostname_domain_id"
+            [[ "$domain_id" =~ ^[a-f0-9]{32}$ || "$domain_id" =~ ^[a-f0-9]{40}$ || "$domain_id" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]
+            if test -n "$RESUME_DOMAIN_ID"; then test "$domain_id" = "$RESUME_DOMAIN_ID"; fi
+            for file in bootstrap-service-domains-after bootstrap-hostname-domains-after; do
+              jq -e --arg id "$domain_id" '
+                (.result | length) == 1 and .result[0].id == $id
+                and .result[0].hostname == "release-health-controller.scalesmall.ai"
+                and .result[0].service == "ssai-release-health-controller"
+                and .result[0].zone_name == "scalesmall.ai"
+                and (.result[0].zone_id | type) == "string"
+                and (.result[0].zone_id | test("^[a-f0-9]{32}$"))
+                and (.result[0].environment // "production") == "production"
+              ' "$RUNNER_TEMP/$file.json" >/dev/null
+            done
+          fi
           curl --fail --silent --show-error --max-time 15 --proto '=https' \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             "$api/workers/scripts/$CONTROLLER_NAME/versions/$candidate" \
             -o "$RUNNER_TEMP/bootstrap-candidate-version.json"
-          jq -e --arg id "$candidate" --arg source "$EXPECTED_SOURCE" --arg profile "$EXPECTED_PROFILE" --arg config "$EXPECTED_CONFIG" '
-            .success == true and .result.id == $id
+          jq -e --arg id "$candidate" --arg tag "$attestation_sha" --arg message "$message" \
+            --arg source "$EXPECTED_SOURCE" --arg profile "$EXPECTED_PROFILE" --arg config "$EXPECTED_CONFIG" '
+            (.result.resources.bindings // .result.bindings // []) as $bindings
+            | .success == true and .result.id == $id
+            and (.result.annotations // .result.metadata.annotations // {})["workers/tag"] == $tag
+            and (.result.annotations // .result.metadata.annotations // {})["workers/message"] == $message
             and ((.result.resources.bindings // .result.bindings // []) | any(.name == "MODE" and .type == "plain_text" and .text == "observe"))
             and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_SOURCE_SHA256" and .type == "plain_text" and .text == $source))
             and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_ACTIVATION_PROFILE_SHA256" and .type == "plain_text" and .text == $profile))
             and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config))
             and ((.result.resources.bindings // .result.bindings // []) | any(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject"))
-            and ((.result.resources.bindings // .result.bindings // []) | all(.name != "ADMISSION_HMAC_KEY" and .name != "ALERT_SIGNING_KEY" and .name != "ACTIVATION_PROOF"))
+            and ([$bindings[] | select(.name == "GITHUB_APP_CLIENT_ID" and .type == "secret_text")] | length) == 1
+            and ([$bindings[] | select(.name == "GITHUB_APP_PRIVATE_KEY" and .type == "secret_text")] | length) == 1
+            and ([$bindings[] | select(.name == "GITHUB_INSTALLATION_ID" and .type == "secret_text")] | length) == 1
+            and ([$bindings[] | select(.type == "secret_text") | .name] | sort)
+              == ["GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"]
           ' "$RUNNER_TEMP/bootstrap-candidate-version.json" >/dev/null
-          preview="https://${alias}-${CONTROLLER_NAME}.${ACCOUNT_SUBDOMAIN}.workers.dev/healthz"
-          code="$(curl --silent --show-error --max-time 20 --proto '=https' \
-            -H 'Host: release-health-controller.scalesmall.ai' \
-            -o "$RUNNER_TEMP/bootstrap-preview-health.json" -w '%{http_code}' "$preview")"
-          test "$code" = 503
           jq -e --arg source "$EXPECTED_SOURCE" --arg profile "$EXPECTED_PROFILE" --arg config "$EXPECTED_CONFIG" '
-            .schema == "ssai-release-health-controller-health-v1"
-            and .component == "release-health-controller" and .status == "unhealthy"
-            and .mode == "observe" and .source_digest == $source and .profile_digest == $profile
-            and .config_digest == $config
-            and .checks.fresh == false and .checks.no_terminal_failure == false
-          ' "$RUNNER_TEMP/bootstrap-preview-health.json" >/dev/null
+            .result.bindings as $bindings
+            | .success == true
+            and ([$bindings[] | select(.name == "MODE" and .type == "plain_text" and .text == "observe")] | length) == 1
+            and ([$bindings[] | select(.name == "CONTROLLER_SOURCE_SHA256" and .type == "plain_text" and .text == $source)] | length) == 1
+            and ([$bindings[] | select(.name == "CONTROLLER_ACTIVATION_PROFILE_SHA256" and .type == "plain_text" and .text == $profile)] | length) == 1
+            and ([$bindings[] | select(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config)] | length) == 1
+            and ([$bindings[] | select(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject")] | length) == 1
+            and ([$bindings[] | select(.type == "secret_text") | .name] | sort)
+              == ["GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"]
+          ' "$RUNNER_TEMP/bootstrap-settings-after.json" >/dev/null
+          printf 'state=%s\n' "$state" >> "$GITHUB_OUTPUT"
           printf 'candidate_version_id=%s\n' "$candidate" >> "$GITHUB_OUTPUT"
-          printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          printf 'candidate_deployment_id=%s\n' "$deployment_id" >> "$GITHUB_OUTPUT"
+          printf 'deployment_created_on=%s\n' "$deployment_created_on" >> "$GITHUB_OUTPUT"
+          printf 'attestation_sha=%s\n' "$attestation_sha" >> "$GITHUB_OUTPUT"
+          printf 'domain_id=%s\n' "$domain_id" >> "$GITHUB_OUTPUT"
+
+      - name: Attach and preverify bootstrap health domain
+        id: bootstrap_domain
+        if: ${{ inputs.bootstrap && steps.bootstrap_candidate.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+          EXPECTED_SOURCE: ${{ inputs.expected_target_source_sha256 }}
+          EXPECTED_PROFILE: ${{ inputs.expected_target_profile_sha256 }}
+          EXPECTED_CONFIG: ${{ inputs.expected_config_sha256 }}
+          CURRENT_STATE: ${{ steps.bootstrap_candidate.outputs.state }}
+          PREEXISTING_DOMAIN_ID: ${{ steps.bootstrap_candidate.outputs.domain_id }}
+        run: |
+          set -euo pipefail
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          valid_domain_id() {
+            [[ "$1" =~ ^[a-f0-9]{32}$ || "$1" =~ ^[a-f0-9]{40}$ || "$1" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]
+          }
+          case "$CURRENT_STATE" in contained|domain|scheduled) ;; *) exit 1 ;; esac
+          printf 'mutation_attempted=false\n' >> "$GITHUB_OUTPUT"
+          printf 'domain_created_by_run=false\n' >> "$GITHUB_OUTPUT"
+          if test "$CURRENT_STATE" = contained; then
+            printf 'mutation_attempted=true\n' >> "$GITHUB_OUTPUT"
+            printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+            jq -n '{
+              hostname:"release-health-controller.scalesmall.ai",
+              service:"ssai-release-health-controller",
+              zone_name:"scalesmall.ai"
+            }' > "$RUNNER_TEMP/bootstrap-domain-attach-body.json"
+            attach_code="$(curl --silent --show-error --max-time 30 --proto '=https' \
+              --request PUT \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H 'Content-Type: application/json' \
+              --data-binary @"$RUNNER_TEMP/bootstrap-domain-attach-body.json" \
+              -o "$RUNNER_TEMP/bootstrap-domain-attach-response.json" -w '%{http_code}' \
+              "$api/workers/domains" || true)"
+            returned_domain=
+            test "$attach_code" = 200
+            returned_domain="$(jq -er '
+              select(.success == true)
+              | .result
+              | select(.hostname == "release-health-controller.scalesmall.ai")
+              | select(.service == "ssai-release-health-controller")
+              | select(.zone_name == "scalesmall.ai")
+              | .id
+            ' "$RUNNER_TEMP/bootstrap-domain-attach-response.json")"
+            valid_domain_id "$returned_domain"
+            printf 'domain_id=%s\n' "$returned_domain" >> "$GITHUB_OUTPUT"
+            printf 'domain_created_by_run=true\n' >> "$GITHUB_OUTPUT"
+          else
+            returned_domain="$PREEXISTING_DOMAIN_ID"
+            valid_domain_id "$returned_domain"
+          fi
+          domain_deadline=$((SECONDS + 480))
+          domain_ready=false
+          while test "$SECONDS" -lt "$domain_deadline"; do
+            domain_id=
+            code=000
+            if curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/domains?service=$CONTROLLER_NAME" -o "$RUNNER_TEMP/bootstrap-domain-probe-service.json" \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/domains?hostname=release-health-controller.scalesmall.ai" -o "$RUNNER_TEMP/bootstrap-domain-probe-hostname.json" \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/scripts/$CONTROLLER_NAME/schedules" -o "$RUNNER_TEMP/bootstrap-domain-probe-schedules.json"; then
+              domain_id="$(jq -er '
+                select(.success == true and (.result | type) == "array" and (.result | length) == 1)
+                | .result[0]
+                | select(.hostname == "release-health-controller.scalesmall.ai")
+                | select(.service == "ssai-release-health-controller")
+                | select(.zone_name == "scalesmall.ai")
+                | select((.zone_id | type) == "string" and (.zone_id | test("^[a-f0-9]{32}$")))
+                | select((.environment // "production") == "production")
+                | .id
+              ' "$RUNNER_TEMP/bootstrap-domain-probe-service.json" 2>/dev/null || true)"
+            fi
+            if valid_domain_id "$domain_id" \
+              && { test -z "$returned_domain" || test "$domain_id" = "$returned_domain"; } \
+              && jq -e --arg id "$domain_id" '
+                .success == true and (.result | type) == "array" and (.result | length) == 1
+                and .result[0].id == $id
+                and .result[0].hostname == "release-health-controller.scalesmall.ai"
+                and .result[0].service == "ssai-release-health-controller"
+              ' "$RUNNER_TEMP/bootstrap-domain-probe-hostname.json" >/dev/null \
+              && { test "$CURRENT_STATE" = scheduled \
+                || jq -e '.success == true and (.result.schedules // .result // []) == []' "$RUNNER_TEMP/bootstrap-domain-probe-schedules.json" >/dev/null; }; then
+              curl --fail --silent --show-error --max-time 15 --proto '=https' \
+                -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                "$api/workers/domains/$domain_id" -o "$RUNNER_TEMP/bootstrap-domain-probe-detail.json"
+              jq -e --arg id "$domain_id" '
+                .success == true and .result.id == $id
+                and .result.hostname == "release-health-controller.scalesmall.ai"
+                and .result.service == "ssai-release-health-controller"
+                and .result.zone_name == "scalesmall.ai"
+                and (.result.zone_id | type) == "string"
+                and (.result.zone_id | test("^[a-f0-9]{32}$"))
+                and (.result.environment // "production") == "production"
+              ' "$RUNNER_TEMP/bootstrap-domain-probe-detail.json" >/dev/null
+              printf 'domain_id=%s\n' "$domain_id" >> "$GITHUB_OUTPUT"
+              domain_ready=true
+              break
+            fi
+            sleep 5
+          done
+          test "$domain_ready" = true
+          if test "$CURRENT_STATE" = contained; then
+            health_ready=false
+            while test "$SECONDS" -lt "$domain_deadline"; do
+              code="$(curl --silent --show-error --max-time 20 --proto '=https' \
+                -o "$RUNNER_TEMP/bootstrap-domain-health.json" -w '%{http_code}' \
+                "$CONTROLLER_HEALTH_URL" || true)"
+              if test "$code" = 503 \
+                && jq -e --arg source "$EXPECTED_SOURCE" --arg profile "$EXPECTED_PROFILE" --arg config "$EXPECTED_CONFIG" '
+                  .schema == "ssai-release-health-controller-health-v1"
+                  and .component == "release-health-controller" and .status == "unhealthy"
+                  and .mode == "observe" and .source_digest == $source and .profile_digest == $profile
+                  and .config_digest == $config
+                  and .last_completed_tick == null and .last_scheduled_time == null and .last_decision == null
+                  and .alerts == {pending:0,dead:0}
+                  and .checks == {fresh:false,no_dead_alerts:true,no_terminal_failure:false,no_internal_failure:false}
+                ' "$RUNNER_TEMP/bootstrap-domain-health.json" >/dev/null; then
+                health_ready=true
+                break
+              fi
+              sleep 5
+            done
+            test "$health_ready" = true
+          elif test "$CURRENT_STATE" = domain; then
+            health_ready=false
+            while test "$SECONDS" -lt "$domain_deadline"; do
+              code="$(curl --silent --show-error --max-time 20 --proto '=https' \
+                -o "$RUNNER_TEMP/bootstrap-domain-health.json" -w '%{http_code}' \
+                "$CONTROLLER_HEALTH_URL" || true)"
+              if { test "$code" = 200 || test "$code" = 503; } \
+                && node --input-type=module - "$RUNNER_TEMP/bootstrap-domain-health.json" "$code" \
+                  "$EXPECTED_SOURCE" "$EXPECTED_PROFILE" "$EXPECTED_CONFIG" <<'NODE'
+          import { readFile } from 'node:fs/promises';
+          const [file, code, source, profile, config] = process.argv.slice(2);
+          const health = JSON.parse(await readFile(file, 'utf8'));
+          const expectedKeys = [
+            'alerts', 'checks', 'component', 'config_digest', 'last_completed_tick',
+            'last_decision', 'last_scheduled_time', 'mode', 'profile_digest', 'schema',
+            'source_digest', 'status',
+          ];
+          const canonical = (value) => {
+            if (typeof value !== 'string') return null;
+            const parsed = Date.parse(value);
+            return Number.isFinite(parsed) && new Date(parsed).toISOString() === value ? parsed : null;
+          };
+          const decisions = new Set([
+            'outside-window', 'claimed', 'standby', 'native-blocked',
+            'native-blocked-final', 'outstanding', 'would_dispatch',
+          ]);
+          const common = JSON.stringify(Object.keys(health).sort()) === JSON.stringify(expectedKeys)
+            && health.schema === 'ssai-release-health-controller-health-v1'
+            && health.component === 'release-health-controller'
+            && health.mode === 'observe'
+            && health.source_digest === source
+            && health.profile_digest === profile
+            && health.config_digest === config
+            && health.alerts?.pending === 0
+            && health.alerts?.dead === 0;
+          const virgin = code === '503'
+            && health.status === 'unhealthy'
+            && health.last_completed_tick === null
+            && health.last_scheduled_time === null
+            && health.last_decision === null
+            && health.checks?.fresh === false
+            && health.checks?.no_dead_alerts === true
+            && health.checks?.no_terminal_failure === false
+            && health.checks?.no_internal_failure === false;
+          const scheduled = canonical(health.last_scheduled_time);
+          const completed = canonical(health.last_completed_tick);
+          const historical = scheduled !== null
+            && completed !== null
+            && completed >= scheduled
+            && completed <= Date.now() + 60_000
+            && decisions.has(health.last_decision)
+            && typeof health.checks?.fresh === 'boolean'
+            && health.checks?.no_dead_alerts === true
+            && health.checks?.no_terminal_failure === true
+            && health.checks?.no_internal_failure === true
+            && health.status === (health.checks.fresh ? 'healthy' : 'unhealthy')
+            && code === (health.checks.fresh ? '200' : '503');
+          if (!common || (!virgin && !historical)) process.exit(1);
+          NODE
+              then
+                health_ready=true
+                break
+              fi
+              sleep 5
+            done
+            test "$health_ready" = true
+          fi
+          printf 'state=%s\n' "$(if test "$CURRENT_STATE" = scheduled; then printf scheduled; else printf domain; fi)" >> "$GITHUB_OUTPUT"
 
       - name: Verify exact attested observe rollback target
         id: attest_rollback
         if: ${{ !inputs.bootstrap }}
         shell: bash
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
           ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
           ROLLBACK_SOURCE: ${{ inputs.rollback_source_sha256 }}
@@ -391,25 +941,27 @@ jobs:
             --arg profile "$ROLLBACK_PROFILE" \
             --arg config "$ROLLBACK_CONFIG" \
             --arg attestation "$ROLLBACK_ATTESTATION_SHA" \
-            '.success == true
+            '(.result.resources.bindings // .result.bindings // []) as $bindings
+             | .success == true
              and .result.id == $id
-             and .result.metadata.annotations["workers/tag"] == $attestation
-             and .result.metadata.annotations["workers/message"] == ("protected-observe:" + $attestation + ":" + $source + ":" + $profile)
+             and (.result.annotations // .result.metadata.annotations // {})["workers/tag"] == $attestation
+             and (.result.annotations // .result.metadata.annotations // {})["workers/message"] == ("protected-observe:" + $attestation + ":" + $source + ":" + $profile)
              and ((.result.resources.bindings // .result.bindings // []) | any(.name == "MODE" and .type == "plain_text" and .text == "observe"))
              and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_SOURCE_SHA256" and .type == "plain_text" and .text == $source))
              and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_ACTIVATION_PROFILE_SHA256" and .type == "plain_text" and .text == $profile))
              and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config))
              and ((.result.resources.bindings // .result.bindings // []) | any(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject"))
-             and ((.result.resources.bindings // .result.bindings // []) | all(.name != "ADMISSION_HMAC_KEY" and .name != "ALERT_SIGNING_KEY" and .name != "ACTIVATION_PROOF"))' \
+             and ([$bindings[] | select(.type == "secret_text") | .name] | sort)
+               == ["GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"]' \
             "$RUNNER_TEMP/controller-rollback-version.json" >/dev/null
 
       - name: Apply exact observe or active deployment
         id: apply_deploy
         if: ${{ inputs.operation != 'rollback-observe' && !inputs.bootstrap }}
         continue-on-error: true
+        timeout-minutes: 12
         shell: bash
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
           OPERATION: ${{ inputs.operation }}
           EXPECTED_SOURCE: ${{ inputs.expected_target_source_sha256 }}
@@ -425,22 +977,114 @@ jobs:
             --message "$message" \
             --tag "$GITHUB_SHA"
 
-      - name: Promote preverified bootstrap candidate and create exact triggers
+      - name: Activate or re-attest exact bootstrap schedule
         id: apply_bootstrap
-        if: ${{ inputs.bootstrap && steps.bootstrap_candidate.outcome == 'success' }}
+        if: ${{ inputs.bootstrap && steps.bootstrap_candidate.outcome == 'success' && steps.bootstrap_domain.outcome == 'success' }}
         continue-on-error: true
+        timeout-minutes: 8
         shell: bash
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
           CANDIDATE_VERSION_ID: ${{ steps.bootstrap_candidate.outputs.candidate_version_id }}
+          CANDIDATE_DEPLOYMENT_ID: ${{ steps.bootstrap_candidate.outputs.candidate_deployment_id }}
+          DOMAIN_ID: ${{ steps.bootstrap_domain.outputs.domain_id }}
+          CURRENT_STATE: ${{ steps.bootstrap_domain.outputs.state }}
         run: |
           set -euo pipefail
-          printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
-          ./node_modules/.bin/wrangler versions deploy "$CANDIDATE_VERSION_ID@100%" \
-            --config "$CONTROLLER_CONFIG" --message "bootstrap-observe ${GITHUB_SHA}" --yes
-          ./node_modules/.bin/wrangler triggers deploy \
-            --config workers/release-health-controller/.wrangler-deployment.jsonc
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          [[ "$CANDIDATE_VERSION_ID" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]
+          [[ "$CANDIDATE_DEPLOYMENT_ID" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]
+          [[ "$DOMAIN_ID" =~ ^[a-f0-9]{32}$ || "$DOMAIN_ID" =~ ^[a-f0-9]{40}$ || "$DOMAIN_ID" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]
+          case "$CURRENT_STATE" in domain|scheduled) ;; *) exit 1 ;; esac
+          printf 'mutation_attempted=false\n' >> "$GITHUB_OUTPUT"
+          printf 'schedule_created_by_run=false\n' >> "$GITHUB_OUTPUT"
+          printf 'schedule_preexisting=%s\n' "$(if test "$CURRENT_STATE" = scheduled; then printf true; else printf false; fi)" >> "$GITHUB_OUTPUT"
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/scripts/$CONTROLLER_NAME/deployments" \
+            -o "$RUNNER_TEMP/bootstrap-promotion-deployments.json"
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/scripts/$CONTROLLER_NAME/schedules" \
+            -o "$RUNNER_TEMP/bootstrap-promotion-schedules.json"
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/domains" \
+            -o "$RUNNER_TEMP/bootstrap-promotion-domains.json"
+          jq -e --arg deployment "$CANDIDATE_DEPLOYMENT_ID" --arg version "$CANDIDATE_VERSION_ID" '
+            .success == true
+            and (.result.deployments // .result)[0].id == $deployment
+            and (((.result.deployments // .result)[0].versions // []) | length) == 1
+            and (((.result.deployments // .result)[0].versions[0].percentage | tonumber) == 100)
+            and (.result.deployments // .result)[0].versions[0].version_id == $version
+          ' "$RUNNER_TEMP/bootstrap-promotion-deployments.json" >/dev/null
+          jq -e --arg id "$DOMAIN_ID" '
+            .success == true
+            and ([.result[] | select(
+              .hostname == "release-health-controller.scalesmall.ai"
+              or .service == "ssai-release-health-controller"
+            )] | length) == 1
+            and ([.result[] | select(
+              .hostname == "release-health-controller.scalesmall.ai"
+              or .service == "ssai-release-health-controller"
+            )][0] | .id == $id
+              and .hostname == "release-health-controller.scalesmall.ai"
+              and .service == "ssai-release-health-controller"
+              and .zone_name == "scalesmall.ai"
+              and (.zone_id | type) == "string"
+              and (.zone_id | test("^[a-f0-9]{32}$"))
+              and (.environment // "production") == "production")
+          ' "$RUNNER_TEMP/bootstrap-promotion-domains.json" >/dev/null
+          if test "$CURRENT_STATE" = domain; then
+            jq -e '.success == true and (.result.schedules // .result // []) == []' "$RUNNER_TEMP/bootstrap-promotion-schedules.json" >/dev/null
+            printf 'mutation_attempted=true\n' >> "$GITHUB_OUTPUT"
+            printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+            jq -n '[{cron:"* * * * *"}]' > "$RUNNER_TEMP/bootstrap-schedule-body.json"
+            schedule_code="$(curl --silent --show-error --max-time 30 --proto '=https' \
+              --request PUT \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -H 'Content-Type: application/json' \
+              --data-binary @"$RUNNER_TEMP/bootstrap-schedule-body.json" \
+              -o "$RUNNER_TEMP/bootstrap-schedule-response.json" -w '%{http_code}' \
+              "$api/workers/scripts/$CONTROLLER_NAME/schedules" || true)"
+            test "$schedule_code" = 200
+            jq -e '.success == true
+              and (.result.schedules | type) == "array"
+              and (.result.schedules | length) == 1
+              and .result.schedules[0].cron == "* * * * *"' \
+              "$RUNNER_TEMP/bootstrap-schedule-response.json" >/dev/null
+            printf 'schedule_created_by_run=true\n' >> "$GITHUB_OUTPUT"
+          fi
+          schedule_deadline=$((SECONDS + 360))
+          schedule_ready=false
+          while test "$SECONDS" -lt "$schedule_deadline"; do
+            if curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/scripts/$CONTROLLER_NAME/schedules" \
+              -o "$RUNNER_TEMP/bootstrap-schedule-probe.json" \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/domains/$DOMAIN_ID" \
+              -o "$RUNNER_TEMP/bootstrap-schedule-domain.json" \
+              && jq -e '.success == true
+                and ((.result.schedules // .result // []) | length) == 1
+                and (.result.schedules // .result // [])[0].cron == "* * * * *"' \
+              "$RUNNER_TEMP/bootstrap-schedule-probe.json" >/dev/null \
+              && jq -e --arg id "$DOMAIN_ID" '
+                .success == true and .result.id == $id
+                and .result.hostname == "release-health-controller.scalesmall.ai"
+                and .result.service == "ssai-release-health-controller"
+                and .result.zone_name == "scalesmall.ai"
+                and (.result.environment // "production") == "production"
+              ' "$RUNNER_TEMP/bootstrap-schedule-domain.json" >/dev/null; then
+              printf 'cron_verified_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+              printf 'state=scheduled\n' >> "$GITHUB_OUTPUT"
+              schedule_ready=true
+              break
+            fi
+            sleep 5
+          done
+          test "$schedule_ready" = true
 
       - name: Remove every active-only binding from observe mode
         id: strip_active_secrets
@@ -449,7 +1093,6 @@ jobs:
         shell: bash
         env:
           CI: true
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
         run: |
           set -euo pipefail
@@ -471,7 +1114,6 @@ jobs:
         continue-on-error: true
         shell: bash
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
           EXPECTED_SOURCE: ${{ inputs.expected_target_source_sha256 }}
           EXPECTED_PROFILE: ${{ inputs.expected_target_profile_sha256 }}
@@ -489,7 +1131,6 @@ jobs:
         continue-on-error: true
         shell: bash
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
           ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
         run: |
@@ -504,9 +1145,9 @@ jobs:
         id: verify_deploy
         if: ${{ always() }}
         continue-on-error: true
+        timeout-minutes: 15
         shell: bash
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
           OPERATION: ${{ inputs.operation }}
           EXPECTED_SOURCE: ${{ inputs.expected_target_source_sha256 }}
@@ -517,13 +1158,22 @@ jobs:
           ROLLBACK_ATTESTATION_SHA: ${{ inputs.rollback_attestation_sha }}
           BOOTSTRAP: ${{ inputs.bootstrap }}
           CANDIDATE_VERSION_ID: ${{ steps.bootstrap_candidate.outputs.candidate_version_id }}
-          DEPLOY_STARTED_AT: ${{ steps.apply_bootstrap.outputs.started_at || steps.apply_deploy.outputs.started_at || steps.apply_rollback.outputs.started_at }}
+          CANDIDATE_DEPLOYMENT_ID: ${{ steps.bootstrap_candidate.outputs.candidate_deployment_id }}
+          CANDIDATE_ATTESTATION_SHA: ${{ steps.bootstrap_candidate.outputs.attestation_sha }}
+          CANDIDATE_DOMAIN_ID: ${{ steps.bootstrap_domain.outputs.domain_id }}
+          CRON_VERIFIED_AT: ${{ steps.apply_bootstrap.outputs.cron_verified_at }}
+          FALLBACK_BEFORE_ID: ${{ steps.fallback_before.outputs.latest_run_id }}
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_STARTED_AT: ${{ steps.apply_deploy.outputs.started_at || steps.apply_rollback.outputs.started_at }}
         run: |
           set -euo pipefail
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
           expected_mode=observe
           if test "$OPERATION" = deploy-active; then expected_mode=active; fi
           expected_config="$CURRENT_CONFIG"
           expected_version=''
+          expected_deployment=''
+          expected_domain=''
           expected_tag="$GITHUB_SHA"
           expected_message="protected-${expected_mode}:${GITHUB_SHA}:${EXPECTED_SOURCE}:${EXPECTED_PROFILE}"
           if test "$OPERATION" = rollback-observe; then
@@ -533,11 +1183,16 @@ jobs:
             expected_message="protected-observe:${ROLLBACK_ATTESTATION_SHA}:${EXPECTED_SOURCE}:${EXPECTED_PROFILE}"
           elif test "$BOOTSTRAP" = true; then
             expected_version="$CANDIDATE_VERSION_ID"
+            expected_deployment="$CANDIDATE_DEPLOYMENT_ID"
+            expected_domain="$CANDIDATE_DOMAIN_ID"
+            expected_tag="$CANDIDATE_ATTESTATION_SHA"
+            expected_message="protected-observe:${CANDIDATE_ATTESTATION_SHA}:${EXPECTED_SOURCE}:${EXPECTED_PROFILE}"
           fi
           case "$OPERATION" in
             deploy-observe)
               if test "$BOOTSTRAP" = true; then
                 test '${{ steps.bootstrap_candidate.outcome }}' = success
+                test '${{ steps.bootstrap_domain.outcome }}' = success
                 test '${{ steps.apply_bootstrap.outcome }}' = success
               else
                 test '${{ steps.apply_deploy.outcome }}' = success
@@ -553,86 +1208,281 @@ jobs:
               ;;
             *) exit 1 ;;
           esac
+          verification_deadline=$((SECONDS + 720))
           success=false
-          for attempt in $(seq 1 90); do
+          while test "$SECONDS" -lt "$verification_deadline"; do
+            checks_ready=false
             if curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$CONTROLLER_NAME/schedules" \
+              "$api/workers/scripts/$CONTROLLER_NAME/schedules" \
               -o "$RUNNER_TEMP/controller-schedules.json" \
               && curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" \
-              -o "$RUNNER_TEMP/controller-domains.json" \
+              "$api/workers/domains?service=$CONTROLLER_NAME" \
+              -o "$RUNNER_TEMP/controller-service-domains.json" \
               && curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$CONTROLLER_NAME/deployments" \
+              "$api/workers/domains?hostname=release-health-controller.scalesmall.ai" \
+              -o "$RUNNER_TEMP/controller-hostname-domains.json" \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/scripts/$CONTROLLER_NAME/deployments" \
               -o "$RUNNER_TEMP/controller-deployments-after.json" \
               && curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$CONTROLLER_NAME/settings" \
+              "$api/workers/scripts/$CONTROLLER_NAME/settings" \
               -o "$RUNNER_TEMP/controller-settings-after.json" \
-              && live_version_id="$(jq -er --arg started "$DEPLOY_STARTED_AT" --arg expected "$expected_version" '
-                (.result.deployments // .result // []) as $deployments
-                | $deployments[0] as $live
-                | select(($live.created_on // "") >= $started)
-                | select(($live.versions // []) | length == 1)
-                | $live.versions[0]
-                | select((.percentage | tonumber) == 100)
-                | .version_id
-                | select($expected == "" or . == $expected)
-              ' "$RUNNER_TEMP/controller-deployments-after.json")" \
-              && [[ "$live_version_id" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$ ]] \
               && curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$CONTROLLER_NAME/versions/$live_version_id" \
-              -o "$RUNNER_TEMP/controller-live-version.json" \
+              "$api/workers/scripts/$CONTROLLER_NAME/subdomain" \
+              -o "$RUNNER_TEMP/controller-subdomain-after.json" \
+              && live_deployment_id="$(jq -er --arg expected "$expected_deployment" '
+                (.result.deployments // .result // []) as $deployments
+                | $deployments[0] as $live
+                | select(($live.versions // []) | length == 1)
+                | select(($live.versions[0].percentage | tonumber) == 100)
+                | select($expected == "" or .id == $expected)
+                | .id
+              ' "$RUNNER_TEMP/controller-deployments-after.json")" \
+              && live_deployment_created_on="$(jq -er --arg id "$live_deployment_id" '
+                (.result.deployments // .result // [])[0]
+                | select(.id == $id) | .created_on | select(type == "string" and length > 0)
+              ' "$RUNNER_TEMP/controller-deployments-after.json")" \
+              && node -e '
+                const [expected, started, created] = process.argv.slice(1);
+                if (!expected) {
+                  const startMs = Date.parse(started);
+                  const createdMs = Date.parse(created);
+                  if (!Number.isFinite(startMs) || !Number.isFinite(createdMs) || createdMs < startMs) process.exit(1);
+                }
+              ' "$expected_deployment" "$DEPLOY_STARTED_AT" "$live_deployment_created_on" \
+              && live_version_id="$(jq -er --arg deployment "$live_deployment_id" --arg expected "$expected_version" '
+                (.result.deployments // .result // [])[0]
+                | select(.id == $deployment)
+                | .versions[0].version_id
+                | select($expected == "" or . == $expected)
+              ' "$RUNNER_TEMP/controller-deployments-after.json")" \
+              && [[ "$live_deployment_id" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
+              && [[ "$live_version_id" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
               && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/scripts/$CONTROLLER_NAME/deployments/$live_deployment_id" \
+              -o "$RUNNER_TEMP/controller-live-deployment.json" \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/scripts/$CONTROLLER_NAME/versions/$live_version_id" \
+              -o "$RUNNER_TEMP/controller-live-version.json" \
+              && domain_id="$(jq -er --arg expected "$expected_domain" '
+                select(.success == true and (.result | type) == "array" and (.result | length) == 1)
+                | .result[0]
+                | select(.hostname == "release-health-controller.scalesmall.ai")
+                | select(.service == "ssai-release-health-controller")
+                | select(.zone_name == "scalesmall.ai")
+                | select((.zone_id | type) == "string" and (.zone_id | test("^[a-f0-9]{32}$")))
+                | select((.environment // "production") == "production")
+                | .id | select($expected == "" or . == $expected)
+              ' "$RUNNER_TEMP/controller-service-domains.json")" \
+              && [[ "$domain_id" =~ ^[a-f0-9]{32}$ || "$domain_id" =~ ^[a-f0-9]{40}$ || "$domain_id" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/domains/$domain_id" \
+              -o "$RUNNER_TEMP/controller-domain-detail.json" \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              --fail \
               "$CONTROLLER_HEALTH_URL" -o "$RUNNER_TEMP/controller-health.json" \
-              && jq -e '.success == true and (.result | length == 1) and .result[0].cron == "* * * * *"' \
+              && jq -e '.success == true
+                and ((.result.schedules // .result // []) | length) == 1
+                and (.result.schedules // .result // [])[0].cron == "* * * * *"' \
                 "$RUNNER_TEMP/controller-schedules.json" >/dev/null \
-              && jq -e '.success == true and (.result | any(.hostname == "release-health-controller.scalesmall.ai" and .service == "ssai-release-health-controller" and .environment == "production"))' \
-                "$RUNNER_TEMP/controller-domains.json" >/dev/null \
-              && jq -e --arg started "$DEPLOY_STARTED_AT" \
-                '.success == true and ((.result.deployments // .result // []) | any(.created_on >= $started))' \
-                "$RUNNER_TEMP/controller-deployments-after.json" >/dev/null \
-              && jq -e --arg id "$live_version_id" --arg tag "$expected_tag" --arg message "$expected_message" --arg mode "$expected_mode" --arg source "$EXPECTED_SOURCE" --arg profile "$EXPECTED_PROFILE" --arg config "$expected_config" '
+              && jq -e --arg id "$domain_id" '
+                .success == true and (.result | length) == 1
+                and .result[0].id == $id
+                and .result[0].hostname == "release-health-controller.scalesmall.ai"
+                and .result[0].service == "ssai-release-health-controller"
+              ' "$RUNNER_TEMP/controller-hostname-domains.json" >/dev/null \
+              && jq -e --arg id "$domain_id" '
                 .success == true and .result.id == $id
-                and .result.metadata.annotations["workers/tag"] == $tag
-                and .result.metadata.annotations["workers/message"] == $message
+                and .result.hostname == "release-health-controller.scalesmall.ai"
+                and .result.service == "ssai-release-health-controller"
+                and .result.zone_name == "scalesmall.ai"
+                and (.result.environment // "production") == "production"
+              ' "$RUNNER_TEMP/controller-domain-detail.json" >/dev/null \
+              && jq -e '.success == true and .result.enabled == false and .result.previews_enabled == false' \
+                "$RUNNER_TEMP/controller-subdomain-after.json" >/dev/null \
+              && jq -e --arg deployment "$live_deployment_id" --arg version "$live_version_id" '
+                .success == true and .result.id == $deployment
+                and (.result.versions | length) == 1
+                and .result.versions[0].version_id == $version
+                and (.result.versions[0].percentage | tonumber) == 100
+              ' "$RUNNER_TEMP/controller-live-deployment.json" >/dev/null \
+              && jq -e --arg id "$live_version_id" --arg tag "$expected_tag" --arg message "$expected_message" --arg mode "$expected_mode" --arg source "$EXPECTED_SOURCE" --arg profile "$EXPECTED_PROFILE" --arg config "$expected_config" '
+                (.result.resources.bindings // .result.bindings // []) as $bindings
+                | .success == true and .result.id == $id
+                and (.result.annotations // .result.metadata.annotations // {})["workers/tag"] == $tag
+                and (.result.annotations // .result.metadata.annotations // {})["workers/message"] == $message
                 and ((.result.resources.bindings // .result.bindings // []) | any(.name == "MODE" and .type == "plain_text" and .text == $mode))
                 and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_SOURCE_SHA256" and .type == "plain_text" and .text == $source))
                 and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_ACTIVATION_PROFILE_SHA256" and .type == "plain_text" and .text == $profile))
                 and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config))
                 and ((.result.resources.bindings // .result.bindings // []) | any(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject"))
+                and (if $mode == "active"
+                  then ([$bindings[] | select(.type == "secret_text") | .name] | sort)
+                    == ["ACTIVATION_PROOF","ADMISSION_HMAC_KEY","ALERT_SIGNING_KEY","GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"]
+                  else ([$bindings[] | select(.type == "secret_text") | .name] | sort)
+                    == ["GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"]
+                  end)
               ' "$RUNNER_TEMP/controller-live-version.json" >/dev/null \
               && jq -e --arg mode "$expected_mode" --arg source "$EXPECTED_SOURCE" --arg profile "$EXPECTED_PROFILE" --arg config "$expected_config" \
-                '.schema == "ssai-release-health-controller-health-v1" and .component == "release-health-controller" and .status == "healthy" and .mode == $mode and .source_digest == $source and .profile_digest == $profile and .config_digest == $config and .checks.fresh == true and .checks.no_dead_alerts == true and .checks.no_terminal_failure == true and .checks.no_internal_failure == true' \
+                '.schema == "ssai-release-health-controller-health-v1"
+                 and .component == "release-health-controller" and .status == "healthy"
+                 and .mode == $mode and .source_digest == $source and .profile_digest == $profile
+                 and .config_digest == $config
+                 and .checks == {fresh:true,no_dead_alerts:true,no_terminal_failure:true,no_internal_failure:true}' \
                 "$RUNNER_TEMP/controller-health.json" >/dev/null \
               && jq -e --arg mode "$expected_mode" --arg config "$expected_config" \
-                '.success == true
-                 and (.result.bindings | any(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject"))
-                 and (.result.bindings | any(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config))
+                '.result.bindings as $bindings
+                 | .success == true
+                 and ($bindings | any(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject"))
+                 and ($bindings | any(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config))
                  and (if $mode == "active"
-                   then (.result.bindings | any(.name == "ADMISSION_HMAC_KEY"))
-                     and (.result.bindings | any(.name == "ALERT_SIGNING_KEY"))
-                     and (.result.bindings | any(.name == "ACTIVATION_PROOF"))
-                   else (.result.bindings | all(.name != "ADMISSION_HMAC_KEY" and .name != "ALERT_SIGNING_KEY" and .name != "ACTIVATION_PROOF"))
-                   end)' "$RUNNER_TEMP/controller-settings-after.json" >/dev/null; then
+                    then ([$bindings[] | select(.type == "secret_text") | .name] | sort)
+                      == ["ACTIVATION_PROOF","ADMISSION_HMAC_KEY","ALERT_SIGNING_KEY","GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"]
+                    else ([$bindings[] | select(.type == "secret_text") | .name] | sort)
+                      == ["GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"]
+                    end)' "$RUNNER_TEMP/controller-settings-after.json" >/dev/null; then
+              checks_ready=true
+            fi
+            if test "$checks_ready" = true && test "$BOOTSTRAP" = true; then
+              if ! jq -e '
+                (keys | sort) == ["alerts","checks","component","config_digest","last_completed_tick","last_decision","last_scheduled_time","mode","profile_digest","schema","source_digest","status"]
+                and .alerts == {pending:0,dead:0}
+                and (.last_completed_tick | type) == "string"
+                and (.last_scheduled_time | type) == "string"
+                and (.last_decision | type) == "string"
+                and (.last_decision == "outside-window"
+                  or .last_decision == "claimed"
+                  or .last_decision == "standby"
+                  or .last_decision == "native-blocked"
+                  or .last_decision == "native-blocked-final"
+                  or .last_decision == "outstanding"
+                  or .last_decision == "would_dispatch")
+              ' "$RUNNER_TEMP/controller-health.json" >/dev/null; then
+                checks_ready=false
+              elif ! node --input-type=module - "$RUNNER_TEMP/controller-health.json" "$CRON_VERIFIED_AT" <<'NODE'
+          import { readFile } from 'node:fs/promises';
+          const health = JSON.parse(await readFile(process.argv[2], 'utf8'));
+          const canonical = (value) => {
+            if (typeof value !== 'string') return null;
+            const parsed = Date.parse(value);
+            return Number.isFinite(parsed) && new Date(parsed).toISOString() === value ? parsed : null;
+          };
+          const scheduled = canonical(health.last_scheduled_time);
+          const completed = canonical(health.last_completed_tick);
+          if (scheduled === null || completed === null || completed < scheduled || completed > Date.now() + 60_000) process.exit(1);
+          if (process.argv[3]) {
+            const threshold = Date.parse(process.argv[3]);
+            if (!Number.isFinite(threshold) || scheduled < threshold) process.exit(1);
+          }
+          NODE
+              then
+                checks_ready=false
+              else
+                gh api --method GET \
+                  'repos/ScaleSmall/SSAI_Shared/actions/workflows/344170407/runs?event=workflow_dispatch&branch=main&per_page=1' \
+                  > "$RUNNER_TEMP/bootstrap-fallback-after.json"
+                fallback_after_id="$(jq -er '
+                  select((.workflow_runs | type) == "array" and (.workflow_runs | length) <= 1)
+                  | if (.workflow_runs | length) == 0 then "absent"
+                    else (.workflow_runs[0]
+                      | select(.workflow_id == 344170407 and .event == "workflow_dispatch" and .head_branch == "main")
+                      | (.id | tostring))
+                    end
+                ' "$RUNNER_TEMP/bootstrap-fallback-after.json")"
+                if test "$fallback_after_id" != "$FALLBACK_BEFORE_ID"; then checks_ready=false; fi
+              fi
+            fi
+            if test "$checks_ready" = true; then
               success=true
               printf 'verified_version_id=%s\n' "$live_version_id" >> "$GITHUB_OUTPUT"
+              printf 'verified_deployment_id=%s\n' "$live_deployment_id" >> "$GITHUB_OUTPUT"
+              printf 'verified_domain_id=%s\n' "$domain_id" >> "$GITHUB_OUTPUT"
               break
             fi
             sleep 10
           done
           test "$success" = true
 
+      - name: Record exact verified deployment attestation
+        id: record_attestation
+        if: ${{ steps.verify_deploy.outcome == 'success' }}
+        shell: bash
+        env:
+          OPERATION: ${{ inputs.operation }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          EXPECTED_SOURCE: ${{ inputs.expected_target_source_sha256 }}
+          EXPECTED_PROFILE: ${{ inputs.expected_target_profile_sha256 }}
+          EXPECTED_CONFIG: ${{ inputs.expected_config_sha256 }}
+          ROLLBACK_CONFIG: ${{ inputs.rollback_config_sha256 }}
+          VERSION_ID: ${{ steps.verify_deploy.outputs.verified_version_id }}
+          DEPLOYMENT_ID: ${{ steps.verify_deploy.outputs.verified_deployment_id }}
+          DOMAIN_ID: ${{ steps.verify_deploy.outputs.verified_domain_id }}
+          CRON_VERIFIED_AT: ${{ steps.apply_bootstrap.outputs.cron_verified_at }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$EXPECTED_SOURCE" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$EXPECTED_PROFILE" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$EXPECTED_CONFIG" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$VERSION_ID" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]
+          [[ "$DEPLOYMENT_ID" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]
+          [[ "$DOMAIN_ID" =~ ^[a-f0-9]{32}$ || "$DOMAIN_ID" =~ ^[a-f0-9]{40}$ || "$DOMAIN_ID" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]
+          mode=observe
+          if test "$OPERATION" = deploy-active; then mode=active; fi
+          effective_config="$EXPECTED_CONFIG"
+          if test "$OPERATION" = rollback-observe; then effective_config="$ROLLBACK_CONFIG"; fi
+          [[ "$effective_config" =~ ^[a-f0-9]{64}$ ]]
+          verified_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          node -e '
+            for (const value of process.argv.slice(1)) {
+              if (value && (!Number.isFinite(Date.parse(value)) || /[\r\n]/.test(value))) process.exit(1);
+            }
+          ' "$CRON_VERIFIED_AT" "$verified_at"
+          jq -n -S \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg protected_sha "$EXPECTED_SHA" \
+            --arg operation "$OPERATION" \
+            --argjson bootstrap "$BOOTSTRAP" \
+            --arg mode "$mode" \
+            --arg version_id "$VERSION_ID" \
+            --arg deployment_id "$DEPLOYMENT_ID" \
+            --arg domain_id "$DOMAIN_ID" \
+            --arg source_sha256 "$EXPECTED_SOURCE" \
+            --arg profile_sha256 "$EXPECTED_PROFILE" \
+            --arg config_sha256 "$effective_config" \
+            --arg cron_verified_at "$CRON_VERIFIED_AT" \
+            --arg verified_at "$verified_at" \
+            '{schema:"ssai-release-health-controller-deployment-attestation-v1",
+              run_id:$run_id,run_attempt:$run_attempt,protected_sha:$protected_sha,
+              operation:$operation,bootstrap:$bootstrap,mode:$mode,
+              version_id:$version_id,deployment_id:$deployment_id,domain_id:$domain_id,
+              source_sha256:$source_sha256,profile_sha256:$profile_sha256,config_sha256:$config_sha256,
+              cron_verified_at:(if $cron_verified_at == "" then null else $cron_verified_at end),
+              verified_at:$verified_at}' > "$RUNNER_TEMP/controller-deployment-attestation.json"
+          {
+            printf '### Release-health controller deployment attestation\n\n```json\n'
+            cat "$RUNNER_TEMP/controller-deployment-attestation.json"
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Automatically restore attested observe version after failed deployment verification
         id: automatic_rollback
         if: ${{ always() && inputs.operation != 'rollback-observe' && steps.attest_rollback.outcome == 'success' && steps.apply_deploy.outputs.started_at != '' && steps.verify_deploy.outcome != 'success' }}
         continue-on-error: true
+        timeout-minutes: 10
         shell: bash
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
           ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
           ROLLBACK_SOURCE: ${{ inputs.rollback_source_sha256 }}
@@ -644,8 +1494,9 @@ jobs:
             --config "$CONTROLLER_CONFIG" \
             --message "automatic-safe-rollback ${GITHUB_SHA}" \
             --yes
+          rollback_deadline=$((SECONDS + 480))
           restored=false
-          for attempt in $(seq 1 90); do
+          while test "$SECONDS" -lt "$rollback_deadline"; do
             if curl --silent --show-error --max-time 15 --proto '=https' \
               "$CONTROLLER_HEALTH_URL" -o "$RUNNER_TEMP/controller-rollback-health.json" \
               && curl --silent --show-error --max-time 15 --proto '=https' \
@@ -660,10 +1511,12 @@ jobs:
                  and .checks.fresh == true and .checks.no_dead_alerts == true
                  and .checks.no_terminal_failure == true' \
                 "$RUNNER_TEMP/controller-rollback-health.json" >/dev/null \
-              && jq -e --arg config "$ROLLBACK_CONFIG" '.success == true
-                 and (.result.bindings | any(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject"))
-                 and (.result.bindings | any(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config))
-                 and (.result.bindings | all(.name != "ADMISSION_HMAC_KEY" and .name != "ALERT_SIGNING_KEY" and .name != "ACTIVATION_PROOF"))' \
+              && jq -e --arg config "$ROLLBACK_CONFIG" '.result.bindings as $bindings
+                 | .success == true
+                 and ($bindings | any(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject"))
+                 and ($bindings | any(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config))
+                 and ([$bindings[] | select(.type == "secret_text") | .name] | sort)
+                   == ["GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"]' \
                 "$RUNNER_TEMP/controller-rollback-settings.json" >/dev/null; then
               restored=true
               break
@@ -674,53 +1527,179 @@ jobs:
 
       - name: Contain failed first deployment without deleting Worker history
         id: bootstrap_containment
-        if: ${{ always() && inputs.bootstrap && steps.bootstrap_absence.outcome == 'success' && steps.apply_bootstrap.outputs.started_at != '' && steps.verify_deploy.outcome != 'success' }}
+        if: ${{ always() && inputs.bootstrap && steps.bootstrap_absence.outcome == 'success' && (steps.bootstrap_domain.outputs.mutation_attempted == 'true' || steps.apply_bootstrap.outputs.mutation_attempted == 'true') && steps.verify_deploy.outcome != 'success' }}
         continue-on-error: true
+        timeout-minutes: 10
         shell: bash
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+          DOMAIN_CREATED_BY_RUN: ${{ steps.bootstrap_domain.outputs.domain_created_by_run }}
+          DOMAIN_MUTATION_ATTEMPTED: ${{ steps.bootstrap_domain.outputs.mutation_attempted }}
+          EXPECTED_DOMAIN_ID: ${{ steps.bootstrap_domain.outputs.domain_id }}
+          SCHEDULE_MUTATION_ATTEMPTED: ${{ steps.apply_bootstrap.outputs.mutation_attempted }}
+          SCHEDULE_CREATED_BY_RUN: ${{ steps.apply_bootstrap.outputs.schedule_created_by_run }}
+          EXPECTED_VERSION_ID: ${{ steps.bootstrap_candidate.outputs.candidate_version_id }}
+          EXPECTED_DEPLOYMENT_ID: ${{ steps.bootstrap_candidate.outputs.candidate_deployment_id }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
-          curl --fail --silent --show-error --max-time 15 --proto '=https' \
-            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            "$api/workers/domains" -o "$RUNNER_TEMP/bootstrap-domains-containment.json"
-          domain_id="$(jq -er '[.result[] | select(
-            .hostname == "release-health-controller.scalesmall.ai"
-            and .service == "ssai-release-health-controller"
-            and .environment == "production"
-          )] | if length == 0 then "absent" elif length == 1 then .[0].id else error("ambiguous domain") end' \
-            "$RUNNER_TEMP/bootstrap-domains-containment.json")"
-          if test "$domain_id" != absent; then
-            [[ "$domain_id" =~ ^[a-f0-9]{8}-?[a-f0-9]{4}-?[1-5][a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}$ ]]
-            curl --fail --silent --show-error --max-time 15 --proto '=https' \
-              --request DELETE -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              "$api/workers/domains/$domain_id" -o "$RUNNER_TEMP/bootstrap-domain-delete.json"
-            jq -e '.success == true' "$RUNNER_TEMP/bootstrap-domain-delete.json" >/dev/null
+          containment_deadline=$((SECONDS + 480))
+          containment_rc=0
+          valid_domain_id() {
+            [[ "$1" =~ ^[a-f0-9]{32}$ || "$1" =~ ^[a-f0-9]{40}$ || "$1" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]
+          }
+          if test "$SCHEDULE_MUTATION_ATTEMPTED" = true && test "$SCHEDULE_CREATED_BY_RUN" != true; then
+            containment_rc=1
           fi
-          schedule_code="$(curl --silent --show-error --max-time 15 --proto '=https' \
-            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            -o "$RUNNER_TEMP/bootstrap-schedules-containment.json" -w '%{http_code}' \
-            "$api/workers/scripts/$CONTROLLER_NAME/schedules")"
-          if test "$schedule_code" = 200 && jq -e '.success == true and (.result | length == 1) and .result[0].cron == "* * * * *"' \
-            "$RUNNER_TEMP/bootstrap-schedules-containment.json" >/dev/null; then
-            curl --fail --silent --show-error --max-time 15 --proto '=https' \
-              --request DELETE -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              "$api/workers/scripts/$CONTROLLER_NAME/schedules/%2A%20%2A%20%2A%20%2A%20%2A" \
-              -o "$RUNNER_TEMP/bootstrap-schedule-delete.json"
-            jq -e '.success == true' "$RUNNER_TEMP/bootstrap-schedule-delete.json" >/dev/null
-          else
-            test "$schedule_code" = 404 || jq -e '.success == true and (.result | length == 0)' \
-              "$RUNNER_TEMP/bootstrap-schedules-containment.json" >/dev/null
+          if test "$DOMAIN_MUTATION_ATTEMPTED" = true && test "$DOMAIN_CREATED_BY_RUN" != true; then
+            containment_rc=1
           fi
-          curl --fail --silent --show-error --max-time 15 --proto '=https' \
-            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            "$api/workers/domains" -o "$RUNNER_TEMP/bootstrap-domains-contained.json"
-          jq -e '.success == true and (.result | all(
-            .hostname != "release-health-controller.scalesmall.ai"
-            and .service != "ssai-release-health-controller"
-          ))' "$RUNNER_TEMP/bootstrap-domains-contained.json" >/dev/null
+          if test "$SCHEDULE_CREATED_BY_RUN" = true; then
+            schedule_code="$(curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -o "$RUNNER_TEMP/bootstrap-schedules-containment.json" -w '%{http_code}' \
+              "$api/workers/scripts/$CONTROLLER_NAME/schedules" || true)"
+            if test "$schedule_code" = 200 \
+              && jq -e '.success == true
+                and ((.result.schedules // .result // []) | length) == 1
+                and (.result.schedules // .result // [])[0].cron == "* * * * *"' \
+              "$RUNNER_TEMP/bootstrap-schedules-containment.json" >/dev/null; then
+              printf '[]\n' > "$RUNNER_TEMP/bootstrap-schedule-empty-body.json"
+              delete_code="$(curl --silent --show-error --max-time 15 --proto '=https' \
+                --request PUT \
+                -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                -H 'Content-Type: application/json' \
+                --data-binary @"$RUNNER_TEMP/bootstrap-schedule-empty-body.json" \
+                -o "$RUNNER_TEMP/bootstrap-schedule-delete.json" -w '%{http_code}' \
+                "$api/workers/scripts/$CONTROLLER_NAME/schedules" || true)"
+              if test "$delete_code" != 200 \
+                || ! jq -e '.success == true and (.result.schedules // .result // []) == []' \
+                  "$RUNNER_TEMP/bootstrap-schedule-delete.json" >/dev/null; then
+                containment_rc=1
+              fi
+            elif test "$schedule_code" != 200 \
+              || ! jq -e '.success == true and ((.result.schedules // .result // []) | length) == 0' \
+                "$RUNNER_TEMP/bootstrap-schedules-containment.json" >/dev/null; then
+              containment_rc=1
+            fi
+          fi
+          if test "$DOMAIN_CREATED_BY_RUN" = true; then
+            domain_id=
+            if curl --fail --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/domains?service=$CONTROLLER_NAME" \
+              -o "$RUNNER_TEMP/bootstrap-service-domains-containment.json" \
+              && curl --fail --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/domains?hostname=release-health-controller.scalesmall.ai" \
+              -o "$RUNNER_TEMP/bootstrap-hostname-domains-containment.json"; then
+              service_count="$(jq -er 'select(.success == true and (.result | type) == "array" and (.result | length) <= 1) | .result | length' \
+                "$RUNNER_TEMP/bootstrap-service-domains-containment.json" 2>/dev/null || true)"
+              hostname_count="$(jq -er 'select(.success == true and (.result | type) == "array" and (.result | length) <= 1) | .result | length' \
+                "$RUNNER_TEMP/bootstrap-hostname-domains-containment.json" 2>/dev/null || true)"
+              if test "$service_count$hostname_count" = 00; then
+                domain_id=absent
+              elif test "$service_count$hostname_count" = 11; then
+                domain_id="$(jq -er '.result[0].id' "$RUNNER_TEMP/bootstrap-service-domains-containment.json" 2>/dev/null || true)"
+                hostname_domain_id="$(jq -er '.result[0].id' "$RUNNER_TEMP/bootstrap-hostname-domains-containment.json" 2>/dev/null || true)"
+                if ! valid_domain_id "$domain_id" || test "$domain_id" != "$hostname_domain_id" \
+                  || { test -n "$EXPECTED_DOMAIN_ID" && test "$domain_id" != "$EXPECTED_DOMAIN_ID"; } \
+                  || ! curl --fail --silent --show-error --max-time 15 --proto '=https' \
+                    -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                    "$api/workers/domains/$domain_id" -o "$RUNNER_TEMP/bootstrap-domain-containment-detail.json" \
+                  || ! jq -e --arg id "$domain_id" '
+                    .success == true and .result.id == $id
+                    and .result.hostname == "release-health-controller.scalesmall.ai"
+                    and .result.service == "ssai-release-health-controller"
+                    and .result.zone_name == "scalesmall.ai"
+                    and (.result.environment // "production") == "production"
+                  ' "$RUNNER_TEMP/bootstrap-domain-containment-detail.json" >/dev/null; then
+                  containment_rc=1
+                  domain_id=ambiguous
+                fi
+              else
+                containment_rc=1
+                domain_id=ambiguous
+              fi
+            else
+              containment_rc=1
+              domain_id=ambiguous
+            fi
+            if valid_domain_id "$domain_id"; then
+              delete_code="$(curl --silent --show-error --max-time 15 --proto '=https' \
+                --request DELETE -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                -o "$RUNNER_TEMP/bootstrap-domain-delete.json" -w '%{http_code}' \
+                "$api/workers/domains/$domain_id" || true)"
+              if test "$delete_code" != 200 \
+                || ! jq -e '.success == true' "$RUNNER_TEMP/bootstrap-domain-delete.json" >/dev/null; then
+                containment_rc=1
+              fi
+            fi
+          fi
+          contained=false
+          while test "$SECONDS" -lt "$containment_deadline"; do
+            schedule_ok=false
+            domain_ok=false
+            provider_ok=false
+            if curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/scripts/$CONTROLLER_NAME/schedules" \
+              -o "$RUNNER_TEMP/bootstrap-schedules-contained.json" \
+              && jq -e '.success == true and ((.result.schedules // .result // []) | length) == 0' \
+                "$RUNNER_TEMP/bootstrap-schedules-contained.json" >/dev/null; then
+              schedule_ok=true
+            fi
+            if test "$DOMAIN_CREATED_BY_RUN" != true; then
+              domain_ok=true
+            elif curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/domains?service=$CONTROLLER_NAME" \
+              -o "$RUNNER_TEMP/bootstrap-service-domains-contained.json" \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/domains?hostname=release-health-controller.scalesmall.ai" \
+              -o "$RUNNER_TEMP/bootstrap-hostname-domains-contained.json" \
+              && jq -e '.success == true and .result == []' "$RUNNER_TEMP/bootstrap-service-domains-contained.json" >/dev/null \
+              && jq -e '.success == true and .result == []' "$RUNNER_TEMP/bootstrap-hostname-domains-contained.json" >/dev/null; then
+              domain_ok=true
+            fi
+            if curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/scripts/$CONTROLLER_NAME/deployments" \
+              -o "$RUNNER_TEMP/bootstrap-deployments-contained.json" \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/scripts/$CONTROLLER_NAME/settings" \
+              -o "$RUNNER_TEMP/bootstrap-settings-contained.json" \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/scripts/$CONTROLLER_NAME/subdomain" \
+              -o "$RUNNER_TEMP/bootstrap-subdomain-contained.json" \
+              && jq -e --arg deployment "$EXPECTED_DEPLOYMENT_ID" --arg version "$EXPECTED_VERSION_ID" '
+                .success == true
+                and (.result.deployments // .result)[0].id == $deployment
+                and ((.result.deployments // .result)[0].versions | length) == 1
+                and (.result.deployments // .result)[0].versions[0].version_id == $version
+                and ((.result.deployments // .result)[0].versions[0].percentage | tonumber) == 100
+              ' "$RUNNER_TEMP/bootstrap-deployments-contained.json" >/dev/null \
+              && jq -e '.result.bindings as $bindings
+                | .success == true
+                and ($bindings | any(.name == "MODE" and .type == "plain_text" and .text == "observe"))
+                and ([$bindings[] | select(.type == "secret_text") | .name] | sort)
+                  == ["GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"]' \
+                "$RUNNER_TEMP/bootstrap-settings-contained.json" >/dev/null \
+              && jq -e '.success == true and .result.enabled == false and .result.previews_enabled == false' \
+                "$RUNNER_TEMP/bootstrap-subdomain-contained.json" >/dev/null; then
+              provider_ok=true
+            fi
+            if test "$schedule_ok$domain_ok$provider_ok" = truetruetrue; then
+              contained=true
+              break
+            fi
+            sleep 5
+          done
+          test "$contained" = true || containment_rc=1
+          test "$containment_rc" -eq 0
 
       - name: Conclude exact operation and safe rollback outcome
         if: ${{ always() }}
@@ -735,11 +1714,13 @@ jobs:
             exit 0
           fi
           if test '${{ inputs.bootstrap }}' = true && test '${{ steps.verify_deploy.outcome }}' != success; then
-            if test '${{ steps.apply_bootstrap.outcome }}' != skipped; then
+            domain_mutation='${{ steps.bootstrap_domain.outputs.mutation_attempted }}'
+            schedule_mutation='${{ steps.apply_bootstrap.outputs.mutation_attempted }}'
+            if test "$domain_mutation" = true || test "$schedule_mutation" = true; then
               test '${{ steps.bootstrap_containment.outcome }}' = success
-              echo 'Bootstrap verification failed; traffic triggers created by this run were withdrawn.' >&2
+              echo 'Bootstrap verification failed; every traffic trigger created by this run was withdrawn.' >&2
             else
-              echo 'Bootstrap candidate failed before traffic promotion; no traffic trigger was created.' >&2
+              echo 'Bootstrap verification failed without a traffic mutation in this run.' >&2
             fi
             exit 1
           fi
@@ -750,6 +1731,7 @@ jobs:
           fi
           if test '${{ inputs.bootstrap }}' = true; then
             test '${{ steps.bootstrap_candidate.outcome }}' = success
+            test '${{ steps.bootstrap_domain.outcome }}' = success
             test '${{ steps.apply_bootstrap.outcome }}' = success
             exit 0
           fi
@@ -768,4 +1750,6 @@ jobs:
             "$RUNNER_TEMP/github-app-input.pem" \
             "$RUNNER_TEMP/github-app-pkcs8.pem" \
             "$RUNNER_TEMP/controller-secrets.json" \
+            "$RUNNER_TEMP/controller-deployment-attestation.json" \
+            workers/release-health-controller/.wrangler-bootstrap-deployment.jsonc \
             workers/release-health-controller/.wrangler-deployment.jsonc

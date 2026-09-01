@@ -115,17 +115,38 @@ SHA tag and message, mode, source/profile/config digests, Durable Object binding
 and health response. Split traffic, multiple live versions, or a newer unrecognized mutation fails
 closed.
 
-The explicit `bootstrap` input is valid only with `deploy-observe`. It fails closed unless official
-Cloudflare API evidence proves the named Worker has no deployments, versions, settings, schedules,
-custom domain, or service traffic. Bootstrap uploads one immutable SHA-tagged observe candidate,
-proves its preview health contract, exact digests, Durable Object binding, and absence of active
-secrets before promotion, and then creates the exact domain and cron. If post-promotion validation
-fails, the workflow removes only the exact domain and cron whose pre-run absence it proved. It
-leaves the Worker/version evidence intact and never deletes an existing Worker.
+The explicit `bootstrap` input is valid only with `deploy-observe`. Official Cloudflare API evidence
+classifies the provider into one exact resumable state: absent, contained, domain attached, or
+scheduled. A contained candidate whose source/profile/config no longer matches is classified as
+stale-contained and replaced without deleting its immutable history. Every resumable candidate must
+be a 100-percent deployment attested by the current protected-main commit or an ancestor, with the
+exact observe bindings, only the three GitHub App secrets, no active-only or unaccounted secret, and
+both the public workers.dev subdomain and preview URLs disabled.
+
+Because Cloudflare cannot upload a version for a Worker that does not yet exist, an absent or stale
+bootstrap first uses `wrangler deploy` with a temporary contained configuration that has no route or
+cron. The workflow then attaches the exact custom domain through Cloudflare's official domain API and
+proves the pre-cron health contract there. A newly attached domain must return the exact virgin 503
+state. A resumed domain-only state may retain safe prior tick history, but it must have the exact
+schema and digests, zero pending/dead alerts, canonical non-future timestamps, and no terminal or
+internal failure.
+
+The one-minute cron is created through Cloudflare's official schedules API only after domain proof.
+Every bootstrap or resume records a new in-run schedule-verification boundary and waits for a later
+natural tick. Final acceptance requires the exact live deployment, version, domain, schedule, healthy
+observe response, allowlisted observe decision, canonical tick ordering, and no new fallback workflow
+dispatch. If validation fails after this run mutates traffic, containment removes the cron first and
+then only a domain created by this run. It preserves the contained Worker, Durable Object storage,
+deployment, and immutable versions, and never deletes an existing Worker.
+
+The workflow pins Cloudflare account `7b68f149b6054718ad2c6ff0634ae145` in reviewed source instead
+of accepting an account identifier from a secret or dispatch input. A domain or schedule is treated
+as owned by the current run only after Cloudflare returns an exact successful creation receipt. An
+ambiguous mutation result fails closed for manual read-only reconciliation and is never used as
+authority to delete a possibly pre-existing resource.
 
 Required deployment-environment secrets are:
 
-- `SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID`
 - `SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN`
 - `SSAI_RELEASE_CONTROLLER_GITHUB_APP_CLIENT_ID`
 - `SSAI_RELEASE_CONTROLLER_GITHUB_APP_PRIVATE_KEY`
