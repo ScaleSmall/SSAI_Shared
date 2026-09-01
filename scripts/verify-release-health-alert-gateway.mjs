@@ -12,7 +12,7 @@ const id = createHash('sha256').update(`ssai-release-health-alert-id-v1\0${canon
 const signature = createHmac('sha256', hmacKeyBytes).update(`ssai-release-health-alert-v2\0${id}\n${canonicalBody}`).digest('hex');
 const allowRateLimiter = Object.freeze({
   async limit({ key }) {
-    assert.equal(key, 'authenticated-release-health-alert-ingest');
+    assert.ok(['authenticated-release-health-alert-ingest', 'immutable-preview-health'].includes(key));
     return { success: true };
   },
 });
@@ -130,6 +130,17 @@ function upstream(status = 202, body = '') {
     status: 'unhealthy',
     version_id: null,
   });
+  const productionMissingMetadata = await createGatewayImplementation({
+    hmacKey,
+    rateLimiter: allowRateLimiter,
+  }).fetch(new Request('https://alerts.scalesmall.ai/healthz'));
+  assert.equal(productionMissingMetadata.status, 503);
+  assert.deepEqual(await productionMissingMetadata.json(), {
+    schema: 'ssai-release-health-alert-gateway-health-v2',
+    component: 'release-health-alert-gateway',
+    status: 'unhealthy',
+    version_id: null,
+  });
   for (const malformedVersionMetadata of [
     { ...versionMetadata, id: 'not-a-version-id' },
     { ...versionMetadata, tag: 'not-a-commit-tag' },
@@ -186,8 +197,12 @@ for (const status of [200, 202, 204, 208, 226]) {
   assert.equal(health.headers.get('location'), null);
   assert.equal(health.redirected, false);
 
-  const previewHost = 'c-0123456789ab-ssai-release-health-alert-gateway.ssai-preview.workers.dev';
-  const previewHealth = await gateway.fetch(new Request(`https://${previewHost}/healthz`, {
+  const previewHost = 'aaaaaaaa-ssai-release-health-alert-gateway.ssai-preview.workers.dev';
+  const previewHealth = await createGatewayImplementation({
+    hmacKey,
+    rateLimiter: allowRateLimiter,
+    versionMetadata: { id: versionMetadata.id },
+  }).fetch(new Request(`https://${previewHost}/healthz`, {
     headers: { 'X-SSAI-Preview-Health-Host': previewHost },
   }));
   assert.equal(previewHealth.status, 200);
@@ -200,16 +215,67 @@ for (const status of [200, 202, 204, 208, 226]) {
   assert.equal(previewHealth.headers.get('location'), null);
   assert.equal(previewHealth.redirected, false);
 
+  const previewWithoutMetadata = await createGatewayImplementation({
+    hmacKey,
+    rateLimiter: allowRateLimiter,
+  }).fetch(new Request(`https://${previewHost}/healthz`, {
+    headers: { 'X-SSAI-Preview-Health-Host': previewHost },
+  }));
+  assert.equal(previewWithoutMetadata.status, 200);
+  assert.deepEqual(await previewWithoutMetadata.json(), {
+    schema: 'ssai-release-health-alert-gateway-health-v2',
+    component: 'release-health-alert-gateway',
+    status: 'healthy',
+    version_id: null,
+  });
+
+  for (const invalidPreviewMetadata of [
+    { id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' },
+    { id: 'not-a-version-id' },
+  ]) {
+    const previewWithInvalidMetadata = await createGatewayImplementation({
+      hmacKey,
+      rateLimiter: allowRateLimiter,
+      versionMetadata: invalidPreviewMetadata,
+    }).fetch(new Request(`https://${previewHost}/healthz`, {
+      headers: { 'X-SSAI-Preview-Health-Host': previewHost },
+    }));
+    assert.equal(previewWithInvalidMetadata.status, 503);
+    assert.deepEqual(await previewWithInvalidMetadata.json(), {
+      schema: 'ssai-release-health-alert-gateway-health-v2',
+      component: 'release-health-alert-gateway',
+      status: 'unhealthy',
+      version_id: null,
+    });
+  }
+
+  const previewWithoutLimiter = await createGatewayImplementation({
+    hmacKey,
+    versionMetadata: { id: versionMetadata.id },
+  }).fetch(new Request(`https://${previewHost}/healthz`, {
+    headers: { 'X-SSAI-Preview-Health-Host': previewHost },
+  }));
+  assert.equal(previewWithoutLimiter.status, 503);
+  assert.deepEqual(await previewWithoutLimiter.json(), {
+    schema: 'ssai-release-health-alert-gateway-health-v2',
+    component: 'release-health-alert-gateway',
+    status: 'unhealthy',
+    version_id: versionMetadata.id,
+  });
+
   for (const request of [
     new Request(`https://${previewHost}/healthz`),
     new Request(`https://${previewHost}/healthz`, {
-      headers: { 'X-SSAI-Preview-Health-Host': 'c-fedcba987654-ssai-release-health-alert-gateway.ssai-preview.workers.dev' },
+      headers: { 'X-SSAI-Preview-Health-Host': 'bbbbbbbb-ssai-release-health-alert-gateway.ssai-preview.workers.dev' },
+    }),
+    new Request('https://c-0123456789ab-ssai-release-health-alert-gateway.ssai-preview.workers.dev/healthz', {
+      headers: { 'X-SSAI-Preview-Health-Host': 'c-0123456789ab-ssai-release-health-alert-gateway.ssai-preview.workers.dev' },
     }),
     new Request('https://arbitrary.workers.dev/healthz', {
       headers: { 'X-SSAI-Preview-Health-Host': 'arbitrary.workers.dev' },
     }),
-    new Request('https://c-0123456789ab-ssai-release-health-alert-gateway.other.example/healthz', {
-      headers: { 'X-SSAI-Preview-Health-Host': 'c-0123456789ab-ssai-release-health-alert-gateway.other.example' },
+    new Request('https://aaaaaaaa-ssai-release-health-alert-gateway.other.example/healthz', {
+      headers: { 'X-SSAI-Preview-Health-Host': 'aaaaaaaa-ssai-release-health-alert-gateway.other.example' },
     }),
   ]) {
     const rejectedPreview = await gateway.fetch(request);

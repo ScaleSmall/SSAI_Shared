@@ -156,6 +156,37 @@ const candidateUpload = workflow.slice(candidateUploadStart, candidateUploadEnd)
 assert.ok(candidateUploadStart >= 0 && candidateUploadEnd > candidateUploadStart, 'Candidate upload must have a complete fixed-command budget');
 assert.ok(candidateUpload.includes('--secrets-file "$candidate_secrets"'), 'The immutable candidate must atomically receive the authorized signing key');
 assert.ok(candidateUpload.indexOf('--secrets-file "$candidate_secrets"') < candidateUpload.indexOf('rm -f -- "$candidate_secrets"'), 'Candidate signing material must remain available through upload and then be deleted');
+const previewGateEnd = workflow.indexOf('          gateway_failure_stage=promotion', candidateUploadEnd);
+const previewGate = workflow.slice(candidateUploadEnd, previewGateEnd);
+assert.ok(previewGateEnd > candidateUploadEnd, 'The immutable preview gate must complete before promotion');
+assert.ok(previewGate.includes('(.preview_url|type)=="string" and (.preview_url|length)>0'), 'The Wrangler event must contain a non-empty immutable preview URL');
+assert.ok(previewGate.includes('(.preview_alias_url|type)=="string" and (.preview_alias_url|length)>0'), 'The Wrangler event must still contain the requested preview alias URL');
+assert.equal((previewGate.match(/preview_alias_url/g) ?? []).length, 2, 'The alias URL may be validated for presence but must not be selected or probed');
+const previewSelectionLine = previewGate.split('\n').find((line) => line.includes('preview_url="$(jq'));
+assert.ok(previewSelectionLine?.includes('[0].preview_url//empty'), 'Health must select the immutable Wrangler preview URL');
+assert.doesNotMatch(previewSelectionLine ?? '', /preview_alias_url/, 'Health must never select the mutable preview alias URL');
+assert.ok(previewGate.includes('preview_prefix="${candidate_version_id:0:8}"'), 'The immutable preview prefix must bind to the candidate version ID');
+assert.ok(previewGate.includes('^${preview_prefix}-${GATEWAY_NAME}\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.workers\\.dev$'), 'The immutable preview hostname must retain the exact version, Worker, subdomain, and workers.dev shape');
+assert.ok(previewGate.includes('wait_health "https://$preview_host/healthz" preview "$candidate_version_id" "$preview_host"'), 'The immutable preview must use bounded health reconciliation with its validated host');
+assert.ok(previewGate.indexOf('wait_health "https://$preview_host/healthz"') < previewGate.indexOf('gateway-recheck.json'), 'Preview health must pass before candidate deployment state is rechecked');
+const previewWaitIndex = workflow.indexOf('wait_health "https://$preview_host/healthz" preview "$candidate_version_id" "$preview_host"', candidateUploadEnd);
+const trafficMutationIndex = workflow.indexOf('traffic_mutated=true', previewWaitIndex);
+assert.ok(previewWaitIndex >= 0 && trafficMutationIndex > previewWaitIndex, 'Immutable preview health must pass before production traffic mutation is armed');
+const immutablePreviewHostAccepted = (rawUrl, candidateId, worker) => {
+  let url;
+  try { url = new URL(rawUrl); } catch { return false; }
+  if (url.protocol !== 'https:' || url.pathname !== '/' || url.search || url.hash) return false;
+  const prefix = candidateId.slice(0, 8);
+  const escapedWorker = worker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^${prefix}-${escapedWorker}\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.workers\\.dev$`).test(url.hostname);
+};
+const previewCandidateId = 'aaaaaaaa-1111-2222-3333-444444444444';
+const immutablePreviewUrl = `https://aaaaaaaa-${config.name}.ssai.workers.dev/`;
+assert.equal(immutablePreviewHostAccepted(immutablePreviewUrl, previewCandidateId, config.name), true, 'The exact immutable candidate preview hostname must pass');
+assert.equal(immutablePreviewHostAccepted(`https://c-${'b'.repeat(12)}-${config.name}.ssai.workers.dev/`, previewCandidateId, config.name), false, 'A mutable preview alias hostname must fail');
+assert.equal(immutablePreviewHostAccepted(`https://bbbbbbbb-${config.name}.ssai.workers.dev/`, previewCandidateId, config.name), false, 'A preview for a different version prefix must fail');
+assert.equal(immutablePreviewHostAccepted(`https://aaaaaaaa-other-worker.ssai.workers.dev/`, previewCandidateId, config.name), false, 'A preview for a different Worker must fail');
+assert.equal(immutablePreviewHostAccepted(`https://aaaaaaaa-${config.name}.extra.ssai.workers.dev/`, previewCandidateId, config.name), false, 'An extra preview hostname label must fail');
 const deadlineGuard = 'test "$traffic_mutated" = true || test "$bootstrap_mutation_attempted" = true';
 assert.equal((workflow.match(new RegExp(deadlineGuard.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) ?? []).length, 2, 'API calls and sleeps must honor the forward deadline after either bootstrap or promotion mutation');
 const finishFunction = workflow.split('          finish() {')[1].split('          trap finish EXIT')[0];
@@ -209,7 +240,7 @@ for (const [stage, command] of [
   ['live-health', 'wait_health "https://$GATEWAY_DOMAIN/healthz" preflight-live "$previous_version_id"'],
   ['preflight-secret-cleanup', 'if test -n "$bootstrap_secrets"; then rm -f -- "$bootstrap_secrets"'],
   ['candidate-upload', 'require_forward_budget 360'],
-  ['candidate-preview', 'check_health "https://$preview_host/healthz" preview'],
+  ['candidate-preview', 'wait_health "https://$preview_host/healthz" preview'],
   ['promotion', 'promoted="$(date -u +%Y-%m-%dT%H:%M:%SZ)"'],
   ['ingress', 'api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/settings" "$RUNNER_TEMP/gateway-settings.json"'],
   ['final-attestation', 'attest_candidate_provider_state final'],
@@ -229,6 +260,28 @@ const healthIndex = candidateAttestation.indexOf('check_health "https://$GATEWAY
 const postHealthIngressIndex = candidateAttestation.indexOf('attest_candidate_ingress "${label}-after-health"');
 const finalDeploymentIndex = candidateAttestation.indexOf('gateway-${label}-end-list.json');
 assert.ok(healthIndex >= 0 && healthIndex < postHealthIngressIndex && postHealthIngressIndex < finalDeploymentIndex, 'Final commit proof must bracket health with a later ingress recheck and then close on exact active deployment');
+const checkHealthFunction = workflow.split('          check_health() {')[1].split('          wait_health() {')[0];
+const waitHealthFunction = workflow.split('          wait_health() {')[1].split('          attest_candidate_ingress() {')[0];
+for (const retainedCheck of [
+  'keys==["component","schema","status","version_id"]', '--max-filesize 1024', 'test "$(wc -c < "$temporary_headers")" -le 8192',
+  '^content-type:', '^cache-control:', '^x-content-type-options:', "grep -Eiq '^(location|set-cookie):'",
+]) assert.ok(checkHealthFunction.includes(retainedCheck), `Health validation must retain ${retainedCheck}`);
+assert.ok(checkHealthFunction.includes('if $preview_host=="" then .version_id==$version else (.version_id==null or .version_id==$version) end'), 'Preview health may omit provider version metadata while production remains exact');
+assert.ok(waitHealthFunction.includes('preview_host="${4:-}"'), 'The bounded health loop must accept the validated preview host');
+assert.ok(waitHealthFunction.includes('check_health "$url" "$label" "$expected_version" "$preview_host"'), 'Every bounded health attempt must preserve preview context');
+const healthBodyAccepted = (body, expectedVersion, previewHost = '') => {
+  if (JSON.stringify(Object.keys(body).sort()) !== JSON.stringify(['component', 'schema', 'status', 'version_id'])) return false;
+  if (body.schema !== 'ssai-release-health-alert-gateway-health-v2' || body.component !== 'release-health-alert-gateway' || body.status !== 'healthy') return false;
+  return previewHost === '' ? body.version_id === expectedVersion : body.version_id === null || body.version_id === expectedVersion;
+};
+const expectedHealthVersion = previewCandidateId;
+const baseHealth = { component: 'release-health-alert-gateway', schema: 'ssai-release-health-alert-gateway-health-v2', status: 'healthy', version_id: expectedHealthVersion };
+assert.equal(healthBodyAccepted(baseHealth, expectedHealthVersion, 'immutable-preview-host'), true, 'Preview health with the exact candidate version must pass');
+assert.equal(healthBodyAccepted({ ...baseHealth, version_id: null }, expectedHealthVersion, 'immutable-preview-host'), true, 'Preview health may report null before version metadata is materialized');
+assert.equal(healthBodyAccepted({ ...baseHealth, version_id: 'bbbbbbbb-1111-2222-3333-444444444444' }, expectedHealthVersion, 'immutable-preview-host'), false, 'Preview health with a wrong non-null version must fail');
+assert.equal(healthBodyAccepted(baseHealth, expectedHealthVersion), true, 'Production health with the exact deployed version must pass');
+assert.equal(healthBodyAccepted({ ...baseHealth, version_id: null }, expectedHealthVersion), false, 'Production health with null version metadata must fail');
+assert.equal(healthBodyAccepted({ ...baseHealth, version_id: 'bbbbbbbb-1111-2222-3333-444444444444' }, expectedHealthVersion), false, 'Production health with a different version must fail');
 const containmentFunction = workflow.split('          contain_bootstrap() {')[1].split('          check_health() {')[0];
 assert.ok(containmentFunction.indexOf('bootstrap_version_owned') < containmentFunction.indexOf('api_post_json "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/subdomain"'), 'Bootstrap correction must prove exact run ownership before mutation');
 assert.ok((workflow.match(/rm -f -- "\$output"/g) ?? []).length >= 5, 'Every reusable API destination must be cleared before a request');

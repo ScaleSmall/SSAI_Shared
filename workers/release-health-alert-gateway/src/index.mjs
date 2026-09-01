@@ -7,11 +7,12 @@ const REQUEST_BODY_TIMEOUT_MS = 2_000;
 const MAX_UPSTREAM_RESPONSE_BYTES = 65_536;
 const UPSTREAM_TIMEOUT_MS = 10_000;
 const RATE_LIMIT_KEY = 'authenticated-release-health-alert-ingest';
+const PREVIEW_HEALTH_RATE_LIMIT_KEY = 'immutable-preview-health';
 const PREVIEW_HEALTH_HOST_HEADER = 'x-ssai-preview-health-host';
 const HEX_64 = /^[a-f0-9]{64}$/;
 const VERSION_ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const VERSION_TAG = /^[a-f0-9]{40}$/;
-const PREVIEW_HEALTH_HOST = /^c-[a-f0-9]{12}-ssai-release-health-alert-gateway\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev$/;
+const PREVIEW_HEALTH_HOST = /^([a-f0-9]{8})-ssai-release-health-alert-gateway\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev$/;
 
 function response(status, body = null, contentType = null) {
   const headers = new Headers({
@@ -235,6 +236,16 @@ async function forwardAlert(request, { fetchImpl, timeoutMs, bodyTimeoutMs, rate
   }
 }
 
+async function previewRateLimiterReady(rateLimiter) {
+  if (!rateLimiter || typeof rateLimiter.limit !== 'function') return false;
+  try {
+    const result = await rateLimiter.limit({ key: PREVIEW_HEALTH_RATE_LIMIT_KEY });
+    return Boolean(result) && typeof result.success === 'boolean';
+  } catch {
+    return false;
+  }
+}
+
 export function createGateway({ fetchImpl = fetch, timeoutMs = UPSTREAM_TIMEOUT_MS, bodyTimeoutMs = REQUEST_BODY_TIMEOUT_MS, rateLimiter = null, hmacKey = null, versionMetadata = null } = {}) {
   if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function.');
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > UPSTREAM_TIMEOUT_MS) {
@@ -249,6 +260,7 @@ export function createGateway({ fetchImpl = fetch, timeoutMs = UPSTREAM_TIMEOUT_
 
       const productionOrigin = url.origin === PUBLIC_ORIGIN;
       const previewHost = request.headers.get(PREVIEW_HEALTH_HOST_HEADER);
+      const previewHostMatch = PREVIEW_HEALTH_HOST.exec(url.hostname);
       const exactPreviewHealth = request.method === 'GET'
         && url.protocol === 'https:'
         && url.port === ''
@@ -256,7 +268,7 @@ export function createGateway({ fetchImpl = fetch, timeoutMs = UPSTREAM_TIMEOUT_
         && url.password === ''
         && url.pathname === HEALTH_PATH
         && previewHost === url.hostname
-        && PREVIEW_HEALTH_HOST.test(url.hostname);
+        && previewHostMatch !== null;
       if (!productionOrigin && !exactPreviewHealth) return jsonError(404, 'not_found');
 
       if (url.pathname === HEALTH_PATH) {
@@ -264,15 +276,25 @@ export function createGateway({ fetchImpl = fetch, timeoutMs = UPSTREAM_TIMEOUT_
         const healthRateLimiter = rateLimiter ?? env?.ALERT_INGEST_RATE_LIMITER;
         const rateLimiterReady = Boolean(healthRateLimiter) && typeof healthRateLimiter.limit === 'function';
         const healthVersion = versionMetadata ?? env?.CF_VERSION_METADATA;
-        const versionReady = Boolean(healthVersion)
-          && VERSION_ID.test(healthVersion.id ?? '')
-          && VERSION_TAG.test(healthVersion.tag ?? '');
-        const healthy = rateLimiterReady && versionReady;
+        const versionIdReady = Boolean(healthVersion) && VERSION_ID.test(healthVersion.id ?? '');
+        const productionVersionReady = versionIdReady && VERSION_TAG.test(healthVersion.tag ?? '');
+        const previewMetadataUnavailable = healthVersion === null || healthVersion === undefined;
+        const previewVersionReady = previewMetadataUnavailable
+          || (versionIdReady && previewHostMatch?.[1] === healthVersion.id.slice(0, 8));
+        const previewLimiterReady = exactPreviewHealth
+          ? await previewRateLimiterReady(healthRateLimiter)
+          : false;
+        const healthy = exactPreviewHealth
+          ? previewLimiterReady && previewVersionReady
+          : rateLimiterReady && productionVersionReady;
+        const responseVersionId = exactPreviewHealth
+          ? (previewVersionReady && versionIdReady ? healthVersion.id : null)
+          : (productionVersionReady ? healthVersion.id : null);
         return response(healthy ? 200 : 503, JSON.stringify({
           schema: 'ssai-release-health-alert-gateway-health-v2',
           component: 'release-health-alert-gateway',
           status: healthy ? 'healthy' : 'unhealthy',
-          version_id: versionReady ? healthVersion.id : null,
+          version_id: responseVersionId,
         }), 'application/json; charset=utf-8');
       }
 
