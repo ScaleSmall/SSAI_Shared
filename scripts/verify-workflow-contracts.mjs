@@ -425,11 +425,14 @@ assert.equal((alertGatewayDeployment.match(/\?force=true/g) ?? []).length, 1, 'o
 const alertGatewayRollbackFunction = alertGatewayDeployment.split('          reconcile_traffic_rollback() {')[1].split('          attest_rollback_active() {')[0];
 assert.ok(alertGatewayRollbackFunction.includes('deployments?force=true'), 'forced alert-gateway rollback must remain scoped to the provenance-gated helper');
 rejectPattern(alertGatewayDeployment, /\b(?:domain_snapshot|previous_domain_snapshot)\b/, 'redundant serialized alert-gateway domain snapshot');
+const alertGatewayDomainIdentityLine = alertGatewayDeployment.split('\n').find((line) => line.includes('domain_identity_ok()'));
 const alertGatewayDomainOkLine = alertGatewayDeployment.split('\n').find((line) => line.includes('domain_ok()'));
-assert.ok(alertGatewayDomainOkLine, 'alert-gateway direct domain identity validator must exist');
+assert.ok(alertGatewayDomainIdentityLine, 'alert-gateway direct domain identity validator must exist');
+assert.ok(alertGatewayDomainOkLine, 'alert-gateway full domain readiness validator must exist');
 for (const fieldCheck of ['.result.id==$id', '.result.hostname==$h', '.result.service==$s', '.result.zone_name==$z', '(.result.environment//"production")=="production"']) {
-  requireText(alertGatewayDomainOkLine, fieldCheck, `alert-gateway direct routing identity check ${fieldCheck}`);
+  requireText(alertGatewayDomainIdentityLine, fieldCheck, `alert-gateway direct routing identity check ${fieldCheck}`);
 }
+requireText(alertGatewayDomainOkLine, 'domain_identity_ok "$1" "$2"', 'alert-gateway certificate readiness chained to stable identity');
 rejectPattern(alertGatewayDeployment, /^\s+(?:traffic_mutated|domain_attach_attempted|domain_created_by_run|bootstrap_mutation_attempted)=false\s*$/m, 'sequential alert-gateway rollback disarm');
 rejectPattern(alertGatewayDeployment, /actions\/workflows\/\d+\/dispatches|gh\s+workflow\s+run/i, 'workflow dispatch from alert-gateway deployment');
 

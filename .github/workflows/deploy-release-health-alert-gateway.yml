@@ -109,6 +109,7 @@ jobs:
           legacy_successor_max_age_seconds=600
           domain_inventory_path="accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains?service=$GATEWAY_NAME"
           hostname_inventory_path="accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains?hostname=$GATEWAY_DOMAIN"
+          domain_ownership_file="$RUNNER_TEMP/gateway-domain-ownership.json"
           previous_deployment_id= previous_version_id= previous_domain_id= candidate_deployment_id= candidate_version_id= candidate_domain_id= candidate_secrets= bootstrap_dir= bootstrap_config= bootstrap_secrets=
           traffic_mutated=false domain_preexisting=false domain_attach_attempted=false domain_created_by_run=false bootstrap=false bootstrap_mutation_attempted=false committed=false legacy_contained_previous=false legacy_secret_successor_previous=false rollback_mode=false
           gateway_failure_stage=account-id-shape
@@ -287,7 +288,30 @@ jobs:
           candidate_version_ok() { jq -e --arg id "$2" --arg sha "$GITHUB_SHA" --arg msg "$message" --arg alias "$alias" '.result.metadata as $metadata|(.result.annotations//.result.metadata.annotations//{}) as $annotations|([$metadata.hasPreview?,$metadata.has_preview?]|map(select(type=="boolean"))) as $preview_flags|.result.id==$id and ($metadata.created_on|type)=="string" and ($preview_flags|length)>=1 and all($preview_flags[];.==true) and $annotations["workers/tag"]==$sha and $annotations["workers/message"]==$msg and $annotations["workers/alias"]==$alias' "$1" >/dev/null && binding_ok "$1"; }
           rollback_deployment_ok() { if test "$2" = "$previous_deployment_id"; then deployment_ok "$1" "$2" "$previous_version_id"; else promoted_deployment_ok "$1" "$2" "$previous_version_id" "$rollback_message"; fi; }
           observability_ok() { jq -e '.result.observability.enabled==true and .result.observability.head_sampling_rate==1 and .result.observability.logs.enabled==true and .result.observability.logs.head_sampling_rate==1 and .result.observability.logs.invocation_logs==true and .result.logpush==false and ((.result.tail_consumers//[])|length)==0' "$1" >/dev/null; }
-          domain_ok() { jq -e --arg id "$2" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" '.result.id==$id and .result.hostname==$h and .result.service==$s and .result.zone_name==$z and (.result.zone_id|type)=="string" and (.result.zone_id|test("^[a-f0-9]{32}$")) and (.result.cert_id|type)=="string" and (.result.cert_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")) and (.result.environment//"production")=="production"' "$1" >/dev/null; }
+          domain_identity_compatible() { jq -e --arg id "$2" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" '(.result|type)=="object" and .result.id==$id and ((.result|has("hostname")|not) or .result.hostname==null or .result.hostname==$h) and ((.result|has("service")|not) or .result.service==null or .result.service==$s) and ((.result|has("zone_name")|not) or .result.zone_name==null or .result.zone_name==$z) and ((.result|has("zone_id")|not) or .result.zone_id==null or ((.result.zone_id|type)=="string" and (.result.zone_id|test("^[a-f0-9]{32}$")))) and ((.result|has("environment")|not) or .result.environment==null or .result.environment=="production")' "$1" >/dev/null; }
+          domain_identity_ok() { jq -e --arg id "$2" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" '.result.id==$id and .result.hostname==$h and .result.service==$s and .result.zone_name==$z and (.result.zone_id|type)=="string" and (.result.zone_id|test("^[a-f0-9]{32}$")) and (.result.environment//"production")=="production"' "$1" >/dev/null; }
+          domain_ok() { domain_identity_ok "$1" "$2" && jq -e '(.result.cert_id|type)=="string" and (.result.cert_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"))' "$1" >/dev/null; }
+          record_domain_ownership() {
+            local id="$1" temporary
+            valid_domain_id "$id" || return 1
+            temporary="$(mktemp "${domain_ownership_file}.tmp.XXXXXX")" || return 1
+            if jq -n --arg id "$id" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" --arg sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" '{schema:"ssai-release-health-alert-gateway-domain-ownership-v1",domain_id:$id,hostname:$h,service:$s,zone_name:$z,commit_sha:$sha,run_id:$run,run_attempt:$attempt}' > "$temporary" && chmod 600 "$temporary" && test "$(stat -c '%a' "$temporary")" = 600 && mv -f -- "$temporary" "$domain_ownership_file"; then
+              candidate_domain_id="$id"
+              domain_created_by_run=true
+            else
+              rm -f -- "$temporary"
+              return 1
+            fi
+          }
+          restore_domain_ownership() {
+            local restored
+            if test "$domain_created_by_run" = true && valid_domain_id "$candidate_domain_id"; then return 0; fi
+            test -f "$domain_ownership_file" && test "$(stat -c '%a' "$domain_ownership_file")" = 600 || return 1
+            restored="$(jq -er --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" --arg sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" 'select(.schema=="ssai-release-health-alert-gateway-domain-ownership-v1" and .hostname==$h and .service==$s and .zone_name==$z and .commit_sha==$sha and .run_id==$run and .run_attempt==$attempt)|.domain_id' "$domain_ownership_file")" || return 1
+            valid_domain_id "$restored" || return 1
+            candidate_domain_id="$restored"
+            domain_created_by_run=true
+          }
           domain_list_complete() { jq -e '(.result|type)=="array" and ((has("result_info")|not) or .result_info==null or ((.result_info|type)=="object" and ((.result_info|has("page")|not) or ((.result_info.page|type)=="number" and (.result_info.page|floor)==.result_info.page and .result_info.page==1)) and ((.result_info|has("per_page")|not) or ((.result_info.per_page|type)=="number" and (.result_info.per_page|floor)==.result_info.per_page and .result_info.per_page>=(.result|length))) and ((.result_info|has("count")|not) or ((.result_info.count|type)=="number" and (.result_info.count|floor)==.result_info.count and .result_info.count==(.result|length))) and ((.result_info|has("total_pages")|not) or ((.result_info.total_pages|type)=="number" and (.result_info.total_pages|floor)==.result_info.total_pages and .result_info.total_pages>=0 and .result_info.total_pages<=1 and ((.result|length)==0 or .result_info.total_pages==1)))))' "$1" >/dev/null; }
           script_routes_absent() {
             local input="$1" expected_present="$2"
@@ -375,33 +399,54 @@ jobs:
             return 1
           }
           reconcile_domain_attach_response() {
-            local label="$1" deadline delay service_count hostname_count observed_domain hostname_domain returned_domain
+            local label="$1" deadline delay service_count hostname_count observed_domain hostname_domain returned_domain put_attempted
             deadline=$((SECONDS+120)); delay=1
+            returned_domain=; put_attempted=false
             while test "$SECONDS" -le "$deadline"; do
-              if api_put_json "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" "$RUNNER_TEMP/gateway-domain-attach-body.json" "$RUNNER_TEMP/gateway-${label}-response.json"; then
-                returned_domain="$(jq -er '.result.id' "$RUNNER_TEMP/gateway-${label}-response.json")" || return 2
-                valid_domain_id "$returned_domain" || return 2
-                domain_ok "$RUNNER_TEMP/gateway-${label}-response.json" "$returned_domain" || return 2
-                printf '%s' "$returned_domain"
-                return 0
+              if test "$put_attempted" = false; then
+                put_attempted=true
+                if api_put_json "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" "$RUNNER_TEMP/gateway-domain-attach-body.json" "$RUNNER_TEMP/gateway-${label}-response.json"; then
+                  returned_domain="$(jq -er '.result.id|select(type=="string")' "$RUNNER_TEMP/gateway-${label}-response.json")" || returned_domain=
+                  if test -n "$returned_domain" && valid_domain_id "$returned_domain"; then
+                    domain_identity_compatible "$RUNNER_TEMP/gateway-${label}-response.json" "$returned_domain" || return 2
+                    if domain_identity_ok "$RUNNER_TEMP/gateway-${label}-response.json" "$returned_domain"; then
+                      record_domain_ownership "$returned_domain" || return 2
+                      return 0
+                    fi
+                  else
+                    returned_domain=
+                  fi
+                fi
               fi
               if api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-${label}-domains.json" && domain_list_complete "$RUNNER_TEMP/gateway-${label}-domains.json" && api_get "$hostname_inventory_path" "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" && domain_list_complete "$RUNNER_TEMP/gateway-${label}-hostname-domains.json"; then
                 service_count="$(jq -er '.result|length' "$RUNNER_TEMP/gateway-${label}-domains.json")" || return 2
                 hostname_count="$(jq -er '.result|length' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json")" || return 2
                 if test "$service_count" = 0 && test "$hostname_count" = 0; then
                   :
-                elif test "$service_count" = 1 && test "$hostname_count" = 1; then
-                  observed_domain="$(jq -er '.result[0].id' "$RUNNER_TEMP/gateway-${label}-domains.json")" || return 2
-                  hostname_domain="$(jq -er '.result[0].id' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json")" || return 2
-                  valid_domain_id "$observed_domain" && test "$hostname_domain" = "$observed_domain" || return 2
-                  jq -e --arg id "$observed_domain" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s and .result[0].zone_name==$z and (.result[0].environment//"production")=="production"' "$RUNNER_TEMP/gateway-${label}-domains.json" >/dev/null || return 2
-                  jq -e --arg id "$observed_domain" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" >/dev/null || return 2
-                  api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$observed_domain" "$RUNNER_TEMP/gateway-${label}-domain.json" || return 2
-                  domain_ok "$RUNNER_TEMP/gateway-${label}-domain.json" "$observed_domain" || return 2
-                  printf '%s' "$observed_domain"
-                  return 0
                 else
-                  return 2
+                  test -n "$returned_domain" || return 2
+                  test "$service_count" -le 1 && test "$hostname_count" -le 1 || return 2
+                  observed_domain=
+                  hostname_domain=
+                  if test "$service_count" = 1; then
+                    observed_domain="$(jq -er '.result[0].id' "$RUNNER_TEMP/gateway-${label}-domains.json")" || return 2
+                    valid_domain_id "$observed_domain" || return 2
+                    jq -e --arg id "$observed_domain" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s and .result[0].zone_name==$z and (.result[0].environment//"production")=="production"' "$RUNNER_TEMP/gateway-${label}-domains.json" >/dev/null || return 2
+                  fi
+                  if test "$hostname_count" = 1; then
+                    hostname_domain="$(jq -er '.result[0].id' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json")" || return 2
+                    valid_domain_id "$hostname_domain" || return 2
+                    jq -e --arg id "$hostname_domain" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" >/dev/null || return 2
+                  fi
+                  if test -n "$observed_domain" && test -n "$hostname_domain" && test "$hostname_domain" != "$observed_domain"; then return 2; fi
+                  if test -n "$returned_domain" && { { test -n "$observed_domain" && test "$observed_domain" != "$returned_domain"; } || { test -n "$hostname_domain" && test "$hostname_domain" != "$returned_domain"; }; }; then return 2; fi
+                  if test "$service_count" = 1 && test "$hostname_count" = 1 && api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$observed_domain" "$RUNNER_TEMP/gateway-${label}-domain.json"; then
+                    domain_identity_compatible "$RUNNER_TEMP/gateway-${label}-domain.json" "$observed_domain" || return 2
+                    if domain_identity_ok "$RUNNER_TEMP/gateway-${label}-domain.json" "$observed_domain"; then
+                      record_domain_ownership "$observed_domain" || return 2
+                      return 0
+                    fi
+                  fi
                 fi
               fi
               bounded_sleep "$delay" || return 1
@@ -418,10 +463,10 @@ jobs:
                   wait_domain_absent "${label}-absent"
                   return $?
                 fi
-                if test "$domain_created_by_run" != true || ! valid_domain_id "$candidate_domain_id"; then return 2; fi
+                if test "$domain_created_by_run" != true || ! valid_domain_id "$candidate_domain_id"; then restore_domain_ownership || return 2; fi
                 if ! jq -e --arg id "$candidate_domain_id" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s and .result[0].zone_name==$z and (.result[0].environment//"production")=="production"' "$RUNNER_TEMP/gateway-${label}-domains.json" >/dev/null || ! jq -e --arg id "$candidate_domain_id" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" >/dev/null; then return 2; fi
                 observed_domain="$(jq -er '.result[0].id' "$RUNNER_TEMP/gateway-${label}-domains.json")" || return 2
-                if test "$observed_domain" != "$candidate_domain_id" || ! api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$observed_domain" "$RUNNER_TEMP/gateway-${label}-domain.json" || ! domain_ok "$RUNNER_TEMP/gateway-${label}-domain.json" "$observed_domain"; then return 2; fi
+                if test "$observed_domain" != "$candidate_domain_id" || ! api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$observed_domain" "$RUNNER_TEMP/gateway-${label}-domain.json" || ! domain_identity_ok "$RUNNER_TEMP/gateway-${label}-domain.json" "$observed_domain"; then return 2; fi
                 api_delete "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$observed_domain" "$RUNNER_TEMP/gateway-${label}-delete.json" || :
               fi
               bounded_sleep "$delay" || return 1
@@ -826,9 +871,9 @@ jobs:
             jq -e '(.result|length)==0' "$RUNNER_TEMP/gateway-domain-attach-hostname-preflight.json" >/dev/null
             jq -n --arg hostname "$GATEWAY_DOMAIN" --arg service "$GATEWAY_NAME" --arg zone_name "$GATEWAY_ZONE_NAME" '{hostname:$hostname,service:$service,zone_name:$zone_name}' > "$RUNNER_TEMP/gateway-domain-attach-body.json"
             domain_attach_attempted=true
-            candidate_domain_id="$(reconcile_domain_attach_response domain-attach)"
+            reconcile_domain_attach_response domain-attach
             valid_domain_id "$candidate_domain_id"
-            domain_created_by_run=true
+            test "$domain_created_by_run" = true
             test "$(wait_domain "$candidate_domain_id" post-attach)" = "$candidate_domain_id"
           fi
           wait_health "https://$GATEWAY_DOMAIN/healthz" live "$candidate_version_id"
