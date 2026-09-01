@@ -48,7 +48,10 @@ for (const required of [
   'deployment_ok "$RUNNER_TEMP/gateway-previous-deployment.json"',
   'deployment_ok "$RUNNER_TEMP/gateway-recheck-deployment.json"',
   'deployment_ok "$RUNNER_TEMP/gateway-post-deployment.json"',
-  'legacy_binding_ok()', 'known_settings_binding_ok()', 'legacy_contained_version_ok()', 'legacy_contained_previous=true', 'CF_VERSION_METADATA', 'type:"version_metadata"',
+  'binding_inventory_ok()', 'legacy_binding_ok()', 'settings_binding_ok()', 'legacy_settings_binding_ok()', 'known_settings_binding_ok()',
+  'legacy_contained_version_ok()', 'legacy_bootstrap_parent_ok()', 'legacy_secret_successor_ok()', 'legacy_successor_timestamp_ok()',
+  'legacy_bootstrap_sha=e864778adb9b38e266afb18c672661d0b85e8b67', 'legacy_bootstrap_version_id=48d208dd-f054-4c54-bf67-918e126c49e0',
+  'legacy_contained_previous=true', 'legacy_secret_successor_previous=true', 'CF_VERSION_METADATA', '.type=="version_metadata"',
   'rm -f -- "$RUNNER_TEMP/gateway-candidate.jsonl"',
   '[.[]|select(.type=="version-upload")] as $events|($events|length)==1',
   'candidate_secrets="$RUNNER_TEMP/gateway-candidate-secrets.json"', '--secrets-file "$candidate_secrets"',
@@ -168,7 +171,7 @@ const gatewayFailureStages = [
   'bootstrap-deploy', 'deployment-ids-validate', 'deployment-detail-get', 'deployment-detail-validate',
   'version-detail-get', 'version-detail-validate', 'secrets-get', 'secrets-validate', 'settings-get',
   'settings-observability', 'settings-bindings', 'subdomain-get', 'subdomain-validate', 'scripts-get',
-  'script-routes', 'active-version-bindings', 'bootstrap-domain-absence', 'domain-ready', 'live-health', 'preflight-secret-cleanup',
+  'script-routes', 'active-version-bindings', 'legacy-successor-parent-get', 'legacy-successor-validate', 'bootstrap-domain-absence', 'domain-ready', 'live-health', 'preflight-secret-cleanup',
   'candidate-upload', 'candidate-preview', 'promotion', 'ingress', 'final-attestation', 'unclassified',
 ];
 const reporterStart = workflow.indexOf('          report_gateway_failure_stage() {');
@@ -200,6 +203,8 @@ for (const [stage, command] of [
   ['bootstrap-staging', 'node -e \'const fs=require("node:fs");const secret=process.env.ALERT_HMAC_KEY'],
   ['deployment-ids-validate', 'valid_uuid "$previous_deployment_id"; valid_uuid "$previous_version_id"'],
   ['active-version-bindings', 'if binding_ok "$RUNNER_TEMP/gateway-previous.json"; then'],
+  ['legacy-successor-parent-get', 'versions/$legacy_bootstrap_version_id'],
+  ['legacy-successor-validate', 'legacy_secret_successor_ok "$RUNNER_TEMP/gateway-previous.json"'],
   ['domain-ready', 'test "$(wait_domain "$previous_domain_id" preflight-existing)" = "$previous_domain_id"'],
   ['live-health', 'wait_health "https://$GATEWAY_DOMAIN/healthz" preflight-live "$previous_version_id"'],
   ['preflight-secret-cleanup', 'if test -n "$bootstrap_secrets"; then rm -f -- "$bootstrap_secrets"'],
@@ -347,15 +352,14 @@ const reconcileDomainAttach = (attempts) => {
     const hostname = attempt.hostnameInventory;
     if (!Array.isArray(service) || !Array.isArray(hostname)) continue;
     if (service.length === 0 && hostname.length === 0) continue;
-    if (service.length === 1 && hostname.length === 1 && JSON.stringify(service[0]) === JSON.stringify(intendedDomain) && JSON.stringify(hostname[0]) === JSON.stringify(intendedDomain) && attempt.directDomainValid === true) continue;
+    if (service.length === 1 && hostname.length === 1 && JSON.stringify(service[0]) === JSON.stringify(intendedDomain) && JSON.stringify(hostname[0]) === JSON.stringify(intendedDomain) && attempt.directDomainValid === true) return { status: 'owned', id: intendedDomain.id };
     return { status: 'conflict' };
   }
   return { status: 'timeout' };
 };
 assert.deepEqual(reconcileDomainAttach([
   { put: { success: false }, serviceInventory: [intendedDomain], hostnameInventory: [intendedDomain], directDomainValid: true },
-  { put: { success: true, result: intendedDomain } },
-]), { status: 'owned', id: intendedDomain.id }, 'A committed PUT with a lost response must converge only through an identical retry that returns the authoritative immutable ID');
+]), { status: 'owned', id: intendedDomain.id }, 'A committed PUT with a lost response must converge from exact dual-inventory and direct-detail proof without another mutation');
 assert.deepEqual(reconcileDomainAttach([
   { put: { success: false }, serviceInventory: [], hostnameInventory: [] },
   { put: { success: true, result: intendedDomain } },
@@ -363,6 +367,16 @@ assert.deepEqual(reconcileDomainAttach([
 assert.deepEqual(reconcileDomainAttach([
   { put: { success: false }, serviceInventory: [intendedDomain], hostnameInventory: [{ ...intendedDomain, id: 'b'.repeat(32) }], directDomainValid: true },
 ]), { status: 'conflict' }, 'Conflicting service and hostname domain identities must fail closed');
+assert.deepEqual(reconcileDomainAttach([
+  { put: { success: false }, serviceInventory: [intendedDomain], hostnameInventory: [intendedDomain], directDomainValid: false },
+]), { status: 'conflict' }, 'A matching inventory without direct immutable-detail proof must fail closed');
+assert.deepEqual(reconcileDomainAttach([
+  { put: { success: false }, serviceInventory: [intendedDomain, intendedDomain], hostnameInventory: [intendedDomain], directDomainValid: true },
+]), { status: 'conflict' }, 'A duplicate service inventory must fail closed');
+const domainAttachFunction = workflow.split('          reconcile_domain_attach_response() {')[1].split('          reconcile_owned_domain_rollback() {')[0];
+const reconciledDomainProof = 'domain_ok "$RUNNER_TEMP/gateway-${label}-domain.json" "$observed_domain" || return 2';
+assert.ok(domainAttachFunction.indexOf(reconciledDomainProof) < domainAttachFunction.indexOf('printf \'%s\' "$observed_domain"', domainAttachFunction.indexOf(reconciledDomainProof)), 'Exact direct domain proof must precede returning the reconciled immutable ID');
+assert.ok(domainAttachFunction.indexOf('printf \'%s\' "$observed_domain"', domainAttachFunction.indexOf(reconciledDomainProof)) < domainAttachFunction.indexOf('return 0', domainAttachFunction.indexOf(reconciledDomainProof)), 'Read-after-write reconciliation must return success immediately after emitting the exact ID');
 const rollbackOrder = ({ domainPreexisting, domainAttempted, domainCleanupProven, domainAbsenceProven }) => {
   if (domainPreexisting) return ['traffic', 'previous-attestation'];
   if (domainAttempted && !domainCleanupProven) return ['leave-candidate'];
@@ -407,12 +421,116 @@ const mayAcceptLegacyContainedPrevious = ({ provenance, legacyBindings, serviceD
 assert.equal(mayAcceptLegacyContainedPrevious({ provenance: true, legacyBindings: true, serviceDomains: [], hostnameDomains: [], routes: [], subdomain: { enabled: false, previews_enabled: true } }), true);
 assert.equal(mayAcceptLegacyContainedPrevious({ provenance: false, legacyBindings: true, serviceDomains: [], hostnameDomains: [], routes: [], subdomain: { enabled: false, previews_enabled: true } }), false, 'Legacy binding upgrade requires contained-bootstrap provenance');
 assert.equal(mayAcceptLegacyContainedPrevious({ provenance: true, legacyBindings: true, serviceDomains: [{ id: 'public' }], hostnameDomains: [{ id: 'public' }], routes: [], subdomain: { enabled: false, previews_enabled: true } }), false, 'A public legacy predecessor must never bypass version metadata');
-const settingsBindingViewAccepted = (bindingNames) => [
-  ['ALERT_HMAC_KEY', 'ALERT_INGEST_RATE_LIMITER'],
-  ['ALERT_HMAC_KEY', 'ALERT_INGEST_RATE_LIMITER', 'CF_VERSION_METADATA'],
-].some((expected) => JSON.stringify([...bindingNames].sort()) === JSON.stringify(expected));
-assert.equal(settingsBindingViewAccepted(['ALERT_HMAC_KEY', 'ALERT_INGEST_RATE_LIMITER', 'CF_VERSION_METADATA']), true, 'Latest undeployed v2 settings must not deadlock rollback of an exact legacy active version');
-assert.equal(settingsBindingViewAccepted(['ALERT_HMAC_KEY', 'ALERT_INGEST_RATE_LIMITER', 'UNEXPECTED_BINDING']), false, 'Latest settings with an unexpected binding must fail closed');
+const sortedKeysEqual = (value, expected) => value !== null
+  && typeof value === 'object'
+  && !Array.isArray(value)
+  && JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort());
+const rateLimiterBindingAccepted = (binding) => sortedKeysEqual(binding, ['name', 'namespace_id', 'simple', 'type'])
+  && binding.name === 'ALERT_INGEST_RATE_LIMITER'
+  && binding.type === 'ratelimit'
+  && binding.namespace_id === '735104001'
+  && (sortedKeysEqual(binding.simple, ['limit', 'period']) || sortedKeysEqual(binding.simple, ['limit', 'period', 'mitigation_timeout']))
+  && binding.simple.limit === 60
+  && binding.simple.period === 60
+  && (!Object.hasOwn(binding.simple, 'mitigation_timeout') || (typeof binding.simple.mitigation_timeout === 'number' && binding.simple.mitigation_timeout === 0));
+const bindingInventoryAccepted = (payload, view, expectedCount) => {
+  const bindings = view === 'version' ? payload?.result?.resources?.bindings : view === 'settings' ? payload?.result?.bindings : null;
+  if (![1, 2, 3].includes(expectedCount) || !Array.isArray(bindings) || bindings.length !== expectedCount) return false;
+  const rateLimiters = bindings.filter(rateLimiterBindingAccepted);
+  const secrets = bindings.filter((binding) => binding?.name === 'ALERT_HMAC_KEY' && binding?.type === 'secret_text');
+  const metadata = bindings.filter((binding) => binding?.name === 'CF_VERSION_METADATA' && binding?.type === 'version_metadata');
+  return rateLimiters.length === 1
+    && secrets.length === (expectedCount >= 2 ? 1 : 0)
+    && metadata.length === (expectedCount === 3 ? 1 : 0);
+};
+const rateLimitBinding = { name: 'ALERT_INGEST_RATE_LIMITER', type: 'ratelimit', namespace_id: '735104001', simple: { limit: 60, period: 60 } };
+const normalizedRateLimitBinding = { type: 'ratelimit', simple: { mitigation_timeout: 0, period: 60, limit: 60 }, namespace_id: '735104001', name: 'ALERT_INGEST_RATE_LIMITER' };
+const secretBinding = { name: 'ALERT_HMAC_KEY', type: 'secret_text', provider_metadata: 'ignored' };
+const metadataBinding = { name: 'CF_VERSION_METADATA', type: 'version_metadata' };
+assert.equal(bindingInventoryAccepted({ result: { resources: { bindings: [normalizedRateLimitBinding, secretBinding] } } }, 'version', 2), true, 'Version details may normalize disabled mitigation_timeout to numeric zero');
+assert.equal(bindingInventoryAccepted({ result: { resources: { bindings: [secretBinding, metadataBinding, rateLimitBinding] } } }, 'version', 3), true, 'Current version details must retain exactly the three authorized bindings');
+assert.equal(bindingInventoryAccepted({ result: { bindings: [secretBinding, metadataBinding, rateLimitBinding] } }, 'settings', 3), true, 'Current settings must be read only from the settings binding path');
+assert.equal(bindingInventoryAccepted({ result: { bindings: [secretBinding, rateLimitBinding] } }, 'settings', 2), true, 'Legacy settings may contain only the authorized secret and rate limiter');
+assert.equal(bindingInventoryAccepted({ result: { bindings: [secretBinding, metadataBinding, rateLimitBinding] } }, 'version', 3), false, 'A version validator must not fall back to the settings path');
+assert.equal(bindingInventoryAccepted({ result: { resources: { bindings: [secretBinding, metadataBinding, rateLimitBinding] } } }, 'settings', 3), false, 'A settings validator must not fall back to the version path');
+for (const invalidTimeout of [10, null, '0', false, 0.5, -1]) {
+  assert.equal(bindingInventoryAccepted({ result: { resources: { bindings: [{ ...rateLimitBinding, simple: { ...rateLimitBinding.simple, mitigation_timeout: invalidTimeout } }, secretBinding] } } }, 'version', 2), false, `Invalid mitigation_timeout ${String(invalidTimeout)} must fail closed`);
+}
+assert.equal(bindingInventoryAccepted({ result: { resources: { bindings: [{ ...rateLimitBinding, unexpected: true }, secretBinding] } } }, 'version', 2), false, 'Unknown rate-limiter fields must fail closed');
+assert.equal(bindingInventoryAccepted({ result: { resources: { bindings: [{ ...rateLimitBinding, simple: { ...rateLimitBinding.simple, unexpected: 0 } }, secretBinding] } } }, 'version', 2), false, 'Unknown rate-limiter behavior fields must fail closed');
+assert.equal(bindingInventoryAccepted({ result: { resources: { bindings: [{ ...rateLimitBinding, namespace_id: 'wrong' }, secretBinding] } } }, 'version', 2), false, 'A different rate-limit namespace must fail closed');
+assert.equal(bindingInventoryAccepted({ result: { resources: { bindings: [rateLimitBinding, secretBinding, { name: 'EXTRA', type: 'plain_text' }] } } }, 'version', 2), false, 'An additional binding must fail closed');
+assert.equal(bindingInventoryAccepted({ result: { resources: { bindings: [rateLimitBinding, secretBinding, secretBinding] } } }, 'version', 3), false, 'A duplicate secret cannot substitute for version metadata');
+const bindingInventoryFunction = workflow.split('          binding_inventory_ok() {')[1].split('          binding_ok() {')[0];
+assert.ok(bindingInventoryFunction.includes('if $view=="version" then .result.resources.bindings elif $view=="settings" then .result.bindings else null end'), 'Binding validation must select the documented response path explicitly');
+assert.doesNotMatch(bindingInventoryFunction, /resources\.bindings\/\//, 'Malformed or missing version bindings must not be defaulted');
+
+const legacyBootstrapSha = 'e864778adb9b38e266afb18c672661d0b85e8b67';
+const legacyBootstrapVersionId = '48d208dd-f054-4c54-bf67-918e126c49e0';
+const legacyActiveVersionId = '9b7ef3f4-1111-2222-3333-444444444444';
+const cloneJson = (value) => JSON.parse(JSON.stringify(value));
+const legacyParent = {
+  result: {
+    id: legacyBootstrapVersionId,
+    number: 7,
+    annotations: { 'workers/tag': legacyBootstrapSha, 'workers/message': `contained bootstrap ${legacyBootstrapSha}` },
+    metadata: { created_on: '2026-09-01T17:43:58.706Z', source: 'wrangler' },
+    resources: { script: { etag: 'same-code-etag' }, bindings: [rateLimitBinding] },
+  },
+};
+const legacySuccessor = {
+  result: {
+    id: legacyActiveVersionId,
+    number: 8,
+    metadata: { created_on: '2026-09-01T17:44:00.239Z', source: 'unknown' },
+    resources: { script: { etag: 'same-code-etag' }, bindings: [normalizedRateLimitBinding, secretBinding] },
+  },
+};
+const legacyBootstrapParentAccepted = (parent) => {
+  const result = parent?.result;
+  const annotations = [result?.annotations, result?.metadata?.annotations].filter((value) => value !== null && value !== undefined);
+  return result?.id === legacyBootstrapVersionId
+    && annotations.length >= 1
+    && annotations.every((value) => value?.['workers/tag'] === legacyBootstrapSha && value?.['workers/message'] === `contained bootstrap ${legacyBootstrapSha}`)
+    && Number.isSafeInteger(result?.number) && result.number > 0
+    && typeof result?.metadata?.created_on === 'string'
+    && typeof result?.resources?.script?.etag === 'string' && result.resources.script.etag.length > 0
+    && bindingInventoryAccepted(parent, 'version', 1);
+};
+const legacySecretSuccessorAccepted = (active, parent, activeId) => {
+  const parentResult = parent?.result;
+  const activeResult = active?.result;
+  const parentCreated = Date.parse(parentResult?.metadata?.created_on);
+  const activeCreated = Date.parse(activeResult?.metadata?.created_on);
+  return legacyBootstrapParentAccepted(parent)
+    && bindingInventoryAccepted(active, 'version', 2)
+    && activeResult?.id === activeId
+    && activeResult.id !== legacyBootstrapVersionId
+    && Number.isSafeInteger(activeResult?.number)
+    && activeResult.number === parentResult.number + 1
+    && typeof activeResult?.resources?.script?.etag === 'string' && activeResult.resources.script.etag.length > 0
+    && activeResult.resources.script.etag === parentResult.resources.script.etag
+    && Number.isFinite(parentCreated) && Number.isFinite(activeCreated)
+    && activeCreated > parentCreated && activeCreated - parentCreated <= 600_000;
+};
+assert.equal(legacySecretSuccessorAccepted(legacySuccessor, legacyParent, legacyActiveVersionId), true, 'The exact immediate code-identical secret successor must pass without depending on optional source metadata');
+for (const [label, mutate] of [
+  ['wrong parent id', (active, parent) => { parent.result.id = 'wrong'; }],
+  ['wrong parent tag', (active, parent) => { parent.result.annotations['workers/tag'] = 'f'.repeat(40); }],
+  ['conflicting parent annotations', (active, parent) => { parent.result.metadata.annotations = { 'workers/tag': 'f'.repeat(40), 'workers/message': 'wrong' }; }],
+  ['non-adjacent number', (active) => { active.result.number += 1; }],
+  ['different script', (active) => { active.result.resources.script.etag = 'different'; }],
+  ['late successor', (active) => { active.result.metadata.created_on = '2026-09-01T18:00:00Z'; }],
+  ['invalid timestamp', (active) => { active.result.metadata.created_on = 'invalid'; }],
+  ['extra binding', (active) => { active.result.resources.bindings.push({ name: 'EXTRA', type: 'plain_text' }); }],
+]) {
+  const active = cloneJson(legacySuccessor);
+  const parent = cloneJson(legacyParent);
+  mutate(active, parent);
+  assert.equal(legacySecretSuccessorAccepted(active, parent, legacyActiveVersionId), false, `Legacy successor with ${label} must fail closed`);
+}
+assert.equal(legacySecretSuccessorAccepted(legacySuccessor, legacyParent, 'different-active-id'), false, 'The fallback must bind to the exact active deployment version ID');
+assert.doesNotMatch(workflow.split('          legacy_secret_successor_ok() {')[1].split('          candidate_version_ok() {')[0], /metadata\.source/, 'Optional provider source metadata must not become a brittle authorization gate');
 
 const domainInventoryComplete = (payload) => {
   const { result, result_info: info } = payload;
