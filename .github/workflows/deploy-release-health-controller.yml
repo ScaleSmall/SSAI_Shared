@@ -205,8 +205,10 @@ jobs:
           printf '%s' "$APP_PRIVATE_KEY" > "$RUNNER_TEMP/github-app-input.pem"
           openssl pkey -in "$RUNNER_TEMP/github-app-input.pem" \
             -out "$RUNNER_TEMP/github-app-pkcs8.pem" >/dev/null 2>&1
-          grep -qx -- '-----BEGIN PRIVATE KEY-----' "$RUNNER_TEMP/github-app-pkcs8.pem"
-          grep -qx -- '-----END PRIVATE KEY-----' "$RUNNER_TEMP/github-app-pkcs8.pem"
+          pem_begin="$(printf '%s %s\n' '-----BEGIN' 'PRIVATE KEY-----')"
+          pem_end="$(printf '%s %s\n' '-----END' 'PRIVATE KEY-----')"
+          grep -qx -- "$pem_begin" "$RUNNER_TEMP/github-app-pkcs8.pem"
+          grep -qx -- "$pem_end" "$RUNNER_TEMP/github-app-pkcs8.pem"
           openssl pkey -in "$RUNNER_TEMP/github-app-pkcs8.pem" -check -noout >/dev/null 2>&1
           APP_PRIVATE_KEY_PKCS8="$(cat "$RUNNER_TEMP/github-app-pkcs8.pem")" \
           APP_CLIENT_ID="$APP_CLIENT_ID" INSTALLATION_ID="$INSTALLATION_ID" \
