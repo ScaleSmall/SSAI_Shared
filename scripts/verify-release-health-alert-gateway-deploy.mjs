@@ -765,9 +765,9 @@ assert.equal(exactNormalIngress({ domains: [exactDomain], hostnameDomains: [exac
 assert.equal(exactNormalIngress({ domains: [exactDomain], hostnameDomains: [exactDomain], subdomain: safeSubdomain }), false, 'Missing ordinary-route evidence must fail closed');
 
 if (process.platform !== 'win32') {
-  const shellStart = workflow.indexOf('          valid_domain_id() {');
+  const shellStart = workflow.indexOf('          valid_uuid() {');
   const shellEnd = workflow.indexOf('          contain_bootstrap() {', shellStart);
-  assert.ok(shellStart >= 0 && shellEnd > shellStart, 'The exact domain reconciliation functions must be extractable for Bash state-machine tests');
+  assert.ok(shellStart >= 0 && shellEnd > shellStart, 'The exact domain validators and reconciliation functions must be extractable for Bash state-machine tests');
   const domainFunctions = workflow.slice(shellStart, shellEnd).split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n');
   const bashHarness = String.raw`set -Eeuo pipefail
 ${domainFunctions}
