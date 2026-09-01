@@ -124,6 +124,20 @@ export class ReleaseHealthSlotLedger {
         created_at_ms INTEGER NOT NULL,
         updated_at_ms INTEGER NOT NULL
       )`);
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS controller_runtime(
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+        scheduled_time_ms INTEGER NOT NULL,
+        completed_at_ms INTEGER NOT NULL,
+        source_digest TEXT NOT NULL,
+        profile_digest TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        failure_class TEXT,
+        CHECK(completed_at_ms>=scheduled_time_ms),
+        CHECK(failure_class IS NULL OR failure_class IN (
+          'provider-evidence','transport','rate-limit','dispatch-unknown','circuit-open',
+          'configuration','internal','prepared-expired'
+        ))
+      )`);
     });
   }
 
@@ -875,6 +889,100 @@ export class ReleaseHealthSlotLedger {
        FROM slots WHERE phase IN ('leased','prepared') ORDER BY slot ASC LIMIT ?`,
       limit,
     ).map((row) => Object.freeze({ ...row }));
+  }
+
+  async recordCompletedTick({
+    scheduledTime,
+    completedAt,
+    sourceDigest,
+    profileDigest,
+    decision,
+    failureClass = null,
+  }) {
+    exactNow(scheduledTime);
+    exactNow(completedAt);
+    if (completedAt < scheduledTime) throw new Error('Controller completion time is invalid.');
+    digest(sourceDigest, 'Controller source digest');
+    digest(profileDigest, 'Controller profile digest');
+    if (
+      !/^[a-z][a-z0-9_-]{2,47}$/.test(String(decision ?? ''))
+      || (failureClass !== null && ![
+        'provider-evidence', 'transport', 'rate-limit', 'dispatch-unknown', 'circuit-open',
+        'configuration', 'internal', 'prepared-expired',
+      ].includes(failureClass))
+    ) throw new Error('Controller completion result is invalid.');
+    return this.serialize(async () => this.state.storage.transactionSync(() => {
+      const current = rows(
+        this.sql,
+        'SELECT scheduled_time_ms,completed_at_ms FROM controller_runtime WHERE singleton=1',
+      )[0];
+      if (
+        current
+        && (scheduledTime < current.scheduled_time_ms
+          || (scheduledTime === current.scheduled_time_ms && completedAt < current.completed_at_ms))
+      ) return false;
+      this.sql.exec(
+        `INSERT INTO controller_runtime(
+          singleton,scheduled_time_ms,completed_at_ms,source_digest,profile_digest,decision,failure_class
+        ) VALUES(1,?,?,?,?,?,?)
+        ON CONFLICT(singleton) DO UPDATE SET
+          scheduled_time_ms=excluded.scheduled_time_ms,
+          completed_at_ms=excluded.completed_at_ms,
+          source_digest=excluded.source_digest,
+          profile_digest=excluded.profile_digest,
+          decision=excluded.decision,
+          failure_class=excluded.failure_class`,
+        scheduledTime,
+        completedAt,
+        sourceDigest,
+        profileDigest,
+        decision,
+        failureClass,
+      );
+      return true;
+    }));
+  }
+
+  async healthStatus(nowMs, sourceDigest, profileDigest, staleAfterMs) {
+    exactNow(nowMs);
+    digest(sourceDigest, 'Controller source digest');
+    digest(profileDigest, 'Controller profile digest');
+    if (!Number.isSafeInteger(staleAfterMs) || staleAfterMs < 60_000 || staleAfterMs > 900_000) {
+      throw new Error('Controller health staleness policy is invalid.');
+    }
+    const runtime = rows(this.sql, 'SELECT * FROM controller_runtime WHERE singleton=1')[0] || null;
+    const alertCounts = rows(
+      this.sql,
+      `SELECT
+        SUM(CASE WHEN state IN ('pending','sending') THEN 1 ELSE 0 END) AS pending,
+        SUM(CASE WHEN state='dead' THEN 1 ELSE 0 END) AS dead
+       FROM alert_outbox`,
+    )[0] || { pending: 0, dead: 0 };
+    const generationMatches = Boolean(
+      runtime
+      && runtime.source_digest === sourceDigest
+      && runtime.profile_digest === profileDigest,
+    );
+    const fresh = Boolean(
+      generationMatches
+      && runtime.completed_at_ms <= nowMs + 60_000
+      && nowMs - runtime.completed_at_ms <= staleAfterMs,
+    );
+    const terminalFailure = Boolean(generationMatches && runtime.failure_class !== null);
+    const internalFailure = Boolean(generationMatches && runtime.failure_class === 'internal');
+    const pending = Number(alertCounts.pending || 0);
+    const dead = Number(alertCounts.dead || 0);
+    return Object.freeze({
+      healthy: fresh && !terminalFailure && dead === 0,
+      fresh,
+      terminal_failure: terminalFailure,
+      internal_failure: internalFailure,
+      last_completed_tick_ms: runtime?.completed_at_ms ?? null,
+      last_decision: generationMatches ? runtime.decision : null,
+      last_scheduled_time_ms: runtime?.scheduled_time_ms ?? null,
+      pending_alerts: pending,
+      dead_alerts: dead,
+    });
   }
 
   async claimAlerts(nowMs, limit = 3, leaseMs = 30_000) {

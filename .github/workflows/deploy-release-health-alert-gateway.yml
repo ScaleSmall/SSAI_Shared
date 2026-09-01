@@ -1,0 +1,165 @@
+name: Deploy release-health alert gateway
+run-name: Release-health alert gateway candidate at ${{ inputs.expected_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha: { description: Exact protected main commit, required: true, type: string }
+      expected_config_sha256: { description: LF-normalized gateway config SHA-256, required: true, type: string }
+      expected_source_sha256: { description: Exact gateway source digest, required: true, type: string }
+      allow_first_bootstrap: { description: Permit contained first creation, required: true, default: false, type: boolean }
+
+permissions:
+  contents: read
+concurrency:
+  group: release-health-alert-gateway-production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.repository == 'ScaleSmall/SSAI_Shared' && github.repository_id == '1183552904' &&
+      github.ref == 'refs/heads/main' && github.ref_protected == true &&
+      github.sha == inputs.expected_sha && github.workflow_sha == inputs.expected_sha && github.run_attempt == 1
+    environment:
+      name: release-health-controller-production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      GATEWAY_CONFIG: workers/release-health-alert-gateway/wrangler.jsonc
+      GATEWAY_NAME: ssai-release-health-alert-gateway
+      GATEWAY_DOMAIN: alerts.scalesmall.ai
+      RATE_LIMITER_NAMESPACE_ID: '735104001'
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        with: { ref: '${{ inputs.expected_sha }}', persist-credentials: false }
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with: { node-version: '24' }
+      - name: Verify exact protected identity and contracts
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          SSAI_EXPECTED_ALERT_GATEWAY_CONFIG_SHA256: ${{ inputs.expected_config_sha256 }}
+          SSAI_EXPECTED_ALERT_GATEWAY_SOURCE_SHA256: ${{ inputs.expected_source_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ ]]
+          test "$GITHUB_REPOSITORY" = ScaleSmall/SSAI_Shared
+          test "$GITHUB_REPOSITORY_ID" = 1183552904
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_SHA" = "$EXPECTED_SHA"
+          test '${{ github.workflow_sha }}' = "$EXPECTED_SHA"
+          test '${{ github.ref_protected }}' = true
+          test '${{ github.run_attempt }}' = 1
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          git diff --exit-code
+          test -z "$(git status --porcelain --untracked-files=all)"
+          npm ci
+          node scripts/verify-release-health-alert-gateway.mjs
+          node scripts/verify-release-health-alert-gateway-deploy.mjs
+          node -e "if(require('./node_modules/wrangler/package.json').version!=='4.127.1')process.exit(1)"
+      - name: Dry-run immutable candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./node_modules/.bin/wrangler versions upload --config "$GATEWAY_CONFIG" --name "$GATEWAY_NAME" \
+            --preview-alias "c-${GITHUB_SHA:0:12}" --tag "$GITHUB_SHA" --message "candidate ${GITHUB_SHA}" \
+            --strict --dry-run --outdir "$RUNNER_TEMP/gateway-dry-run" >/dev/null
+      - name: Candidate-first deploy, attestation, promotion, and rollback
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+          ALERT_HMAC_KEY: ${{ secrets.SSAI_RELEASE_CONTROLLER_ALERT_SIGNING_KEY }}
+          EXPECTED_CONFIG_SHA256: ${{ inputs.expected_config_sha256 }}
+          EXPECTED_SOURCE_SHA256: ${{ inputs.expected_source_sha256 }}
+          ALLOW_FIRST_BOOTSTRAP: ${{ inputs.allow_first_bootstrap }}
+        run: |
+          set -euo pipefail
+          umask 077
+          api=https://api.cloudflare.com/client/v4
+          alias="c-${GITHUB_SHA:0:12}"
+          message="release-health-alert-gateway ${GITHUB_SHA} config=${EXPECTED_CONFIG_SHA256} source=${EXPECTED_SOURCE_SHA256}"
+          previous_version_id= candidate_version_id= traffic_mutated=false bootstrap=false
+          api_get() { curl --fail --silent --show-error --max-time 20 --proto '=https' -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api/$1" -o "$2"; jq -e '.success==true' "$2" >/dev/null; }
+          sole_version() { jq -r '[(.result.deployments//.result//[])[]]|sort_by(.created_on)|last|select((.versions|length)==1 and .versions[0].percentage==100)|.versions[0].version_id//empty' "$1"; }
+          binding_ok() { jq -e --arg ns "$RATE_LIMITER_NAMESPACE_ID" '((.result.resources.bindings//.result.bindings//[])|length)==2 and any((.result.resources.bindings//.result.bindings//[])[];.=={name:"ALERT_INGEST_RATE_LIMITER",type:"ratelimit",namespace_id:$ns,simple:{limit:60,period:60}}) and any((.result.resources.bindings//.result.bindings//[])[];.name=="ALERT_HMAC_KEY" and .type=="secret_text")' "$1" >/dev/null; }
+          finish() {
+            rc=$?
+            if test "$rc" -ne 0 && test "$traffic_mutated" = true; then
+              test -n "$previous_version_id" || exit 97
+              ./node_modules/.bin/wrangler versions deploy "${previous_version_id}@100%" --config "$GATEWAY_CONFIG" --name "$GATEWAY_NAME" --message "automatic rollback after ${GITHUB_SHA}" --yes
+              api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-rollback.json"
+              test "$(sole_version "$RUNNER_TEMP/gateway-rollback.json")" = "$previous_version_id" || exit 98
+            fi
+            rm -rf -- "$RUNNER_TEMP/gateway-dry-run" "$RUNNER_TEMP/gateway-bootstrap.jsonc"
+            rm -f -- "$RUNNER_TEMP"/gateway-*.json "$RUNNER_TEMP"/gateway-*.jsonl "$RUNNER_TEMP"/gateway-*.headers
+            exit "$rc"
+          }
+          trap finish EXIT
+          [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[a-f0-9]{32}$ ]]; test "${#CLOUDFLARE_API_TOKEN}" -ge 20
+          node -e "const v=process.env.ALERT_HMAC_KEY;if(!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(v||'')||Buffer.from(v,'base64').length<32||Buffer.from(v,'base64').length>128||Buffer.from(v,'base64').toString('base64')!==v)process.exit(1)"
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID" "$RUNNER_TEMP/gateway-account.json"
+          jq -e --arg id "$CLOUDFLARE_ACCOUNT_ID" '.result.id==$id' "$RUNNER_TEMP/gateway-account.json" >/dev/null
+          code="$(curl --silent --show-error --max-time 20 --proto '=https' -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" --write-out '%{http_code}' "$api/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" -o "$RUNNER_TEMP/gateway-preflight.json")"
+          if test "$code" = 200; then
+            jq -e '.success==true' "$RUNNER_TEMP/gateway-preflight.json" >/dev/null
+            previous_version_id="$(sole_version "$RUNNER_TEMP/gateway-preflight.json")"; [[ "$previous_version_id" =~ ^[a-f0-9-]{36}$ ]]
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/versions/$previous_version_id" "$RUNNER_TEMP/gateway-previous.json"
+            jq -e --arg id "$previous_version_id" '.result.id==$id' "$RUNNER_TEMP/gateway-previous.json" >/dev/null
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/secrets" "$RUNNER_TEMP/gateway-secrets.json"
+            jq -e '[.result[]|select(.name=="ALERT_HMAC_KEY" and .type=="secret_text")]|length==1 and (.result|length)==1' "$RUNNER_TEMP/gateway-secrets.json" >/dev/null
+          elif test "$code" = 404; then
+            test "$ALLOW_FIRST_BOOTSTRAP" = true; bootstrap=true
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" "$RUNNER_TEMP/gateway-domains.json"
+            jq -e --arg h "$GATEWAY_DOMAIN" '[.result[]|select(.hostname==$h)]|length==0' "$RUNNER_TEMP/gateway-domains.json" >/dev/null
+            jq '.routes=[]' "$GATEWAY_CONFIG" > "$RUNNER_TEMP/gateway-bootstrap.jsonc"
+            ./node_modules/.bin/wrangler deploy --config "$RUNNER_TEMP/gateway-bootstrap.jsonc" --name "$GATEWAY_NAME" --message "contained bootstrap ${GITHUB_SHA}" --tag "$GITHUB_SHA"
+            printf '%s' "$ALERT_HMAC_KEY" | ./node_modules/.bin/wrangler secret put ALERT_HMAC_KEY --config "$RUNNER_TEMP/gateway-bootstrap.jsonc" --name "$GATEWAY_NAME"
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-preflight.json"
+            previous_version_id="$(sole_version "$RUNNER_TEMP/gateway-preflight.json")"; [[ "$previous_version_id" =~ ^[a-f0-9-]{36}$ ]]
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" "$RUNNER_TEMP/gateway-domains.json"
+            jq -e --arg h "$GATEWAY_DOMAIN" '[.result[]|select(.hostname==$h)]|length==0' "$RUNNER_TEMP/gateway-domains.json" >/dev/null
+          else exit 41; fi
+          upload_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          WRANGLER_OUTPUT_FILE_PATH="$RUNNER_TEMP/gateway-candidate.jsonl" ./node_modules/.bin/wrangler versions upload --config "$GATEWAY_CONFIG" --name "$GATEWAY_NAME" --preview-alias "$alias" --tag "$GITHUB_SHA" --message "$message" --strict
+          candidate_version_id="$(jq -rs '[.[]|select(.type=="version-upload")]|last|.version_id//empty' "$RUNNER_TEMP/gateway-candidate.jsonl")"
+          preview_url="$(jq -rs '[.[]|select(.type=="version-upload")]|last|.preview_alias_url//empty' "$RUNNER_TEMP/gateway-candidate.jsonl")"
+          [[ "$candidate_version_id" =~ ^[a-f0-9-]{36}$ ]]; test "$candidate_version_id" != "$previous_version_id"
+          preview_host="$(node -e "const u=new URL(process.argv[1]);if(u.protocol!=='https:'||u.pathname!=='/'||u.search||u.hash)process.exit(1);process.stdout.write(u.hostname)" "$preview_url")"
+          [[ "$preview_host" =~ ^${alias}-${GATEWAY_NAME}\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev$ ]]
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/versions/$candidate_version_id" "$RUNNER_TEMP/gateway-candidate-version.json"
+          jq -e --arg id "$candidate_version_id" --arg sha "$GITHUB_SHA" --arg msg "$message" --arg a "$alias" --arg started "$upload_started" '.result.id==$id and .result.metadata.created_on>=$started and .result.metadata.has_preview==true and .result.annotations["workers/tag"]==$sha and .result.annotations["workers/message"]==$msg and .result.annotations["workers/alias"]==$a' "$RUNNER_TEMP/gateway-candidate-version.json" >/dev/null
+          binding_ok "$RUNNER_TEMP/gateway-candidate-version.json"
+          status="$(curl --silent --show-error --max-time 15 --max-filesize 1024 --proto '=https' --dump-header "$RUNNER_TEMP/gateway-preview.headers" --write-out '%{http_code}' -H "X-SSAI-Preview-Health-Host: $preview_host" "$preview_url/healthz" -o "$RUNNER_TEMP/gateway-preview.json")"
+          test "$status" = 200; test "$(wc -c < "$RUNNER_TEMP/gateway-preview.headers")" -le 8192
+          jq -e 'keys==["component","schema","status"] and .schema=="ssai-release-health-alert-gateway-health-v1" and .status=="healthy"' "$RUNNER_TEMP/gateway-preview.json" >/dev/null
+          ! tr -d '\r' < "$RUNNER_TEMP/gateway-preview.headers" | grep -Eiq '^(location|set-cookie):'
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-recheck.json"
+          test "$(sole_version "$RUNNER_TEMP/gateway-recheck.json")" = "$previous_version_id"
+          ! jq -e --arg c "$candidate_version_id" 'any((.result.deployments//.result//[])[].versions[]?;.version_id==$c)' "$RUNNER_TEMP/gateway-recheck.json" >/dev/null
+          promoted="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          traffic_mutated=true
+          ./node_modules/.bin/wrangler versions deploy "${candidate_version_id}@100%" --config "$GATEWAY_CONFIG" --name "$GATEWAY_NAME" --message "promote ${GITHUB_SHA}" --yes
+          ./node_modules/.bin/wrangler triggers deploy --config "$GATEWAY_CONFIG" --name "$GATEWAY_NAME"
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-post.json"
+          test "$(sole_version "$RUNNER_TEMP/gateway-post.json")" = "$candidate_version_id"
+          jq -e --arg t "$promoted" '[(.result.deployments//.result//[])[]]|sort_by(.created_on)|last|.created_on >= $t' "$RUNNER_TEMP/gateway-post.json" >/dev/null
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" "$RUNNER_TEMP/gateway-domains.json"
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/settings" "$RUNNER_TEMP/gateway-settings.json"
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/secrets" "$RUNNER_TEMP/gateway-secrets.json"
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/subdomain" "$RUNNER_TEMP/gateway-subdomain.json"
+          jq -e --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '[.result[]|select(.hostname==$h and .service==$s and .environment=="production")]|length==1' "$RUNNER_TEMP/gateway-domains.json" >/dev/null
+          jq -e --arg ns "$RATE_LIMITER_NAMESPACE_ID" '(.result.bindings|length)==2 and any(.result.bindings[];.=={name:"ALERT_INGEST_RATE_LIMITER",type:"ratelimit",namespace_id:$ns,simple:{limit:60,period:60}}) and any(.result.bindings[];.name=="ALERT_HMAC_KEY" and .type=="secret_text")' "$RUNNER_TEMP/gateway-settings.json" >/dev/null
+          jq -e '[.result[]|select(.name=="ALERT_HMAC_KEY" and .type=="secret_text")]|length==1 and (.result|length)==1' "$RUNNER_TEMP/gateway-secrets.json" >/dev/null
+          jq -e '.result.enabled==false and .result.previews_enabled==true' "$RUNNER_TEMP/gateway-subdomain.json" >/dev/null
+          status="$(curl --silent --show-error --max-time 15 --max-filesize 1024 --proto '=https' --dump-header "$RUNNER_TEMP/gateway-live.headers" --write-out '%{http_code}' https://alerts.scalesmall.ai/healthz -o "$RUNNER_TEMP/gateway-live.json")"
+          test "$status" = 200; test "$(wc -c < "$RUNNER_TEMP/gateway-live.headers")" -le 8192
+          jq -e 'keys==["component","schema","status"] and .schema=="ssai-release-health-alert-gateway-health-v1" and .component=="release-health-alert-gateway" and .status=="healthy"' "$RUNNER_TEMP/gateway-live.json" >/dev/null
+          tr -d '\r' < "$RUNNER_TEMP/gateway-live.headers" | grep -Eiq '^content-type:[[:space:]]*application/json;[[:space:]]*charset=utf-8'
+          tr -d '\r' < "$RUNNER_TEMP/gateway-live.headers" | grep -Eiq '^cache-control:.*no-store'
+          tr -d '\r' < "$RUNNER_TEMP/gateway-live.headers" | grep -Eiq '^x-content-type-options:[[:space:]]*nosniff'; ! tr -d '\r' < "$RUNNER_TEMP/gateway-live.headers" | grep -Eiq '^(location|set-cookie):'
+          jq -n --arg sha "$GITHUB_SHA" --arg version "$candidate_version_id" --arg previous "$previous_version_id" --arg config "$EXPECTED_CONFIG_SHA256" --arg source "$EXPECTED_SOURCE_SHA256" --argjson bootstrap "$bootstrap" '{schema:"ssai-release-health-alert-gateway-deployment-evidence-v2",commit_sha:$sha,candidate_version_id:$version,previous_version_id:$previous,config_sha256:$config,source_sha256:$source,first_bootstrap:$bootstrap,traffic_percent:100,health:"healthy",rate_limit_namespace:"735104001",expected_secret_names:["ALERT_HMAC_KEY"],rollback_armed:true}' > "$RUNNER_TEMP/gateway-evidence.json"
+          jq -c . "$RUNNER_TEMP/gateway-evidence.json"; { echo '### Gateway deployment evidence'; echo '```json'; jq . "$RUNNER_TEMP/gateway-evidence.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          traffic_mutated=false

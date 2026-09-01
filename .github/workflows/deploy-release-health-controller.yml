@@ -1,0 +1,769 @@
+name: Deploy release-health controller
+run-name: Release-health controller ${{ inputs.operation }} at ${{ inputs.expected_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Exact protected operation
+        required: true
+        type: choice
+        options: [deploy-observe, deploy-active, rollback-observe]
+      expected_sha:
+        description: Exact protected main commit to execute
+        required: true
+        type: string
+      expected_config_sha256:
+        description: LF-normalized SHA-256 of checked-in wrangler.jsonc
+        required: true
+        type: string
+      expected_target_source_sha256:
+        description: Controller source digest expected after the operation
+        required: true
+        type: string
+      expected_target_profile_sha256:
+        description: Activation-profile digest expected after the operation
+        required: true
+        type: string
+      bootstrap:
+        description: First deployment only; requires official proof of no Worker history or traffic
+        required: true
+        default: false
+        type: boolean
+      rollback_version_id:
+        description: Exact attested known-good observe Cloudflare version UUID
+        required: false
+        type: string
+      rollback_source_sha256:
+        description: Source digest attested by the rollback observe version
+        required: false
+        type: string
+      rollback_profile_sha256:
+        description: Profile digest attested by the rollback observe version
+        required: false
+        type: string
+      rollback_config_sha256:
+        description: Config digest attested by the rollback observe version
+        required: false
+        type: string
+      rollback_attestation_sha:
+        description: Protected main SHA recorded on the rollback observe version
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-health-controller-production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Verify and apply exact controller operation
+    if: >-
+      github.repository == 'ScaleSmall/SSAI_Shared' &&
+      github.repository_id == '1183552904' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_protected == true &&
+      github.sha == inputs.expected_sha &&
+      github.workflow_sha == inputs.expected_sha
+    environment:
+      name: release-health-controller-production
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      CONTROLLER_CONFIG: workers/release-health-controller/wrangler.jsonc
+      CONTROLLER_NAME: ssai-release-health-controller
+      CONTROLLER_HEALTH_URL: https://release-health-controller.scalesmall.ai/healthz
+      ALERT_HEALTH_URL: https://alerts.scalesmall.ai/healthz
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
+        with:
+          ref: ${{ inputs.expected_sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24'
+
+      - name: Verify exact protected execution identity
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          OPERATION: ${{ inputs.operation }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+          ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
+          ROLLBACK_SOURCE: ${{ inputs.rollback_source_sha256 }}
+          ROLLBACK_PROFILE: ${{ inputs.rollback_profile_sha256 }}
+          ROLLBACK_CONFIG: ${{ inputs.rollback_config_sha256 }}
+          ROLLBACK_ATTESTATION_SHA: ${{ inputs.rollback_attestation_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'ScaleSmall/SSAI_Shared'
+          test "$GITHUB_REPOSITORY_ID" = '1183552904'
+          test "$GITHUB_REF" = 'refs/heads/main'
+          test "$GITHUB_SHA" = "$EXPECTED_SHA"
+          test '${{ github.workflow_sha }}' = "$EXPECTED_SHA"
+          test '${{ github.ref_protected }}' = 'true'
+          test '${{ github.run_attempt }}' = '1'
+          git diff --exit-code
+          case "$OPERATION" in deploy-observe|deploy-active|rollback-observe) ;; *) exit 1 ;; esac
+          if test "$BOOTSTRAP" = true; then
+            test "$OPERATION" = deploy-observe
+            test -z "$ROLLBACK_VERSION_ID$ROLLBACK_SOURCE$ROLLBACK_PROFILE$ROLLBACK_CONFIG$ROLLBACK_ATTESTATION_SHA"
+          else
+            [[ "$ROLLBACK_VERSION_ID" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$ ]]
+            [[ "$ROLLBACK_SOURCE" =~ ^[a-f0-9]{64}$ ]]
+            [[ "$ROLLBACK_PROFILE" =~ ^[a-f0-9]{64}$ ]]
+            [[ "$ROLLBACK_CONFIG" =~ ^[a-f0-9]{64}$ ]]
+            [[ "$ROLLBACK_ATTESTATION_SHA" =~ ^[a-f0-9]{40}$ ]]
+          fi
+          if test "$OPERATION" = rollback-observe; then
+            test "$ROLLBACK_SOURCE" = '${{ inputs.expected_target_source_sha256 }}'
+            test "$ROLLBACK_PROFILE" = '${{ inputs.expected_target_profile_sha256 }}'
+          fi
+
+      - name: Install exact locked toolchain
+        run: npm ci
+
+      - name: Verify exact source and deployment contracts
+        env:
+          SSAI_EXPECTED_CONTROLLER_CONFIG_SHA256: ${{ inputs.expected_config_sha256 }}
+          SSAI_EXPECTED_CONTROLLER_TARGET_SOURCE_SHA256: ${{ inputs.expected_target_source_sha256 }}
+          SSAI_EXPECTED_CONTROLLER_TARGET_PROFILE_SHA256: ${{ inputs.expected_target_profile_sha256 }}
+          SSAI_RELEASE_CONTROLLER_OPERATION: ${{ inputs.operation }}
+        run: |
+          node scripts/verify-release-health-controller.mjs
+          node scripts/verify-release-health-controller-deploy.mjs
+          node -e "const p=require('./node_modules/wrangler/package.json');if(p.version!=='4.127.1')process.exit(1)"
+
+      - name: Verify Cloudflare account capability
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[a-f0-9]{32}$ ]]
+          test "${#CLOUDFLARE_API_TOKEN}" -ge 20
+          umask 077
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID" \
+            -o "$RUNNER_TEMP/cloudflare-account.json"
+          jq -e --arg id "$CLOUDFLARE_ACCOUNT_ID" \
+            '.success == true and .result.id == $id' \
+            "$RUNNER_TEMP/cloudflare-account.json" >/dev/null
+
+      - name: Prove bootstrap has no Worker history or traffic
+        id: bootstrap_absence
+        if: ${{ inputs.bootstrap }}
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          for resource in deployments versions settings schedules; do
+            code="$(curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              -o "$RUNNER_TEMP/bootstrap-$resource.json" -w '%{http_code}' \
+              "$api/workers/scripts/$CONTROLLER_NAME/$resource")"
+            test "$code" = 404
+          done
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/domains" -o "$RUNNER_TEMP/bootstrap-domains-before.json"
+          jq -e '.success == true and (.result | all(
+            .hostname != "release-health-controller.scalesmall.ai"
+            and .service != "ssai-release-health-controller"
+          ))' "$RUNNER_TEMP/bootstrap-domains-before.json" >/dev/null
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/subdomain" -o "$RUNNER_TEMP/bootstrap-subdomain.json"
+          subdomain="$(jq -er '.result.subdomain | select(test("^[a-z0-9-]{1,63}$"))' \
+            "$RUNNER_TEMP/bootstrap-subdomain.json")"
+          printf 'subdomain=%s\n' "$subdomain" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare and validate runtime credentials without disclosure
+        if: ${{ inputs.operation != 'rollback-observe' }}
+        shell: bash
+        env:
+          APP_CLIENT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_GITHUB_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.SSAI_RELEASE_CONTROLLER_GITHUB_APP_PRIVATE_KEY }}
+          INSTALLATION_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_GITHUB_INSTALLATION_ID }}
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$APP_CLIENT_ID" =~ ^[A-Za-z0-9_-]{1,128}$ ]]
+          [[ "$INSTALLATION_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          test -n "$APP_PRIVATE_KEY"
+          printf '%s' "$APP_PRIVATE_KEY" > "$RUNNER_TEMP/github-app-input.pem"
+          openssl pkey -in "$RUNNER_TEMP/github-app-input.pem" \
+            -out "$RUNNER_TEMP/github-app-pkcs8.pem" >/dev/null 2>&1
+          grep -qx -- '-----BEGIN PRIVATE KEY-----' "$RUNNER_TEMP/github-app-pkcs8.pem"
+          grep -qx -- '-----END PRIVATE KEY-----' "$RUNNER_TEMP/github-app-pkcs8.pem"
+          openssl pkey -in "$RUNNER_TEMP/github-app-pkcs8.pem" -check -noout >/dev/null 2>&1
+          APP_PRIVATE_KEY_PKCS8="$(cat "$RUNNER_TEMP/github-app-pkcs8.pem")" \
+          APP_CLIENT_ID="$APP_CLIENT_ID" INSTALLATION_ID="$INSTALLATION_ID" \
+          OPERATION="$OPERATION" node --input-type=module <<'NODE'
+          import { readFile } from 'node:fs/promises';
+          import { githubApi, installationToken } from './workers/release-health-controller/src/github-app.mjs';
+          const permissionMode = process.env.OPERATION === 'deploy-active' ? 'write' : 'read';
+          const env = {
+            GITHUB_APP_CLIENT_ID: process.env.APP_CLIENT_ID,
+            GITHUB_APP_PRIVATE_KEY: process.env.APP_PRIVATE_KEY_PKCS8,
+            GITHUB_INSTALLATION_ID: process.env.INSTALLATION_ID,
+            GITHUB_APP_CREDENTIAL_EPOCH: 'github-app-credential-v1',
+          };
+          const access = await installationToken(fetch, env, Math.floor(Date.now() / 1000), permissionMode);
+          await githubApi(fetch, '/repos/ScaleSmall/SSAI_Shared/commits/main', access.token);
+          await githubApi(
+            fetch,
+            '/repos/ScaleSmall/SSAI_Shared/actions/workflows/344170407/runs?event=workflow_dispatch&branch=main&per_page=100',
+            access.token,
+          );
+          await readFile(process.env.RUNNER_TEMP + '/github-app-pkcs8.pem', 'utf8');
+          NODE
+          APP_PRIVATE_KEY_PKCS8="$(cat "$RUNNER_TEMP/github-app-pkcs8.pem")" \
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from 'node:fs/promises';
+          const secrets = {
+            GITHUB_APP_CLIENT_ID: process.env.APP_CLIENT_ID,
+            GITHUB_APP_PRIVATE_KEY: process.env.APP_PRIVATE_KEY_PKCS8,
+            GITHUB_INSTALLATION_ID: process.env.INSTALLATION_ID,
+          };
+          if (Object.values(secrets).some((value) => !value)) throw new Error('A runtime secret is missing.');
+          await writeFile(process.env.RUNNER_TEMP + '/controller-secrets.json', JSON.stringify(secrets), { mode: 0o600 });
+          await readFile(process.env.RUNNER_TEMP + '/controller-secrets.json', 'utf8');
+          NODE
+
+      - name: Validate and bind active-only dispatch credentials
+        if: ${{ inputs.operation == 'deploy-active' }}
+        shell: bash
+        env:
+          ADMISSION_KEY: ${{ secrets.SSAI_RELEASE_CONTROLLER_ADMISSION_HMAC_KEY }}
+          ALERT_KEY: ${{ secrets.SSAI_RELEASE_CONTROLLER_ALERT_SIGNING_KEY }}
+          ACTIVATION_PROOF: ${{ secrets.SSAI_RELEASE_CONTROLLER_ACTIVATION_PROOF }}
+        run: |
+          set -euo pipefail
+          umask 077
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from 'node:fs/promises';
+          const canonical = (name, value) => {
+            if (typeof value !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) throw new Error(name + ' is invalid.');
+            const bytes = Buffer.from(value, 'base64');
+            if (bytes.length < 32 || bytes.toString('base64') !== value) throw new Error(name + ' is invalid.');
+          };
+          canonical('Admission key', process.env.ADMISSION_KEY);
+          canonical('Alert key', process.env.ALERT_KEY);
+          if (!/^[a-f0-9]{64}$/.test(process.env.ACTIVATION_PROOF || '')) {
+            throw new Error('Activation proof is invalid.');
+          }
+          const path = process.env.RUNNER_TEMP + '/controller-secrets.json';
+          const base = JSON.parse(await readFile(path, 'utf8'));
+          const secrets = {
+            ...base,
+            ADMISSION_HMAC_KEY: process.env.ADMISSION_KEY,
+            ALERT_SIGNING_KEY: process.env.ALERT_KEY,
+            ACTIVATION_PROOF: process.env.ACTIVATION_PROOF,
+          };
+          await writeFile(path, JSON.stringify(secrets), { mode: 0o600 });
+          NODE
+
+      - name: Require healthy signed alert sink before active mode
+        if: ${{ inputs.operation == 'deploy-active' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            "$ALERT_HEALTH_URL" -o "$RUNNER_TEMP/alert-health.json"
+          jq -e '.schema == "ssai-release-health-alert-gateway-health-v1" and .status == "healthy"' \
+            "$RUNNER_TEMP/alert-health.json" >/dev/null
+
+      - name: Materialize exact mode-bound deploy configuration
+        if: ${{ inputs.operation != 'rollback-observe' }}
+        env:
+          OPERATION: ${{ inputs.operation }}
+          EXPECTED_CONFIG: ${{ inputs.expected_config_sha256 }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from 'node:fs/promises';
+          const source = process.env.CONTROLLER_CONFIG;
+          const value = JSON.parse(await readFile(source, 'utf8'));
+          if (value.vars.MODE !== 'observe') throw new Error('Checked-in controller mode is invalid.');
+          value.vars.MODE = process.env.OPERATION === 'deploy-active' ? 'active' : 'observe';
+          if (!/^[a-f0-9]{64}$/.test(process.env.EXPECTED_CONFIG || '')) throw new Error('Config digest is invalid.');
+          value.vars.CONTROLLER_CONFIG_SHA256 = process.env.EXPECTED_CONFIG;
+          const path = 'workers/release-health-controller/.wrangler-deployment.jsonc';
+          await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+          NODE
+          ./node_modules/.bin/wrangler deploy \
+            --config workers/release-health-controller/.wrangler-deployment.jsonc \
+            --dry-run --outdir "$RUNNER_TEMP/controller-dry-run" >/dev/null
+
+      - name: Upload and preverify immutable bootstrap observe candidate
+        id: bootstrap_candidate
+        if: ${{ inputs.bootstrap && steps.bootstrap_absence.outcome == 'success' }}
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+          EXPECTED_SOURCE: ${{ inputs.expected_target_source_sha256 }}
+          EXPECTED_PROFILE: ${{ inputs.expected_target_profile_sha256 }}
+          EXPECTED_CONFIG: ${{ inputs.expected_config_sha256 }}
+          ACCOUNT_SUBDOMAIN: ${{ steps.bootstrap_absence.outputs.subdomain }}
+        run: |
+          set -euo pipefail
+          alias="bootstrap-${GITHUB_SHA:0:12}"
+          message="protected-observe:${GITHUB_SHA}:${EXPECTED_SOURCE}:${EXPECTED_PROFILE}"
+          ./node_modules/.bin/wrangler versions upload \
+            --config workers/release-health-controller/.wrangler-deployment.jsonc \
+            --secrets-file "$RUNNER_TEMP/controller-secrets.json" \
+            --preview-alias "$alias" --message "$message" --tag "$GITHUB_SHA"
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/scripts/$CONTROLLER_NAME/versions" \
+            -o "$RUNNER_TEMP/bootstrap-versions-after.json"
+          candidate="$(jq -er --arg tag "$GITHUB_SHA" --arg message "$message" '
+            [.result[] | select(
+              .metadata.annotations["workers/tag"] == $tag
+              and .metadata.annotations["workers/message"] == $message
+            )] | select(length == 1) | .[0].id
+          ' "$RUNNER_TEMP/bootstrap-versions-after.json")"
+          [[ "$candidate" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$ ]]
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/scripts/$CONTROLLER_NAME/versions/$candidate" \
+            -o "$RUNNER_TEMP/bootstrap-candidate-version.json"
+          jq -e --arg id "$candidate" --arg source "$EXPECTED_SOURCE" --arg profile "$EXPECTED_PROFILE" --arg config "$EXPECTED_CONFIG" '
+            .success == true and .result.id == $id
+            and ((.result.resources.bindings // .result.bindings // []) | any(.name == "MODE" and .type == "plain_text" and .text == "observe"))
+            and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_SOURCE_SHA256" and .type == "plain_text" and .text == $source))
+            and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_ACTIVATION_PROFILE_SHA256" and .type == "plain_text" and .text == $profile))
+            and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config))
+            and ((.result.resources.bindings // .result.bindings // []) | any(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject"))
+            and ((.result.resources.bindings // .result.bindings // []) | all(.name != "ADMISSION_HMAC_KEY" and .name != "ALERT_SIGNING_KEY" and .name != "ACTIVATION_PROOF"))
+          ' "$RUNNER_TEMP/bootstrap-candidate-version.json" >/dev/null
+          preview="https://${alias}-${CONTROLLER_NAME}.${ACCOUNT_SUBDOMAIN}.workers.dev/healthz"
+          code="$(curl --silent --show-error --max-time 20 --proto '=https' \
+            -H 'Host: release-health-controller.scalesmall.ai' \
+            -o "$RUNNER_TEMP/bootstrap-preview-health.json" -w '%{http_code}' "$preview")"
+          test "$code" = 503
+          jq -e --arg source "$EXPECTED_SOURCE" --arg profile "$EXPECTED_PROFILE" --arg config "$EXPECTED_CONFIG" '
+            .schema == "ssai-release-health-controller-health-v1"
+            and .component == "release-health-controller" and .status == "unhealthy"
+            and .mode == "observe" and .source_digest == $source and .profile_digest == $profile
+            and .config_digest == $config
+            and .checks.fresh == false and .checks.no_terminal_failure == false
+          ' "$RUNNER_TEMP/bootstrap-preview-health.json" >/dev/null
+          printf 'candidate_version_id=%s\n' "$candidate" >> "$GITHUB_OUTPUT"
+          printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify exact attested observe rollback target
+        id: attest_rollback
+        if: ${{ !inputs.bootstrap }}
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+          ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
+          ROLLBACK_SOURCE: ${{ inputs.rollback_source_sha256 }}
+          ROLLBACK_PROFILE: ${{ inputs.rollback_profile_sha256 }}
+          ROLLBACK_CONFIG: ${{ inputs.rollback_config_sha256 }}
+          ROLLBACK_ATTESTATION_SHA: ${{ inputs.rollback_attestation_sha }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$CONTROLLER_NAME/versions/$ROLLBACK_VERSION_ID" \
+            -o "$RUNNER_TEMP/controller-rollback-version.json"
+          jq -e \
+            --arg id "$ROLLBACK_VERSION_ID" \
+            --arg source "$ROLLBACK_SOURCE" \
+            --arg profile "$ROLLBACK_PROFILE" \
+            --arg config "$ROLLBACK_CONFIG" \
+            --arg attestation "$ROLLBACK_ATTESTATION_SHA" \
+            '.success == true
+             and .result.id == $id
+             and .result.metadata.annotations["workers/tag"] == $attestation
+             and .result.metadata.annotations["workers/message"] == ("protected-observe:" + $attestation + ":" + $source + ":" + $profile)
+             and ((.result.resources.bindings // .result.bindings // []) | any(.name == "MODE" and .type == "plain_text" and .text == "observe"))
+             and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_SOURCE_SHA256" and .type == "plain_text" and .text == $source))
+             and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_ACTIVATION_PROFILE_SHA256" and .type == "plain_text" and .text == $profile))
+             and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config))
+             and ((.result.resources.bindings // .result.bindings // []) | any(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject"))
+             and ((.result.resources.bindings // .result.bindings // []) | all(.name != "ADMISSION_HMAC_KEY" and .name != "ALERT_SIGNING_KEY" and .name != "ACTIVATION_PROOF"))' \
+            "$RUNNER_TEMP/controller-rollback-version.json" >/dev/null
+
+      - name: Apply exact observe or active deployment
+        id: apply_deploy
+        if: ${{ inputs.operation != 'rollback-observe' && !inputs.bootstrap }}
+        continue-on-error: true
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+          OPERATION: ${{ inputs.operation }}
+          EXPECTED_SOURCE: ${{ inputs.expected_target_source_sha256 }}
+          EXPECTED_PROFILE: ${{ inputs.expected_target_profile_sha256 }}
+        run: |
+          set -euo pipefail
+          printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          message="protected-active:${GITHUB_SHA}:${EXPECTED_SOURCE}:${EXPECTED_PROFILE}"
+          if test "$OPERATION" = deploy-observe; then message="prepare-observe:${GITHUB_SHA}"; fi
+          ./node_modules/.bin/wrangler deploy \
+            --config workers/release-health-controller/.wrangler-deployment.jsonc \
+            --secrets-file "$RUNNER_TEMP/controller-secrets.json" \
+            --message "$message" \
+            --tag "$GITHUB_SHA"
+
+      - name: Promote preverified bootstrap candidate and create exact triggers
+        id: apply_bootstrap
+        if: ${{ inputs.bootstrap && steps.bootstrap_candidate.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+          CANDIDATE_VERSION_ID: ${{ steps.bootstrap_candidate.outputs.candidate_version_id }}
+        run: |
+          set -euo pipefail
+          printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          ./node_modules/.bin/wrangler versions deploy "$CANDIDATE_VERSION_ID@100%" \
+            --config "$CONTROLLER_CONFIG" --message "bootstrap-observe ${GITHUB_SHA}" --yes
+          ./node_modules/.bin/wrangler triggers deploy \
+            --config workers/release-health-controller/.wrangler-deployment.jsonc
+
+      - name: Remove every active-only binding from observe mode
+        id: strip_active_secrets
+        if: ${{ inputs.operation == 'deploy-observe' && steps.apply_deploy.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          CI: true
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$CONTROLLER_NAME/settings" \
+            -o "$RUNNER_TEMP/controller-settings-before-strip.json"
+          for key in ADMISSION_HMAC_KEY ALERT_SIGNING_KEY ACTIVATION_PROOF; do
+            if jq -e --arg key "$key" '.success == true and (.result.bindings | any(.name == $key))' \
+              "$RUNNER_TEMP/controller-settings-before-strip.json" >/dev/null; then
+              ./node_modules/.bin/wrangler secret delete "$key" \
+                --config workers/release-health-controller/.wrangler-deployment.jsonc
+            fi
+          done
+
+      - name: Finalize attested observe version after active-secret removal
+        id: finalize_observe
+        if: ${{ inputs.operation == 'deploy-observe' && steps.strip_active_secrets.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+          EXPECTED_SOURCE: ${{ inputs.expected_target_source_sha256 }}
+          EXPECTED_PROFILE: ${{ inputs.expected_target_profile_sha256 }}
+        run: |
+          set -euo pipefail
+          ./node_modules/.bin/wrangler deploy \
+            --config workers/release-health-controller/.wrangler-deployment.jsonc \
+            --secrets-file "$RUNNER_TEMP/controller-secrets.json" \
+            --message "protected-observe:${GITHUB_SHA}:${EXPECTED_SOURCE}:${EXPECTED_PROFILE}" \
+            --tag "$GITHUB_SHA"
+
+      - name: Apply exact known-good observe rollback
+        id: apply_rollback
+        if: ${{ inputs.operation == 'rollback-observe' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+          ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
+        run: |
+          set -euo pipefail
+          printf 'started_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          ./node_modules/.bin/wrangler rollback "$ROLLBACK_VERSION_ID" \
+            --config "$CONTROLLER_CONFIG" \
+            --message "rollback-observe ${GITHUB_SHA}" \
+            --yes
+
+      - name: Verify exact deployment, domain, cron, mode, and liveness
+        id: verify_deploy
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+          OPERATION: ${{ inputs.operation }}
+          EXPECTED_SOURCE: ${{ inputs.expected_target_source_sha256 }}
+          EXPECTED_PROFILE: ${{ inputs.expected_target_profile_sha256 }}
+          CURRENT_CONFIG: ${{ inputs.expected_config_sha256 }}
+          ROLLBACK_CONFIG: ${{ inputs.rollback_config_sha256 }}
+          ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
+          ROLLBACK_ATTESTATION_SHA: ${{ inputs.rollback_attestation_sha }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+          CANDIDATE_VERSION_ID: ${{ steps.bootstrap_candidate.outputs.candidate_version_id }}
+          DEPLOY_STARTED_AT: ${{ steps.apply_bootstrap.outputs.started_at || steps.apply_deploy.outputs.started_at || steps.apply_rollback.outputs.started_at }}
+        run: |
+          set -euo pipefail
+          expected_mode=observe
+          if test "$OPERATION" = deploy-active; then expected_mode=active; fi
+          expected_config="$CURRENT_CONFIG"
+          expected_version=''
+          expected_tag="$GITHUB_SHA"
+          expected_message="protected-${expected_mode}:${GITHUB_SHA}:${EXPECTED_SOURCE}:${EXPECTED_PROFILE}"
+          if test "$OPERATION" = rollback-observe; then
+            expected_config="$ROLLBACK_CONFIG"
+            expected_version="$ROLLBACK_VERSION_ID"
+            expected_tag="$ROLLBACK_ATTESTATION_SHA"
+            expected_message="protected-observe:${ROLLBACK_ATTESTATION_SHA}:${EXPECTED_SOURCE}:${EXPECTED_PROFILE}"
+          elif test "$BOOTSTRAP" = true; then
+            expected_version="$CANDIDATE_VERSION_ID"
+          fi
+          case "$OPERATION" in
+            deploy-observe)
+              if test "$BOOTSTRAP" = true; then
+                test '${{ steps.bootstrap_candidate.outcome }}' = success
+                test '${{ steps.apply_bootstrap.outcome }}' = success
+              else
+                test '${{ steps.apply_deploy.outcome }}' = success
+                test '${{ steps.strip_active_secrets.outcome }}' = success
+                test '${{ steps.finalize_observe.outcome }}' = success
+              fi
+              ;;
+            deploy-active)
+              test '${{ steps.apply_deploy.outcome }}' = success
+              ;;
+            rollback-observe)
+              test '${{ steps.apply_rollback.outcome }}' = success
+              ;;
+            *) exit 1 ;;
+          esac
+          success=false
+          for attempt in $(seq 1 90); do
+            if curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$CONTROLLER_NAME/schedules" \
+              -o "$RUNNER_TEMP/controller-schedules.json" \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" \
+              -o "$RUNNER_TEMP/controller-domains.json" \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$CONTROLLER_NAME/deployments" \
+              -o "$RUNNER_TEMP/controller-deployments-after.json" \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$CONTROLLER_NAME/settings" \
+              -o "$RUNNER_TEMP/controller-settings-after.json" \
+              && live_version_id="$(jq -er --arg started "$DEPLOY_STARTED_AT" --arg expected "$expected_version" '
+                (.result.deployments // .result // []) as $deployments
+                | $deployments[0] as $live
+                | select(($live.created_on // "") >= $started)
+                | select(($live.versions // []) | length == 1)
+                | $live.versions[0]
+                | select((.percentage | tonumber) == 100)
+                | .version_id
+                | select($expected == "" or . == $expected)
+              ' "$RUNNER_TEMP/controller-deployments-after.json")" \
+              && [[ "$live_version_id" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$ ]] \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$CONTROLLER_NAME/versions/$live_version_id" \
+              -o "$RUNNER_TEMP/controller-live-version.json" \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              "$CONTROLLER_HEALTH_URL" -o "$RUNNER_TEMP/controller-health.json" \
+              && jq -e '.success == true and (.result | length == 1) and .result[0].cron == "* * * * *"' \
+                "$RUNNER_TEMP/controller-schedules.json" >/dev/null \
+              && jq -e '.success == true and (.result | any(.hostname == "release-health-controller.scalesmall.ai" and .service == "ssai-release-health-controller" and .environment == "production"))' \
+                "$RUNNER_TEMP/controller-domains.json" >/dev/null \
+              && jq -e --arg started "$DEPLOY_STARTED_AT" \
+                '.success == true and ((.result.deployments // .result // []) | any(.created_on >= $started))' \
+                "$RUNNER_TEMP/controller-deployments-after.json" >/dev/null \
+              && jq -e --arg id "$live_version_id" --arg tag "$expected_tag" --arg message "$expected_message" --arg mode "$expected_mode" --arg source "$EXPECTED_SOURCE" --arg profile "$EXPECTED_PROFILE" --arg config "$expected_config" '
+                .success == true and .result.id == $id
+                and .result.metadata.annotations["workers/tag"] == $tag
+                and .result.metadata.annotations["workers/message"] == $message
+                and ((.result.resources.bindings // .result.bindings // []) | any(.name == "MODE" and .type == "plain_text" and .text == $mode))
+                and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_SOURCE_SHA256" and .type == "plain_text" and .text == $source))
+                and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_ACTIVATION_PROFILE_SHA256" and .type == "plain_text" and .text == $profile))
+                and ((.result.resources.bindings // .result.bindings // []) | any(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config))
+                and ((.result.resources.bindings // .result.bindings // []) | any(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject"))
+              ' "$RUNNER_TEMP/controller-live-version.json" >/dev/null \
+              && jq -e --arg mode "$expected_mode" --arg source "$EXPECTED_SOURCE" --arg profile "$EXPECTED_PROFILE" --arg config "$expected_config" \
+                '.schema == "ssai-release-health-controller-health-v1" and .component == "release-health-controller" and .status == "healthy" and .mode == $mode and .source_digest == $source and .profile_digest == $profile and .config_digest == $config and .checks.fresh == true and .checks.no_dead_alerts == true and .checks.no_terminal_failure == true and .checks.no_internal_failure == true' \
+                "$RUNNER_TEMP/controller-health.json" >/dev/null \
+              && jq -e --arg mode "$expected_mode" --arg config "$expected_config" \
+                '.success == true
+                 and (.result.bindings | any(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject"))
+                 and (.result.bindings | any(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config))
+                 and (if $mode == "active"
+                   then (.result.bindings | any(.name == "ADMISSION_HMAC_KEY"))
+                     and (.result.bindings | any(.name == "ALERT_SIGNING_KEY"))
+                     and (.result.bindings | any(.name == "ACTIVATION_PROOF"))
+                   else (.result.bindings | all(.name != "ADMISSION_HMAC_KEY" and .name != "ALERT_SIGNING_KEY" and .name != "ACTIVATION_PROOF"))
+                   end)' "$RUNNER_TEMP/controller-settings-after.json" >/dev/null; then
+              success=true
+              printf 'verified_version_id=%s\n' "$live_version_id" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            sleep 10
+          done
+          test "$success" = true
+
+      - name: Automatically restore attested observe version after failed deployment verification
+        id: automatic_rollback
+        if: ${{ always() && inputs.operation != 'rollback-observe' && steps.attest_rollback.outcome == 'success' && steps.apply_deploy.outputs.started_at != '' && steps.verify_deploy.outcome != 'success' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+          ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
+          ROLLBACK_SOURCE: ${{ inputs.rollback_source_sha256 }}
+          ROLLBACK_PROFILE: ${{ inputs.rollback_profile_sha256 }}
+          ROLLBACK_CONFIG: ${{ inputs.rollback_config_sha256 }}
+        run: |
+          set -euo pipefail
+          ./node_modules/.bin/wrangler rollback "$ROLLBACK_VERSION_ID" \
+            --config "$CONTROLLER_CONFIG" \
+            --message "automatic-safe-rollback ${GITHUB_SHA}" \
+            --yes
+          restored=false
+          for attempt in $(seq 1 90); do
+            if curl --silent --show-error --max-time 15 --proto '=https' \
+              "$CONTROLLER_HEALTH_URL" -o "$RUNNER_TEMP/controller-rollback-health.json" \
+              && curl --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$CONTROLLER_NAME/settings" \
+              -o "$RUNNER_TEMP/controller-rollback-settings.json" \
+              && jq -e --arg source "$ROLLBACK_SOURCE" --arg profile "$ROLLBACK_PROFILE" --arg config "$ROLLBACK_CONFIG" \
+                '.schema == "ssai-release-health-controller-health-v1"
+                 and .status == "healthy" and .mode == "observe"
+                 and .source_digest == $source and .profile_digest == $profile
+                 and .config_digest == $config
+                 and .checks.fresh == true and .checks.no_dead_alerts == true
+                 and .checks.no_terminal_failure == true' \
+                "$RUNNER_TEMP/controller-rollback-health.json" >/dev/null \
+              && jq -e --arg config "$ROLLBACK_CONFIG" '.success == true
+                 and (.result.bindings | any(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject"))
+                 and (.result.bindings | any(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config))
+                 and (.result.bindings | all(.name != "ADMISSION_HMAC_KEY" and .name != "ALERT_SIGNING_KEY" and .name != "ACTIVATION_PROOF"))' \
+                "$RUNNER_TEMP/controller-rollback-settings.json" >/dev/null; then
+              restored=true
+              break
+            fi
+            sleep 10
+          done
+          test "$restored" = true
+
+      - name: Contain failed first deployment without deleting Worker history
+        id: bootstrap_containment
+        if: ${{ always() && inputs.bootstrap && steps.bootstrap_absence.outcome == 'success' && steps.apply_bootstrap.outputs.started_at != '' && steps.verify_deploy.outcome != 'success' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/domains" -o "$RUNNER_TEMP/bootstrap-domains-containment.json"
+          domain_id="$(jq -er '[.result[] | select(
+            .hostname == "release-health-controller.scalesmall.ai"
+            and .service == "ssai-release-health-controller"
+            and .environment == "production"
+          )] | if length == 0 then "absent" elif length == 1 then .[0].id else error("ambiguous domain") end' \
+            "$RUNNER_TEMP/bootstrap-domains-containment.json")"
+          if test "$domain_id" != absent; then
+            [[ "$domain_id" =~ ^[a-f0-9]{8}-?[a-f0-9]{4}-?[1-5][a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}$ ]]
+            curl --fail --silent --show-error --max-time 15 --proto '=https' \
+              --request DELETE -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/domains/$domain_id" -o "$RUNNER_TEMP/bootstrap-domain-delete.json"
+            jq -e '.success == true' "$RUNNER_TEMP/bootstrap-domain-delete.json" >/dev/null
+          fi
+          schedule_code="$(curl --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -o "$RUNNER_TEMP/bootstrap-schedules-containment.json" -w '%{http_code}' \
+            "$api/workers/scripts/$CONTROLLER_NAME/schedules")"
+          if test "$schedule_code" = 200 && jq -e '.success == true and (.result | length == 1) and .result[0].cron == "* * * * *"' \
+            "$RUNNER_TEMP/bootstrap-schedules-containment.json" >/dev/null; then
+            curl --fail --silent --show-error --max-time 15 --proto '=https' \
+              --request DELETE -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/scripts/$CONTROLLER_NAME/schedules/%2A%20%2A%20%2A%20%2A%20%2A" \
+              -o "$RUNNER_TEMP/bootstrap-schedule-delete.json"
+            jq -e '.success == true' "$RUNNER_TEMP/bootstrap-schedule-delete.json" >/dev/null
+          else
+            test "$schedule_code" = 404 || jq -e '.success == true and (.result | length == 0)' \
+              "$RUNNER_TEMP/bootstrap-schedules-containment.json" >/dev/null
+          fi
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "$api/workers/domains" -o "$RUNNER_TEMP/bootstrap-domains-contained.json"
+          jq -e '.success == true and (.result | all(
+            .hostname != "release-health-controller.scalesmall.ai"
+            and .service != "ssai-release-health-controller"
+          ))' "$RUNNER_TEMP/bootstrap-domains-contained.json" >/dev/null
+
+      - name: Conclude exact operation and safe rollback outcome
+        if: ${{ always() }}
+        shell: bash
+        env:
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          set -euo pipefail
+          if test "$OPERATION" = rollback-observe; then
+            test '${{ steps.apply_rollback.outcome }}' = success
+            test '${{ steps.verify_deploy.outcome }}' = success
+            exit 0
+          fi
+          if test '${{ inputs.bootstrap }}' = true && test '${{ steps.verify_deploy.outcome }}' != success; then
+            if test '${{ steps.apply_bootstrap.outcome }}' != skipped; then
+              test '${{ steps.bootstrap_containment.outcome }}' = success
+              echo 'Bootstrap verification failed; traffic triggers created by this run were withdrawn.' >&2
+            else
+              echo 'Bootstrap candidate failed before traffic promotion; no traffic trigger was created.' >&2
+            fi
+            exit 1
+          fi
+          if test '${{ steps.verify_deploy.outcome }}' != success; then
+            test '${{ steps.automatic_rollback.outcome }}' = success
+            echo 'Deployment verification failed; the attested observe version was restored.' >&2
+            exit 1
+          fi
+          if test '${{ inputs.bootstrap }}' = true; then
+            test '${{ steps.bootstrap_candidate.outcome }}' = success
+            test '${{ steps.apply_bootstrap.outcome }}' = success
+            exit 0
+          fi
+          test '${{ steps.apply_deploy.outcome }}' = success
+          if test "$OPERATION" = deploy-observe; then
+            test '${{ steps.strip_active_secrets.outcome }}' = success
+            test '${{ steps.finalize_observe.outcome }}' = success
+          fi
+
+      - name: Remove temporary credential and deployment files
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- \
+            "$RUNNER_TEMP/github-app-input.pem" \
+            "$RUNNER_TEMP/github-app-pkcs8.pem" \
+            "$RUNNER_TEMP/controller-secrets.json" \
+            workers/release-health-controller/.wrangler-deployment.jsonc
