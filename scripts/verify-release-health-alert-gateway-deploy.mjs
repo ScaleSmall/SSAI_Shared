@@ -66,6 +66,7 @@ for (const required of [
   '/workers/domains', '/deployments', '/versions/$candidate_version_id', '/settings', '/secrets', '/subdomain',
   'workers/domains?service=$GATEWAY_NAME', 'workers/domains?hostname=$GATEWAY_DOMAIN', 'domain_list_complete()', 'script_routes_absent()', 'workers/scripts',
   'has("result_info")|not', '.result_info.total_pages>=0 and .result_info.total_pages<=1', 'domain_preexisting=true', 'domain_attach_attempted=true', 'domain_created_by_run=true', 'reconcile_domain_attach_response()',
+  '(.result.cert_id|type)=="string"', '.result.cert_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")',
   'test "$domain_created_by_run" != true || ! valid_domain_id "$candidate_domain_id"',
   '{hostname:$hostname,service:$service,zone_name:$zone_name}', 'domain_snapshot()', 'wait_domain()', 'wait_domain_absent()',
   'api_delete "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$observed_domain"', 'reconcile_owned_domain_rollback()',
@@ -98,6 +99,12 @@ assert.ok(trafficRollbackFunction.includes('deployments?force=true'), 'Changed c
 assert.ok(trafficRollbackFunction.indexOf('promoted_deployment_ok "$RUNNER_TEMP/gateway-${label}-deployment.json"') < trafficRollbackFunction.indexOf('deployments?force=true'), 'Forced rollback requires exact active candidate provenance before mutation');
 assert.equal((workflow.match(/gateway-promotion-body\.json/g) ?? []).length > 0, true);
 assert.doesNotMatch(workflow.split('          traffic_mutated=true')[1], /gateway-promotion-body\.json[^\n]*\?force=true/, 'Normal promotion must remain unforced');
+const domainSnapshotLine = workflow.split('\n').find((line) => line.includes('domain_snapshot()'));
+assert.ok(domainSnapshotLine, 'The exact custom-domain routing snapshot helper must exist');
+assert.doesNotMatch(domainSnapshotLine, /\bcert_id\b/, 'Provider-managed TLS certificate rotation must not change routing identity');
+for (const immutableField of ['id', 'hostname', 'service', 'zone_id', 'zone_name', 'environment']) {
+  assert.match(domainSnapshotLine, new RegExp(`\\b${immutableField}\\b`), `Routing snapshot must retain ${immutableField}`);
+}
 assert.equal((workflow.match(/-X DELETE/g) ?? []).length, 1, 'Only the exact-ID domain rollback helper may issue DELETE');
 assert.equal((workflow.match(/api_delete "accounts\/\$CLOUDFLARE_ACCOUNT_ID\/workers\/domains\/\$observed_domain"/g) ?? []).length, 1);
 assert.ok(workflow.indexOf('traffic_mutated=true') < workflow.indexOf('api_post_json "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-promotion-body.json"'));
@@ -340,6 +347,31 @@ assert.equal(domainInventoryComplete({ result: [] }), true, 'The pinned Worker D
 assert.equal(domainInventoryComplete({ result: [], result_info: { page: 1, per_page: 20, count: 0, total_pages: 0 } }), true, 'A complete empty service-filtered domain inventory must pass');
 assert.equal(domainInventoryComplete({ result: [], result_info: null }), false, 'Malformed optional pagination metadata must fail closed');
 assert.equal(domainInventoryComplete({ result: [], result_info: { page: 1, per_page: 20, count: 0, total_pages: 2 } }), false, 'A truncated domain inventory must fail closed');
+const domainRoutingSnapshot = ({ id, hostname, service, zone_id, zone_name, environment = 'production' }) => JSON.stringify({ id, hostname, service, zone_id, zone_name, environment });
+const routedDomain = {
+  id: 'a'.repeat(32),
+  cert_id: '11111111-1111-4111-8111-111111111111',
+  hostname: 'alerts.scalesmall.ai',
+  service: config.name,
+  zone_id: 'b'.repeat(32),
+  zone_name: 'scalesmall.ai',
+  environment: 'production',
+};
+assert.equal(
+  domainRoutingSnapshot(routedDomain),
+  domainRoutingSnapshot({ ...routedDomain, cert_id: '22222222-2222-4222-8222-222222222222' }),
+  'Provider-managed certificate rotation must preserve the same routing snapshot',
+);
+for (const [field, value] of [
+  ['id', 'c'.repeat(32)],
+  ['hostname', 'other.scalesmall.ai'],
+  ['service', 'other-worker'],
+  ['zone_id', 'd'.repeat(32)],
+  ['zone_name', 'other.example'],
+  ['environment', 'staging'],
+]) {
+  assert.notEqual(domainRoutingSnapshot(routedDomain), domainRoutingSnapshot({ ...routedDomain, [field]: value }), `Routing snapshot must detect a changed ${field}`);
+}
 const exactNormalIngress = ({ domains, hostnameDomains, routes, subdomain }) => Array.isArray(domains)
   && domains.length === 1
   && domains[0].hostname === 'alerts.scalesmall.ai'

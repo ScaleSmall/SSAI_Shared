@@ -376,6 +376,8 @@ requireText(alertGatewayDeployment, 'return 2', 'fail-closed alert-gateway concu
 requireText(alertGatewayDeployment, 'workers/domains?service=$GATEWAY_NAME', 'service-filtered alert-gateway domain inventory');
 requireText(alertGatewayDeployment, 'workers/domains?hostname=$GATEWAY_DOMAIN', 'hostname-filtered alert-gateway domain inventory');
 requireText(alertGatewayDeployment, 'domain_list_complete()', 'complete paginated alert-gateway domain inventory');
+requireText(alertGatewayDeployment, '(.result.cert_id|type)=="string"', 'validated provider-managed alert-gateway TLS certificate identity');
+requireText(alertGatewayDeployment, '.result.cert_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")', 'well-formed provider-managed alert-gateway TLS certificate identity');
 requireText(alertGatewayDeployment, 'script_routes_absent()', 'account-level alert-gateway ordinary-route attestation');
 requireText(alertGatewayDeployment, 'api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts"', 'documented account Worker inventory');
 requireText(alertGatewayDeployment, 'domain_attach_attempted=true', 'pre-armed alert-gateway domain rollback');
@@ -409,6 +411,12 @@ rejectPattern(alertGatewayDeployment, /["']force["']\s*:\s*true/i, 'forced alert
 assert.equal((alertGatewayDeployment.match(/\?force=true/g) ?? []).length, 1, 'only the exact alert-gateway rollback helper may force a deployment');
 const alertGatewayRollbackFunction = alertGatewayDeployment.split('          reconcile_traffic_rollback() {')[1].split('          attest_rollback_active() {')[0];
 assert.ok(alertGatewayRollbackFunction.includes('deployments?force=true'), 'forced alert-gateway rollback must remain scoped to the provenance-gated helper');
+const alertGatewayDomainSnapshotLine = alertGatewayDeployment.split('\n').find((line) => line.includes('domain_snapshot()'));
+assert.ok(alertGatewayDomainSnapshotLine, 'alert-gateway routing snapshot helper must exist');
+rejectPattern(alertGatewayDomainSnapshotLine, /\bcert_id\b/, 'provider-managed TLS certificate in alert-gateway routing identity');
+for (const field of ['id', 'hostname', 'service', 'zone_id', 'zone_name', 'environment']) {
+  requireText(alertGatewayDomainSnapshotLine, field, `alert-gateway immutable routing identity field ${field}`);
+}
 rejectPattern(alertGatewayDeployment, /^\s+(?:traffic_mutated|domain_attach_attempted|domain_created_by_run|bootstrap_mutation_attempted)=false\s*$/m, 'sequential alert-gateway rollback disarm');
 rejectPattern(alertGatewayDeployment, /actions\/workflows\/\d+\/dispatches|gh\s+workflow\s+run/i, 'workflow dispatch from alert-gateway deployment');
 
