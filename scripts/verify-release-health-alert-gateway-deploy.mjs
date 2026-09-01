@@ -396,14 +396,22 @@ const replaceEvidenceAtomically = (previous, attempt) => attempt.transportOk && 
 const oldEvidence = { success: true, result: { id: 'stale' } };
 assert.equal(replaceEvidenceAtomically(oldEvidence, { transportOk: false, schemaOk: false }), undefined, 'A failed request must remove stale prior evidence');
 
+const domainIdA = 'a'.repeat(40);
+const domainIdB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const domainIdD = 'd'.repeat(32);
+const validDomainId = (id) => /^(?:[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/.test(id ?? '');
+assert.equal(validDomainId(domainIdA), true, 'Observed 40-hex Cloudflare custom-domain IDs must pass');
+assert.equal(validDomainId(domainIdB), true, 'Canonical lowercase UUID custom-domain IDs must pass');
+assert.equal(validDomainId(domainIdD), true, 'Documented 32-hex Cloudflare custom-domain IDs must remain compatible');
+for (const invalidDomainId of ['a'.repeat(31), 'a'.repeat(39), 'A'.repeat(40), '../domain', `${'a'.repeat(32)}?x=1`, '%2fdomain', ' domain ', '']) assert.equal(validDomainId(invalidDomainId), false, 'Malformed or path-unsafe domain IDs must fail closed');
 const mayDeleteAttachedDomain = ({ domainCreatedByRun, candidateDomainId, observedDomainId }) =>
   domainCreatedByRun === true
-  && /^[a-f0-9]{32}$/.test(candidateDomainId ?? '')
+  && validDomainId(candidateDomainId)
   && candidateDomainId === observedDomainId;
-assert.equal(mayDeleteAttachedDomain({ domainCreatedByRun: false, candidateDomainId: '', observedDomainId: 'a'.repeat(32) }), false, 'An ambiguous PUT must never delete a matching domain created concurrently by another actor');
-assert.equal(mayDeleteAttachedDomain({ domainCreatedByRun: true, candidateDomainId: 'a'.repeat(32), observedDomainId: 'b'.repeat(32) }), false, 'Rollback must never delete a domain whose immutable ID differs from this run response');
-assert.equal(mayDeleteAttachedDomain({ domainCreatedByRun: true, candidateDomainId: 'a'.repeat(32), observedDomainId: 'a'.repeat(32) }), true, 'Rollback may delete only the exact immutable domain ID proven to have been returned to this run');
-const intendedDomain = { id: 'a'.repeat(32), hostname: 'alerts.scalesmall.ai', service: config.name, zone_name: 'scalesmall.ai', environment: 'production' };
+assert.equal(mayDeleteAttachedDomain({ domainCreatedByRun: false, candidateDomainId: '', observedDomainId: domainIdA }), false, 'An ambiguous PUT must never delete a matching domain created concurrently by another actor');
+assert.equal(mayDeleteAttachedDomain({ domainCreatedByRun: true, candidateDomainId: domainIdA, observedDomainId: domainIdB }), false, 'Rollback must never delete a domain whose immutable ID differs from this run response');
+assert.equal(mayDeleteAttachedDomain({ domainCreatedByRun: true, candidateDomainId: domainIdA, observedDomainId: domainIdA }), true, 'Rollback may delete only the exact immutable domain ID proven to have been returned to this run');
+const intendedDomain = { id: domainIdA, hostname: 'alerts.scalesmall.ai', service: config.name, zone_name: 'scalesmall.ai', environment: 'production' };
 const identityReadyDomain = { ...intendedDomain, zone_id: 'b'.repeat(32) };
 const fullyReadyDomain = { ...identityReadyDomain, cert_id: '11111111-1111-4111-8111-111111111111' };
 const domainIdentityCompatible = (domain, id = intendedDomain.id) => domain?.id === id
@@ -434,7 +442,7 @@ const reconcileDomainAttach = (attempts) => {
       putAttempted = true;
       if (attempt.put.success === true) {
         const result = attempt.put.result;
-        if (/^[a-f0-9]{32}$/.test(result?.id ?? '')) {
+        if (validDomainId(result?.id)) {
           if (!domainIdentityCompatible(result, result.id)) return { status: 'conflict' };
           returnedId = result.id;
           if (domainIdentityReady(result, returnedId)) return { status: 'owned', id: returnedId };
@@ -470,7 +478,7 @@ assert.deepEqual(reconcileDomainAttach([
   { serviceInventory: [intendedDomain], hostnameInventory: [intendedDomain], directDomainValid: true },
 ]), { status: 'conflict' }, 'A successful response without a valid causal ID must not infer destructive ownership from later inventory');
 assert.deepEqual(reconcileDomainAttach([
-  { put: { success: false }, serviceInventory: [intendedDomain], hostnameInventory: [{ ...intendedDomain, id: 'b'.repeat(32) }], directDomainValid: true },
+  { put: { success: false }, serviceInventory: [intendedDomain], hostnameInventory: [{ ...intendedDomain, id: domainIdB }], directDomainValid: true },
 ]), { status: 'conflict' }, 'Conflicting service and hostname domain identities must fail closed');
 assert.deepEqual(reconcileDomainAttach([
   { put: { success: false }, serviceInventory: [intendedDomain], hostnameInventory: [intendedDomain], directDomainValid: false },
@@ -705,7 +713,7 @@ assert.ok(scriptRoutesFunction.includes('$matches[0].routes==null'), 'The docume
 assert.ok(scriptRoutesFunction.includes('($matches[0].routes|type)=="array" and ($matches[0].routes|length)==0'), 'Only explicit empty route arrays may pass');
 assert.doesNotMatch(scriptRoutesFunction, /routes\s*\/\/\s*\[\]/, 'Defaulting route metadata must not hide malformed false values');
 const routedDomain = {
-  id: 'a'.repeat(32),
+  id: domainIdA,
   cert_id: '11111111-1111-4111-8111-111111111111',
   hostname: 'alerts.scalesmall.ai',
   service: config.name,
@@ -724,7 +732,7 @@ assert.equal(exactDomainDetail(routedDomain), true, 'The exact intended domain m
 assert.equal(exactDomainDetail({ ...routedDomain, cert_id: '22222222-2222-4222-8222-222222222222' }), true, 'A rotated valid provider certificate remains the same validated route');
 assert.equal(exactDomainDetail({ ...routedDomain, zone_id: 'c'.repeat(32) }), true, 'A well-formed provider-returned zone ID remains subordinate to immutable domain and exact routing names');
 for (const [field, value] of [
-  ['id', 'd'.repeat(32)],
+  ['id', domainIdD],
   ['hostname', 'other.scalesmall.ai'],
   ['service', 'other-worker'],
   ['zone_name', 'other.example'],
@@ -748,10 +756,10 @@ const exactNormalIngress = ({ domains, hostnameDomains, routes, subdomain }) => 
   && subdomain?.enabled === false
   && subdomain?.previews_enabled === true;
 const safeSubdomain = { enabled: false, previews_enabled: true };
-const exactDomain = { id: 'a'.repeat(32), hostname: 'alerts.scalesmall.ai', service: config.name };
+const exactDomain = { id: domainIdA, hostname: 'alerts.scalesmall.ai', service: config.name };
 assert.equal(exactNormalIngress({ domains: [exactDomain], hostnameDomains: [exactDomain], routes: [], subdomain: safeSubdomain }), true, 'The exact intended custom domain and no ordinary routes must pass');
-assert.equal(exactNormalIngress({ domains: [exactDomain, { id: 'b'.repeat(32), hostname: 'shadow.scalesmall.ai', service: config.name }], hostnameDomains: [exactDomain], routes: [], subdomain: safeSubdomain }), false, 'A different hostname bound to the same service must fail closed');
-assert.equal(exactNormalIngress({ domains: [exactDomain], hostnameDomains: [{ ...exactDomain, id: 'b'.repeat(32), service: 'other-worker' }], routes: [], subdomain: safeSubdomain }), false, 'A hostname attached to another Worker must fail closed');
+assert.equal(exactNormalIngress({ domains: [exactDomain, { id: domainIdB, hostname: 'shadow.scalesmall.ai', service: config.name }], hostnameDomains: [exactDomain], routes: [], subdomain: safeSubdomain }), false, 'A different hostname bound to the same service must fail closed');
+assert.equal(exactNormalIngress({ domains: [exactDomain], hostnameDomains: [{ ...exactDomain, id: domainIdB, service: 'other-worker' }], routes: [], subdomain: safeSubdomain }), false, 'A hostname attached to another Worker must fail closed');
 assert.equal(exactNormalIngress({ domains: [exactDomain], hostnameDomains: [exactDomain], routes: [{ pattern: 'scalesmall.ai/*', script: config.name }], subdomain: safeSubdomain }), false, 'An ordinary route bound to the service must fail closed');
 assert.equal(exactNormalIngress({ domains: [exactDomain], hostnameDomains: [exactDomain], routes: [], subdomain: { enabled: true, previews_enabled: true } }), false, 'A public workers.dev ingress must fail closed');
 assert.equal(exactNormalIngress({ domains: [exactDomain], hostnameDomains: [exactDomain], subdomain: safeSubdomain }), false, 'Missing ordinary-route evidence must fail closed');
@@ -775,7 +783,12 @@ trap 'rm -rf -- "$RUNNER_TEMP"' EXIT
 domain_ownership_file="$RUNNER_TEMP/gateway-domain-ownership.json"
 domain_inventory_path=service-inventory
 hostname_inventory_path=hostname-inventory
-DOMAIN_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+valid_domain_id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+valid_domain_id bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+valid_domain_id cccccccc-cccc-4ccc-8ccc-cccccccccccc
+! valid_domain_id AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+! valid_domain_id ../domain
+DOMAIN_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ZONE_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 candidate_domain_id=
 domain_created_by_run=false
