@@ -333,6 +333,10 @@ requireText(alertGatewayDeployment, 'environment:\n      name: release-health-co
 requireText(alertGatewayDeployment, 'github.workflow_sha == inputs.expected_sha', 'exact alert-gateway deployment workflow SHA');
 requireText(alertGatewayDeployment, 'cancel-in-progress: false', 'non-cancelling alert-gateway deployment concurrency');
 requireText(alertGatewayDeployment, 'wrangler deploy', 'alert-gateway deployment command');
+requireText(alertGatewayDeployment, 'bootstrap_dir="$RUNNER_TEMP/gateway-bootstrap"', 'contained alert-gateway bootstrap staging');
+requireText(alertGatewayDeployment, 'cp -R -- "$(dirname "$GATEWAY_CONFIG")/." "$bootstrap_dir/"', 'complete alert-gateway bootstrap bundle');
+requireText(alertGatewayDeployment, '--dry-run --outdir "$RUNNER_TEMP/gateway-bootstrap-dry-run"', 'exact alert-gateway bootstrap dry-run');
+rejectPattern(alertGatewayDeployment, /\$RUNNER_TEMP\/gateway-bootstrap\.jsonc/, 'detached alert-gateway bootstrap config');
 rejectPattern(alertGatewayDeployment, /actions\/workflows\/\d+\/dispatches|gh\s+workflow\s+run/i, 'workflow dispatch from alert-gateway deployment');
 
 assert.deepEqual(
