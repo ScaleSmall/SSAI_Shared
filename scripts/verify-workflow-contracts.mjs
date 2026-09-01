@@ -376,6 +376,8 @@ requireText(alertGatewayDeployment, 'return 2', 'fail-closed alert-gateway concu
 requireText(alertGatewayDeployment, 'workers/domains?service=$GATEWAY_NAME', 'service-filtered alert-gateway domain inventory');
 requireText(alertGatewayDeployment, 'workers/domains?hostname=$GATEWAY_DOMAIN', 'hostname-filtered alert-gateway domain inventory');
 requireText(alertGatewayDeployment, 'domain_list_complete()', 'complete paginated alert-gateway domain inventory');
+requireText(alertGatewayDeployment, '(.result.zone_id|type)=="string"', 'validated provider-issued alert-gateway zone identity');
+requireText(alertGatewayDeployment, '.result.zone_id|test("^[a-f0-9]{32}$")', 'well-formed provider-issued alert-gateway zone identity');
 requireText(alertGatewayDeployment, '(.result.cert_id|type)=="string"', 'validated provider-managed alert-gateway TLS certificate identity');
 requireText(alertGatewayDeployment, '.result.cert_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")', 'well-formed provider-managed alert-gateway TLS certificate identity');
 requireText(alertGatewayDeployment, 'script_routes_absent()', 'account-level alert-gateway ordinary-route attestation');
@@ -413,8 +415,8 @@ const alertGatewayRollbackFunction = alertGatewayDeployment.split('          rec
 assert.ok(alertGatewayRollbackFunction.includes('deployments?force=true'), 'forced alert-gateway rollback must remain scoped to the provenance-gated helper');
 const alertGatewayDomainSnapshotLine = alertGatewayDeployment.split('\n').find((line) => line.includes('domain_snapshot()'));
 assert.ok(alertGatewayDomainSnapshotLine, 'alert-gateway routing snapshot helper must exist');
-rejectPattern(alertGatewayDomainSnapshotLine, /\bcert_id\b/, 'provider-managed TLS certificate in alert-gateway routing identity');
-for (const field of ['id', 'hostname', 'service', 'zone_id', 'zone_name', 'environment']) {
+rejectPattern(alertGatewayDomainSnapshotLine, /\b(?:cert_id|zone_id)\b/, 'provider-issued certificate or zone identifier in immutable alert-gateway routing identity');
+for (const field of ['id', 'hostname', 'service', 'zone_name', 'environment']) {
   requireText(alertGatewayDomainSnapshotLine, field, `alert-gateway immutable routing identity field ${field}`);
 }
 rejectPattern(alertGatewayDeployment, /^\s+(?:traffic_mutated|domain_attach_attempted|domain_created_by_run|bootstrap_mutation_attempted)=false\s*$/m, 'sequential alert-gateway rollback disarm');

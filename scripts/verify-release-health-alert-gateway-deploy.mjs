@@ -66,6 +66,7 @@ for (const required of [
   '/workers/domains', '/deployments', '/versions/$candidate_version_id', '/settings', '/secrets', '/subdomain',
   'workers/domains?service=$GATEWAY_NAME', 'workers/domains?hostname=$GATEWAY_DOMAIN', 'domain_list_complete()', 'script_routes_absent()', 'workers/scripts',
   'has("result_info")|not', '.result_info.total_pages>=0 and .result_info.total_pages<=1', 'domain_preexisting=true', 'domain_attach_attempted=true', 'domain_created_by_run=true', 'reconcile_domain_attach_response()',
+  '(.result.zone_id|type)=="string"', '.result.zone_id|test("^[a-f0-9]{32}$")',
   '(.result.cert_id|type)=="string"', '.result.cert_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")',
   'test "$domain_created_by_run" != true || ! valid_domain_id "$candidate_domain_id"',
   '{hostname:$hostname,service:$service,zone_name:$zone_name}', 'domain_snapshot()', 'wait_domain()', 'wait_domain_absent()',
@@ -101,8 +102,8 @@ assert.equal((workflow.match(/gateway-promotion-body\.json/g) ?? []).length > 0,
 assert.doesNotMatch(workflow.split('          traffic_mutated=true')[1], /gateway-promotion-body\.json[^\n]*\?force=true/, 'Normal promotion must remain unforced');
 const domainSnapshotLine = workflow.split('\n').find((line) => line.includes('domain_snapshot()'));
 assert.ok(domainSnapshotLine, 'The exact custom-domain routing snapshot helper must exist');
-assert.doesNotMatch(domainSnapshotLine, /\bcert_id\b/, 'Provider-managed TLS certificate rotation must not change routing identity');
-for (const immutableField of ['id', 'hostname', 'service', 'zone_id', 'zone_name', 'environment']) {
+assert.doesNotMatch(domainSnapshotLine, /\b(?:cert_id|zone_id)\b/, 'Provider-issued certificate and zone identifiers must not override the immutable domain routing identity');
+for (const immutableField of ['id', 'hostname', 'service', 'zone_name', 'environment']) {
   assert.match(domainSnapshotLine, new RegExp(`\\b${immutableField}\\b`), `Routing snapshot must retain ${immutableField}`);
 }
 assert.equal((workflow.match(/-X DELETE/g) ?? []).length, 1, 'Only the exact-ID domain rollback helper may issue DELETE');
@@ -347,7 +348,7 @@ assert.equal(domainInventoryComplete({ result: [] }), true, 'The pinned Worker D
 assert.equal(domainInventoryComplete({ result: [], result_info: { page: 1, per_page: 20, count: 0, total_pages: 0 } }), true, 'A complete empty service-filtered domain inventory must pass');
 assert.equal(domainInventoryComplete({ result: [], result_info: null }), false, 'Malformed optional pagination metadata must fail closed');
 assert.equal(domainInventoryComplete({ result: [], result_info: { page: 1, per_page: 20, count: 0, total_pages: 2 } }), false, 'A truncated domain inventory must fail closed');
-const domainRoutingSnapshot = ({ id, hostname, service, zone_id, zone_name, environment = 'production' }) => JSON.stringify({ id, hostname, service, zone_id, zone_name, environment });
+const domainRoutingSnapshot = ({ id, hostname, service, zone_name, environment = 'production' }) => JSON.stringify({ id, hostname, service, zone_name, environment });
 const routedDomain = {
   id: 'a'.repeat(32),
   cert_id: '11111111-1111-4111-8111-111111111111',
@@ -362,11 +363,15 @@ assert.equal(
   domainRoutingSnapshot({ ...routedDomain, cert_id: '22222222-2222-4222-8222-222222222222' }),
   'Provider-managed certificate rotation must preserve the same routing snapshot',
 );
+assert.equal(
+  domainRoutingSnapshot(routedDomain),
+  domainRoutingSnapshot({ ...routedDomain, zone_id: 'c'.repeat(32) }),
+  'Provider-returned zone-ID drift must not override the immutable domain ID and expected routing names',
+);
 for (const [field, value] of [
-  ['id', 'c'.repeat(32)],
+  ['id', 'd'.repeat(32)],
   ['hostname', 'other.scalesmall.ai'],
   ['service', 'other-worker'],
-  ['zone_id', 'd'.repeat(32)],
   ['zone_name', 'other.example'],
   ['environment', 'staging'],
 ]) {
