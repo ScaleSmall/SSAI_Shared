@@ -103,16 +103,20 @@ jobs:
           alias="c-${GITHUB_SHA:0:12}"
           message="release-health-alert-gateway ${GITHUB_SHA} config=${EXPECTED_CONFIG_SHA256} source=${EXPECTED_SOURCE_SHA256}"
           promotion_message="promote ${GITHUB_SHA}"
+          # One-time, fail-closed bridge for bootstrap run 33539437494, where the secret update created the immediate deployed successor.
+          legacy_bootstrap_sha=e864778adb9b38e266afb18c672661d0b85e8b67
+          legacy_bootstrap_version_id=48d208dd-f054-4c54-bf67-918e126c49e0
+          legacy_successor_max_age_seconds=600
           domain_inventory_path="accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains?service=$GATEWAY_NAME"
           hostname_inventory_path="accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains?hostname=$GATEWAY_DOMAIN"
           previous_deployment_id= previous_version_id= previous_domain_id= candidate_deployment_id= candidate_version_id= candidate_domain_id= candidate_secrets= bootstrap_dir= bootstrap_config= bootstrap_secrets=
-          traffic_mutated=false domain_preexisting=false domain_attach_attempted=false domain_created_by_run=false bootstrap=false bootstrap_mutation_attempted=false committed=false legacy_contained_previous=false rollback_mode=false
+          traffic_mutated=false domain_preexisting=false domain_attach_attempted=false domain_created_by_run=false bootstrap=false bootstrap_mutation_attempted=false committed=false legacy_contained_previous=false legacy_secret_successor_previous=false rollback_mode=false
           gateway_failure_stage=account-id-shape
           rollback_message="automatic rollback after ${GITHUB_SHA}"
           report_gateway_failure_stage() {
             local stage="${1:-unclassified}"
             case "$stage" in
-              account-id-shape|api-token-shape|signing-key-shape|secret-file-write|secret-file-mode|account-get|account-validate|service-domain-get|service-domain-validate|hostname-domain-get|hostname-domain-validate|domain-count|preexisting-domain-id|preexisting-domain-hostname|preexisting-domain-detail-get|preexisting-domain-detail-validate|deployments-get|deployment-list-validate|deployment-id|version-id|bootstrap-authorization|bootstrap-script-routes|bootstrap-staging|bootstrap-dry-run|bootstrap-deploy|deployment-ids-validate|deployment-detail-get|deployment-detail-validate|version-detail-get|version-detail-validate|secrets-get|secrets-validate|settings-get|settings-observability|settings-bindings|subdomain-get|subdomain-validate|scripts-get|script-routes|active-version-bindings|bootstrap-domain-absence|domain-ready|live-health|preflight-secret-cleanup|candidate-upload|candidate-preview|promotion|ingress|final-attestation|unclassified) ;;
+              account-id-shape|api-token-shape|signing-key-shape|secret-file-write|secret-file-mode|account-get|account-validate|service-domain-get|service-domain-validate|hostname-domain-get|hostname-domain-validate|domain-count|preexisting-domain-id|preexisting-domain-hostname|preexisting-domain-detail-get|preexisting-domain-detail-validate|deployments-get|deployment-list-validate|deployment-id|version-id|bootstrap-authorization|bootstrap-script-routes|bootstrap-staging|bootstrap-dry-run|bootstrap-deploy|deployment-ids-validate|deployment-detail-get|deployment-detail-validate|version-detail-get|version-detail-validate|secrets-get|secrets-validate|settings-get|settings-observability|settings-bindings|subdomain-get|subdomain-validate|scripts-get|script-routes|active-version-bindings|legacy-successor-parent-get|legacy-successor-validate|bootstrap-domain-absence|domain-ready|live-health|preflight-secret-cleanup|candidate-upload|candidate-preview|promotion|ingress|final-attestation|unclassified) ;;
               *) stage=unclassified ;;
             esac
             printf '::error::Gateway deployment failed at an allowlisted stage (stage=%s).\n' "$stage"
@@ -212,12 +216,74 @@ jobs:
           valid_domain_id() { [[ "$1" =~ ^[a-f0-9]{32}$ ]]; }
           deployment_ok() { jq -e --arg deployment "$2" --arg version "$3" '.result.id==$deployment and (.result.versions|type)=="array" and (.result.versions|length)==1 and .result.versions[0].version_id==$version and .result.versions[0].percentage==100' "$1" >/dev/null; }
           promoted_deployment_ok() { jq -e --arg deployment "$2" --arg version "$3" --arg message "$4" '.result.id==$deployment and .result.source=="api" and .result.strategy=="percentage" and (.result.created_on|type)=="string" and (.result.versions|type)=="array" and (.result.versions|length)==1 and .result.versions[0].version_id==$version and .result.versions[0].percentage==100 and .result.annotations["workers/message"]==$message' "$1" >/dev/null; }
-          binding_ok() { jq -e --arg ns "$RATE_LIMITER_NAMESPACE_ID" '((.result.resources.bindings//.result.bindings//[])|length)==3 and any((.result.resources.bindings//.result.bindings//[])[];.=={name:"ALERT_INGEST_RATE_LIMITER",type:"ratelimit",namespace_id:$ns,simple:{limit:60,period:60}}) and any((.result.resources.bindings//.result.bindings//[])[];.name=="ALERT_HMAC_KEY" and .type=="secret_text") and any((.result.resources.bindings//.result.bindings//[])[];.=={name:"CF_VERSION_METADATA",type:"version_metadata"})' "$1" >/dev/null; }
-          legacy_binding_ok() { jq -e --arg ns "$RATE_LIMITER_NAMESPACE_ID" '((.result.resources.bindings//.result.bindings//[])|length)==2 and any((.result.resources.bindings//.result.bindings//[])[];.=={name:"ALERT_INGEST_RATE_LIMITER",type:"ratelimit",namespace_id:$ns,simple:{limit:60,period:60}}) and any((.result.resources.bindings//.result.bindings//[])[];.name=="ALERT_HMAC_KEY" and .type=="secret_text")' "$1" >/dev/null; }
-          known_settings_binding_ok() { binding_ok "$1" || legacy_binding_ok "$1"; }
+          binding_inventory_ok() {
+            jq -e --arg ns "$RATE_LIMITER_NAMESPACE_ID" --arg view "$2" --argjson expected "$3" '
+              def rate_limiter_ok:
+                type=="object"
+                and (keys|sort)==["name","namespace_id","simple","type"]
+                and .name=="ALERT_INGEST_RATE_LIMITER"
+                and .type=="ratelimit"
+                and .namespace_id==$ns
+                and (.simple|type)=="object"
+                and ((.simple|keys|sort)==["limit","period"] or (.simple|keys|sort)==["limit","mitigation_timeout","period"])
+                and .simple.limit==60
+                and .simple.period==60
+                and ((.simple|has("mitigation_timeout")|not) or ((.simple.mitigation_timeout|type)=="number" and .simple.mitigation_timeout==0));
+              (if $view=="version" then .result.resources.bindings elif $view=="settings" then .result.bindings else null end) as $bindings
+              | ($expected==1 or $expected==2 or $expected==3)
+              and ($bindings|type)=="array"
+              and ($bindings|length)==$expected
+              and ([$bindings[]|select(rate_limiter_ok)]|length)==1
+              and ([$bindings[]|select(type=="object" and .name=="ALERT_HMAC_KEY" and .type=="secret_text")]|length)==(if $expected>=2 then 1 else 0 end)
+              and ([$bindings[]|select(type=="object" and .name=="CF_VERSION_METADATA" and .type=="version_metadata")]|length)==(if $expected==3 then 1 else 0 end)
+            ' "$1" >/dev/null
+          }
+          binding_ok() { binding_inventory_ok "$1" version 3; }
+          legacy_binding_ok() { binding_inventory_ok "$1" version 2; }
+          bootstrap_parent_binding_ok() { binding_inventory_ok "$1" version 1; }
+          settings_binding_ok() { binding_inventory_ok "$1" settings 3; }
+          legacy_settings_binding_ok() { binding_inventory_ok "$1" settings 2; }
+          known_settings_binding_ok() { settings_binding_ok "$1" || legacy_settings_binding_ok "$1"; }
           exact_secret_ok() { jq -e '(.result|type)=="array" and (.result|length)==1 and .result[0].name=="ALERT_HMAC_KEY" and .result[0].type=="secret_text"' "$1" >/dev/null; }
           bootstrap_version_owned() { jq -e --arg id "$2" --arg sha "$GITHUB_SHA" '.result.id==$id and ((.result.annotations//.result.metadata.annotations//{}) as $a|$a["workers/tag"]==$sha and $a["workers/message"]==("contained bootstrap "+$sha))' "$1" >/dev/null; }
           legacy_contained_version_ok() { jq -e --arg id "$2" '.result.id==$id and ((.result.annotations//.result.metadata.annotations//{}) as $a|($a["workers/tag"]|type)=="string" and ($a["workers/tag"]|test("^[a-f0-9]{40}$")) and $a["workers/message"]==("contained bootstrap "+$a["workers/tag"]))' "$1" >/dev/null && legacy_binding_ok "$1"; }
+          legacy_bootstrap_parent_ok() {
+            jq -e --arg id "$legacy_bootstrap_version_id" --arg sha "$legacy_bootstrap_sha" '
+              ([.result.annotations?,.result.metadata.annotations?]|map(select(.!=null))) as $annotations
+              | .result.id==$id
+              and ($annotations|length)>=1
+              and all($annotations[];.["workers/tag"]==$sha and .["workers/message"]==("contained bootstrap "+$sha))
+              and (.result.number|type)=="number"
+              and (.result.number|floor)==.result.number
+              and .result.number>0
+              and .result.number<=9007199254740991
+              and (.result.metadata.created_on|type)=="string"
+              and (.result.resources.script.etag|type)=="string"
+              and (.result.resources.script.etag|length)>0
+            ' "$1" >/dev/null && bootstrap_parent_binding_ok "$1"
+          }
+          legacy_successor_timestamp_ok() {
+            node -e 'const fs=require("node:fs");const parent=JSON.parse(fs.readFileSync(process.argv[1],"utf8")).result;const active=JSON.parse(fs.readFileSync(process.argv[2],"utf8")).result;const max=Number(process.argv[3])*1000;const p=Date.parse(parent?.metadata?.created_on);const a=Date.parse(active?.metadata?.created_on);if(!Number.isFinite(p)||!Number.isFinite(a)||!Number.isSafeInteger(max)||max<=0||a<=p||a-p>max)process.exit(1)' "$1" "$2" "$legacy_successor_max_age_seconds"
+          }
+          legacy_secret_successor_ok() {
+            local active="$1" parent="$2" active_id="$3"
+            legacy_bootstrap_parent_ok "$parent" || return 1
+            legacy_binding_ok "$active" || return 1
+            jq -e --arg active_id "$active_id" --arg parent_id "$legacy_bootstrap_version_id" --slurpfile parent "$parent" '
+              ($parent[0].result) as $p
+              | .result.id==$active_id
+              and .result.id!=$parent_id
+              and (.result.number|type)=="number"
+              and (.result.number|floor)==.result.number
+              and .result.number<=9007199254740991
+              and .result.number==$p.number+1
+              and (.result.metadata.created_on|type)=="string"
+              and (.result.resources.script.etag|type)=="string"
+              and (.result.resources.script.etag|length)>0
+              and .result.resources.script.etag==$p.resources.script.etag
+            ' "$active" >/dev/null || return 1
+            legacy_successor_timestamp_ok "$parent" "$active"
+          }
           candidate_version_ok() { jq -e --arg id "$2" --arg sha "$GITHUB_SHA" --arg msg "$message" --arg alias "$alias" '.result.metadata as $metadata|(.result.annotations//.result.metadata.annotations//{}) as $annotations|([$metadata.hasPreview?,$metadata.has_preview?]|map(select(type=="boolean"))) as $preview_flags|.result.id==$id and ($metadata.created_on|type)=="string" and ($preview_flags|length)>=1 and all($preview_flags[];.==true) and $annotations["workers/tag"]==$sha and $annotations["workers/message"]==$msg and $annotations["workers/alias"]==$alias' "$1" >/dev/null && binding_ok "$1"; }
           rollback_deployment_ok() { if test "$2" = "$previous_deployment_id"; then deployment_ok "$1" "$2" "$previous_version_id"; else promoted_deployment_ok "$1" "$2" "$previous_version_id" "$rollback_message"; fi; }
           observability_ok() { jq -e '.result.observability.enabled==true and .result.observability.head_sampling_rate==1 and .result.observability.logs.enabled==true and .result.observability.logs.head_sampling_rate==1 and .result.observability.logs.invocation_logs==true and .result.logpush==false and ((.result.tail_consumers//[])|length)==0' "$1" >/dev/null; }
@@ -332,6 +398,8 @@ jobs:
                   jq -e --arg id "$observed_domain" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" >/dev/null || return 2
                   api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$observed_domain" "$RUNNER_TEMP/gateway-${label}-domain.json" || return 2
                   domain_ok "$RUNNER_TEMP/gateway-${label}-domain.json" "$observed_domain" || return 2
+                  printf '%s' "$observed_domain"
+                  return 0
                 else
                   return 2
                 fi
@@ -449,13 +517,13 @@ jobs:
             test "$observed_domain" = "$candidate_domain_id" || return 1
             attest_candidate_ingress "${label}-before-health" || return 1
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/settings" "$RUNNER_TEMP/gateway-${label}-before-health-settings.json" || return 1
-            binding_ok "$RUNNER_TEMP/gateway-${label}-before-health-settings.json" && observability_ok "$RUNNER_TEMP/gateway-${label}-before-health-settings.json" || return 1
+            settings_binding_ok "$RUNNER_TEMP/gateway-${label}-before-health-settings.json" && observability_ok "$RUNNER_TEMP/gateway-${label}-before-health-settings.json" || return 1
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/secrets" "$RUNNER_TEMP/gateway-${label}-before-health-secrets.json" || return 1
             exact_secret_ok "$RUNNER_TEMP/gateway-${label}-before-health-secrets.json" || return 1
             check_health "https://$GATEWAY_DOMAIN/healthz" "${label}-health" "$candidate_version_id" || return 1
             attest_candidate_ingress "${label}-after-health" || return 1
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/settings" "$RUNNER_TEMP/gateway-${label}-after-health-settings.json" || return 1
-            binding_ok "$RUNNER_TEMP/gateway-${label}-after-health-settings.json" && observability_ok "$RUNNER_TEMP/gateway-${label}-after-health-settings.json" || return 1
+            settings_binding_ok "$RUNNER_TEMP/gateway-${label}-after-health-settings.json" && observability_ok "$RUNNER_TEMP/gateway-${label}-after-health-settings.json" || return 1
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/secrets" "$RUNNER_TEMP/gateway-${label}-after-health-secrets.json" || return 1
             exact_secret_ok "$RUNNER_TEMP/gateway-${label}-after-health-secrets.json" || return 1
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-${label}-end-list.json" || return 1
@@ -479,7 +547,11 @@ jobs:
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/settings" "$RUNNER_TEMP/gateway-${label}-settings.json" || return 1
             if test "$legacy_contained_previous" = true; then
               test "$domain_preexisting" = false || return 1
-              legacy_contained_version_ok "$RUNNER_TEMP/gateway-${label}-version.json" "$previous_version_id" || return 1
+              if test "$legacy_secret_successor_previous" = true; then
+                legacy_secret_successor_ok "$RUNNER_TEMP/gateway-${label}-version.json" "$RUNNER_TEMP/gateway-legacy-bootstrap-parent.json" "$previous_version_id" || return 1
+              else
+                legacy_contained_version_ok "$RUNNER_TEMP/gateway-${label}-version.json" "$previous_version_id" || return 1
+              fi
             else
               jq -e --arg id "$previous_version_id" '.result.id==$id' "$RUNNER_TEMP/gateway-${label}-version.json" >/dev/null || return 1
               binding_ok "$RUNNER_TEMP/gateway-${label}-version.json" || return 1
@@ -664,6 +736,14 @@ jobs:
             :
           elif test "$bootstrap" = false && test "$domain_preexisting" = false && legacy_contained_version_ok "$RUNNER_TEMP/gateway-previous.json" "$previous_version_id" && wait_domain_absent legacy-contained-preflight; then
             legacy_contained_previous=true
+          elif test "$bootstrap" = false && test "$domain_preexisting" = false; then
+            gateway_failure_stage=legacy-successor-parent-get
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/versions/$legacy_bootstrap_version_id" "$RUNNER_TEMP/gateway-legacy-bootstrap-parent.json"
+            gateway_failure_stage=legacy-successor-validate
+            legacy_secret_successor_ok "$RUNNER_TEMP/gateway-previous.json" "$RUNNER_TEMP/gateway-legacy-bootstrap-parent.json" "$previous_version_id" || exit 42
+            wait_domain_absent legacy-successor-preflight || exit 42
+            legacy_contained_previous=true
+            legacy_secret_successor_previous=true
           else
             exit 42
           fi
@@ -730,7 +810,7 @@ jobs:
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/settings" "$RUNNER_TEMP/gateway-settings.json"
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/secrets" "$RUNNER_TEMP/gateway-secrets.json"
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/subdomain" "$RUNNER_TEMP/gateway-subdomain.json"
-          binding_ok "$RUNNER_TEMP/gateway-settings.json"; observability_ok "$RUNNER_TEMP/gateway-settings.json"
+          settings_binding_ok "$RUNNER_TEMP/gateway-settings.json"; observability_ok "$RUNNER_TEMP/gateway-settings.json"
           exact_secret_ok "$RUNNER_TEMP/gateway-secrets.json"
           jq -e '.result.enabled==false and .result.previews_enabled==true' "$RUNNER_TEMP/gateway-subdomain.json" >/dev/null
           if test "$domain_preexisting" = true; then
@@ -754,6 +834,6 @@ jobs:
           gateway_failure_stage=final-attestation
           attest_candidate_provider_state final
           require_forward_budget 30
-          jq -n --arg sha "$GITHUB_SHA" --arg deployment "$candidate_deployment_id" --arg version "$candidate_version_id" --arg previous_deployment "$previous_deployment_id" --arg previous "$previous_version_id" --arg domain "$candidate_domain_id" --arg config "$EXPECTED_CONFIG_SHA256" --arg source "$EXPECTED_SOURCE_SHA256" --argjson bootstrap "$bootstrap" --argjson domain_preexisting "$domain_preexisting" --argjson legacy_contained_previous "$legacy_contained_previous" '{schema:"ssai-release-health-alert-gateway-deployment-evidence-v3",commit_sha:$sha,candidate_deployment_id:$deployment,candidate_version_id:$version,previous_deployment_id:$previous_deployment,previous_version_id:$previous,domain_id:$domain,domain_preexisting:$domain_preexisting,config_sha256:$config,source_sha256:$source,first_bootstrap:$bootstrap,legacy_contained_previous:$legacy_contained_previous,traffic_percent:100,health:"healthy",health_schema:"ssai-release-health-alert-gateway-health-v2",version_metadata_binding:"CF_VERSION_METADATA",rate_limit_namespace:"735104001",expected_secret_names:["ALERT_HMAC_KEY"],rollback_armed:true}' > "$RUNNER_TEMP/gateway-evidence.json"
+          jq -n --arg sha "$GITHUB_SHA" --arg deployment "$candidate_deployment_id" --arg version "$candidate_version_id" --arg previous_deployment "$previous_deployment_id" --arg previous "$previous_version_id" --arg domain "$candidate_domain_id" --arg config "$EXPECTED_CONFIG_SHA256" --arg source "$EXPECTED_SOURCE_SHA256" --argjson bootstrap "$bootstrap" --argjson domain_preexisting "$domain_preexisting" --argjson legacy_contained_previous "$legacy_contained_previous" --argjson legacy_secret_successor_previous "$legacy_secret_successor_previous" '{schema:"ssai-release-health-alert-gateway-deployment-evidence-v3",commit_sha:$sha,candidate_deployment_id:$deployment,candidate_version_id:$version,previous_deployment_id:$previous_deployment,previous_version_id:$previous,domain_id:$domain,domain_preexisting:$domain_preexisting,config_sha256:$config,source_sha256:$source,first_bootstrap:$bootstrap,legacy_contained_previous:$legacy_contained_previous,legacy_secret_successor_previous:$legacy_secret_successor_previous,traffic_percent:100,health:"healthy",health_schema:"ssai-release-health-alert-gateway-health-v2",version_metadata_binding:"CF_VERSION_METADATA",rate_limit_namespace:"735104001",expected_secret_names:["ALERT_HMAC_KEY"],rollback_armed:true}' > "$RUNNER_TEMP/gateway-evidence.json"
           jq -c . "$RUNNER_TEMP/gateway-evidence.json"; { echo '### Gateway deployment evidence'; echo '```json'; jq . "$RUNNER_TEMP/gateway-evidence.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           committed=true
