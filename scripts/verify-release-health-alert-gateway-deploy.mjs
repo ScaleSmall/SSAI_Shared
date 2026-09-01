@@ -69,7 +69,7 @@ for (const required of [
   '(.result.zone_id|type)=="string"', '.result.zone_id|test("^[a-f0-9]{32}$")',
   '(.result.cert_id|type)=="string"', '.result.cert_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")',
   'test "$domain_created_by_run" != true || ! valid_domain_id "$candidate_domain_id"',
-  '{hostname:$hostname,service:$service,zone_name:$zone_name}', 'domain_snapshot()', 'wait_domain()', 'wait_domain_absent()',
+  '{hostname:$hostname,service:$service,zone_name:$zone_name}', 'domain_ok()', 'wait_domain()', 'wait_domain_absent()',
   'api_delete "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$observed_domain"', 'reconcile_owned_domain_rollback()',
   'observability_ok()', '.result.observability.enabled==true', '.result.observability.logs.invocation_logs==true', '.result.logpush==false', '.result.tail_consumers//[]',
   'wait_health()', 'deadline=$((SECONDS+180))', 'reconcile_traffic_rollback()', 'deployments?force=true', 'attest_previous_provider_state()', 'attest_candidate_ingress()', 'attest_candidate_provider_state()', 'trap - EXIT', 'set +e',
@@ -100,11 +100,11 @@ assert.ok(trafficRollbackFunction.includes('deployments?force=true'), 'Changed c
 assert.ok(trafficRollbackFunction.indexOf('promoted_deployment_ok "$RUNNER_TEMP/gateway-${label}-deployment.json"') < trafficRollbackFunction.indexOf('deployments?force=true'), 'Forced rollback requires exact active candidate provenance before mutation');
 assert.equal((workflow.match(/gateway-promotion-body\.json/g) ?? []).length > 0, true);
 assert.doesNotMatch(workflow.split('          traffic_mutated=true')[1], /gateway-promotion-body\.json[^\n]*\?force=true/, 'Normal promotion must remain unforced');
-const domainSnapshotLine = workflow.split('\n').find((line) => line.includes('domain_snapshot()'));
-assert.ok(domainSnapshotLine, 'The exact custom-domain routing snapshot helper must exist');
-assert.doesNotMatch(domainSnapshotLine, /\b(?:cert_id|zone_id)\b/, 'Provider-issued certificate and zone identifiers must not override the immutable domain routing identity');
-for (const immutableField of ['id', 'hostname', 'service', 'zone_name', 'environment']) {
-  assert.match(domainSnapshotLine, new RegExp(`\\b${immutableField}\\b`), `Routing snapshot must retain ${immutableField}`);
+assert.doesNotMatch(workflow, /\b(?:domain_snapshot|previous_domain_snapshot)\b/, 'Repeated domain_ok checks supersede brittle serialized snapshots');
+const domainOkLine = workflow.split('\n').find((line) => line.includes('domain_ok()'));
+assert.ok(domainOkLine, 'The exact custom-domain identity validator must exist');
+for (const requiredIdentityCheck of ['.result.id==$id', '.result.hostname==$h', '.result.service==$s', '.result.zone_name==$z', '(.result.environment//"production")=="production"']) {
+  assert.ok(domainOkLine.includes(requiredIdentityCheck), `Domain identity must retain ${requiredIdentityCheck}`);
 }
 assert.equal((workflow.match(/-X DELETE/g) ?? []).length, 1, 'Only the exact-ID domain rollback helper may issue DELETE');
 assert.equal((workflow.match(/api_delete "accounts\/\$CLOUDFLARE_ACCOUNT_ID\/workers\/domains\/\$observed_domain"/g) ?? []).length, 1);
@@ -348,7 +348,6 @@ assert.equal(domainInventoryComplete({ result: [] }), true, 'The pinned Worker D
 assert.equal(domainInventoryComplete({ result: [], result_info: { page: 1, per_page: 20, count: 0, total_pages: 0 } }), true, 'A complete empty service-filtered domain inventory must pass');
 assert.equal(domainInventoryComplete({ result: [], result_info: null }), false, 'Malformed optional pagination metadata must fail closed');
 assert.equal(domainInventoryComplete({ result: [], result_info: { page: 1, per_page: 20, count: 0, total_pages: 2 } }), false, 'A truncated domain inventory must fail closed');
-const domainRoutingSnapshot = ({ id, hostname, service, zone_name, environment = 'production' }) => JSON.stringify({ id, hostname, service, zone_name, environment });
 const routedDomain = {
   id: 'a'.repeat(32),
   cert_id: '11111111-1111-4111-8111-111111111111',
@@ -358,16 +357,16 @@ const routedDomain = {
   zone_name: 'scalesmall.ai',
   environment: 'production',
 };
-assert.equal(
-  domainRoutingSnapshot(routedDomain),
-  domainRoutingSnapshot({ ...routedDomain, cert_id: '22222222-2222-4222-8222-222222222222' }),
-  'Provider-managed certificate rotation must preserve the same routing snapshot',
-);
-assert.equal(
-  domainRoutingSnapshot(routedDomain),
-  domainRoutingSnapshot({ ...routedDomain, zone_id: 'c'.repeat(32) }),
-  'Provider-returned zone-ID drift must not override the immutable domain ID and expected routing names',
-);
+const exactDomainDetail = ({ id, cert_id, hostname, service, zone_id, zone_name, environment }) => id === routedDomain.id
+  && hostname === routedDomain.hostname
+  && service === routedDomain.service
+  && zone_name === routedDomain.zone_name
+  && /^[a-f0-9]{32}$/.test(zone_id)
+  && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(cert_id)
+  && (environment ?? 'production') === 'production';
+assert.equal(exactDomainDetail(routedDomain), true, 'The exact intended domain must pass');
+assert.equal(exactDomainDetail({ ...routedDomain, cert_id: '22222222-2222-4222-8222-222222222222' }), true, 'A rotated valid provider certificate remains the same validated route');
+assert.equal(exactDomainDetail({ ...routedDomain, zone_id: 'c'.repeat(32) }), true, 'A well-formed provider-returned zone ID remains subordinate to immutable domain and exact routing names');
 for (const [field, value] of [
   ['id', 'd'.repeat(32)],
   ['hostname', 'other.scalesmall.ai'],
@@ -375,8 +374,10 @@ for (const [field, value] of [
   ['zone_name', 'other.example'],
   ['environment', 'staging'],
 ]) {
-  assert.notEqual(domainRoutingSnapshot(routedDomain), domainRoutingSnapshot({ ...routedDomain, [field]: value }), `Routing snapshot must detect a changed ${field}`);
+  assert.equal(exactDomainDetail({ ...routedDomain, [field]: value }), false, `Domain validation must reject a changed ${field}`);
 }
+assert.equal(exactDomainDetail({ ...routedDomain, zone_id: 'not-a-zone-id' }), false, 'Malformed provider zone identity must fail closed');
+assert.equal(exactDomainDetail({ ...routedDomain, cert_id: 'not-a-certificate-id' }), false, 'Malformed provider certificate identity must fail closed');
 const exactNormalIngress = ({ domains, hostnameDomains, routes, subdomain }) => Array.isArray(domains)
   && domains.length === 1
   && domains[0].hostname === 'alerts.scalesmall.ai'
