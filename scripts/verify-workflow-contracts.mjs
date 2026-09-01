@@ -375,7 +375,7 @@ requireText(alertGatewayDeployment, 'attest_rollback_active()', 'exact alert-gat
 requireText(alertGatewayDeployment, 'return 2', 'fail-closed alert-gateway concurrent-state classification');
 requireText(alertGatewayDeployment, 'workers/domains?service=$GATEWAY_NAME', 'service-filtered alert-gateway domain inventory');
 requireText(alertGatewayDeployment, 'workers/domains?hostname=$GATEWAY_DOMAIN', 'hostname-filtered alert-gateway domain inventory');
-requireText(alertGatewayDeployment, 'domain_list_complete()', 'complete paginated alert-gateway domain inventory');
+requireText(alertGatewayDeployment, 'domain_list_complete()', 'complete single-page alert-gateway domain inventory');
 requireText(alertGatewayDeployment, '(.result.zone_id|type)=="string"', 'validated provider-issued alert-gateway zone identity');
 requireText(alertGatewayDeployment, '.result.zone_id|test("^[a-f0-9]{32}$")', 'well-formed provider-issued alert-gateway zone identity');
 requireText(alertGatewayDeployment, '(.result.cert_id|type)=="string"', 'validated provider-managed alert-gateway TLS certificate identity');
