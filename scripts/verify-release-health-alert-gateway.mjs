@@ -6,6 +6,7 @@ import { createGateway as createGatewayImplementation } from '../workers/release
 const endpoint = 'https://alerts.scalesmall.ai/release-health-alert';
 const hmacKeyBytes = Buffer.alloc(32, 7);
 const hmacKey = hmacKeyBytes.toString('base64');
+const versionMetadata = Object.freeze({ id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', tag: '1'.repeat(40), timestamp: '2026-09-01T00:00:00.000Z' });
 const canonicalBody = JSON.stringify({ version: 2, slot: 123, failure_class: 'transport', status: null, phase: 'terminal', decision: 'delivery-failed', request_id: null });
 const id = createHash('sha256').update(`ssai-release-health-alert-id-v1\0${canonicalBody}`).digest('hex');
 const signature = createHmac('sha256', hmacKeyBytes).update(`ssai-release-health-alert-v2\0${id}\n${canonicalBody}`).digest('hex');
@@ -15,7 +16,7 @@ const allowRateLimiter = Object.freeze({
     return { success: true };
   },
 });
-const createGateway = (options = {}) => createGatewayImplementation({ rateLimiter: allowRateLimiter, hmacKey, ...options });
+const createGateway = (options = {}) => createGatewayImplementation({ rateLimiter: allowRateLimiter, hmacKey, versionMetadata, ...options });
 
 async function deliveryRequest(body = canonicalBody, overrides = {}) {
   const id = overrides.id ?? createHash('sha256').update(`ssai-release-health-alert-id-v1\0${body}`).digest('hex');
@@ -124,10 +125,25 @@ function upstream(status = 202, body = '') {
   );
   assert.equal(missingHealth.status, 503);
   assert.deepEqual(await missingHealth.json(), {
-    schema: 'ssai-release-health-alert-gateway-health-v1',
+    schema: 'ssai-release-health-alert-gateway-health-v2',
     component: 'release-health-alert-gateway',
     status: 'unhealthy',
+    version_id: null,
   });
+  for (const malformedVersionMetadata of [
+    { ...versionMetadata, id: 'not-a-version-id' },
+    { ...versionMetadata, tag: 'not-a-commit-tag' },
+    { ...versionMetadata, id: versionMetadata.id.toUpperCase() },
+    { ...versionMetadata, tag: 'A'.repeat(40) },
+  ]) {
+    const malformedHealth = await createGatewayImplementation({
+      hmacKey,
+      rateLimiter: allowRateLimiter,
+      versionMetadata: malformedVersionMetadata,
+    }).fetch(new Request('https://alerts.scalesmall.ai/healthz'));
+    assert.equal(malformedHealth.status, 503);
+    assert.equal((await malformedHealth.json()).version_id, null);
+  }
 
   const denied = createGatewayImplementation({ hmacKey,
     fetchImpl: async () => { forwarded = true; return upstream(); },
@@ -161,9 +177,10 @@ for (const status of [200, 202, 204, 208, 226]) {
   const health = await gateway.fetch(new Request('https://alerts.scalesmall.ai/healthz'));
   assert.equal(health.status, 200);
   assert.deepEqual(await health.json(), {
-    schema: 'ssai-release-health-alert-gateway-health-v1',
+    schema: 'ssai-release-health-alert-gateway-health-v2',
     component: 'release-health-alert-gateway',
     status: 'healthy',
+    version_id: versionMetadata.id,
   });
   assert.match(health.headers.get('cache-control'), /no-store/);
   assert.equal(health.headers.get('location'), null);
@@ -175,9 +192,10 @@ for (const status of [200, 202, 204, 208, 226]) {
   }));
   assert.equal(previewHealth.status, 200);
   assert.deepEqual(await previewHealth.json(), {
-    schema: 'ssai-release-health-alert-gateway-health-v1',
+    schema: 'ssai-release-health-alert-gateway-health-v2',
     component: 'release-health-alert-gateway',
     status: 'healthy',
+    version_id: versionMetadata.id,
   });
   assert.equal(previewHealth.headers.get('location'), null);
   assert.equal(previewHealth.redirected, false);
@@ -327,6 +345,7 @@ assert.deepEqual(wrangler.ratelimits, [{
   namespace_id: '735104001',
   simple: { limit: 60, period: 60 },
 }]);
+assert.deepEqual(wrangler.version_metadata, { binding: 'CF_VERSION_METADATA' });
 assert.equal(wrangler.observability.enabled, true);
 assert.equal(wrangler.observability.logs.enabled, true);
 assert.equal(wrangler.observability.logs.invocation_logs, true);

@@ -9,6 +9,8 @@ const UPSTREAM_TIMEOUT_MS = 10_000;
 const RATE_LIMIT_KEY = 'authenticated-release-health-alert-ingest';
 const PREVIEW_HEALTH_HOST_HEADER = 'x-ssai-preview-health-host';
 const HEX_64 = /^[a-f0-9]{64}$/;
+const VERSION_ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
+const VERSION_TAG = /^[a-f0-9]{40}$/;
 const PREVIEW_HEALTH_HOST = /^c-[a-f0-9]{12}-ssai-release-health-alert-gateway\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev$/;
 
 function response(status, body = null, contentType = null) {
@@ -233,7 +235,7 @@ async function forwardAlert(request, { fetchImpl, timeoutMs, bodyTimeoutMs, rate
   }
 }
 
-export function createGateway({ fetchImpl = fetch, timeoutMs = UPSTREAM_TIMEOUT_MS, bodyTimeoutMs = REQUEST_BODY_TIMEOUT_MS, rateLimiter = null, hmacKey = null } = {}) {
+export function createGateway({ fetchImpl = fetch, timeoutMs = UPSTREAM_TIMEOUT_MS, bodyTimeoutMs = REQUEST_BODY_TIMEOUT_MS, rateLimiter = null, hmacKey = null, versionMetadata = null } = {}) {
   if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function.');
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > UPSTREAM_TIMEOUT_MS) {
     throw new TypeError('timeoutMs is invalid.');
@@ -261,10 +263,16 @@ export function createGateway({ fetchImpl = fetch, timeoutMs = UPSTREAM_TIMEOUT_
         if (request.method !== 'GET') return jsonError(405, 'method_not_allowed');
         const healthRateLimiter = rateLimiter ?? env?.ALERT_INGEST_RATE_LIMITER;
         const rateLimiterReady = Boolean(healthRateLimiter) && typeof healthRateLimiter.limit === 'function';
-        return response(rateLimiterReady ? 200 : 503, JSON.stringify({
-          schema: 'ssai-release-health-alert-gateway-health-v1',
+        const healthVersion = versionMetadata ?? env?.CF_VERSION_METADATA;
+        const versionReady = Boolean(healthVersion)
+          && VERSION_ID.test(healthVersion.id ?? '')
+          && VERSION_TAG.test(healthVersion.tag ?? '');
+        const healthy = rateLimiterReady && versionReady;
+        return response(healthy ? 200 : 503, JSON.stringify({
+          schema: 'ssai-release-health-alert-gateway-health-v2',
           component: 'release-health-alert-gateway',
-          status: rateLimiterReady ? 'healthy' : 'unhealthy',
+          status: healthy ? 'healthy' : 'unhealthy',
+          version_id: versionReady ? healthVersion.id : null,
         }), 'application/json; charset=utf-8');
       }
 

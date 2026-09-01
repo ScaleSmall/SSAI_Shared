@@ -24,14 +24,22 @@ jobs:
     environment:
       name: release-health-controller-production
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       GATEWAY_CONFIG: workers/release-health-alert-gateway/wrangler.jsonc
       GATEWAY_NAME: ssai-release-health-alert-gateway
       GATEWAY_DOMAIN: alerts.scalesmall.ai
+      GATEWAY_ZONE_NAME: scalesmall.ai
       RATE_LIMITER_NAMESPACE_ID: '735104001'
     steps:
+      - name: Record hard job budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          gateway_job_started_epoch="$(date +%s)"
+          [[ "$gateway_job_started_epoch" =~ ^[0-9]{10}$ ]]
+          echo "GATEWAY_JOB_STARTED_EPOCH=$gateway_job_started_epoch" >> "$GITHUB_ENV"
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
         with: { ref: '${{ inputs.expected_sha }}', persist-credentials: false }
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
@@ -55,17 +63,26 @@ jobs:
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
           git diff --exit-code
           test -z "$(git status --porcelain --untracked-files=all)"
-          npm ci
-          node scripts/verify-release-health-alert-gateway.mjs
-          node scripts/verify-release-health-alert-gateway-deploy.mjs
+          timeout --signal=TERM --kill-after=15s 5m npm ci
+          timeout --signal=TERM --kill-after=15s 2m node scripts/verify-release-health-alert-gateway.mjs
+          timeout --signal=TERM --kill-after=15s 2m node scripts/verify-release-health-alert-gateway-deploy.mjs
           node -e "if(require('./node_modules/wrangler/package.json').version!=='4.127.1')process.exit(1)"
       - name: Dry-run immutable candidate
         shell: bash
+        env:
+          ALERT_HMAC_KEY: ${{ secrets.SSAI_RELEASE_CONTROLLER_ALERT_SIGNING_KEY }}
         run: |
           set -euo pipefail
-          ./node_modules/.bin/wrangler versions upload --config "$GATEWAY_CONFIG" --name "$GATEWAY_NAME" \
+          umask 077
+          candidate_dry_run_secrets="$RUNNER_TEMP/gateway-candidate-dry-run-secrets.json"
+          trap 'rm -f -- "$candidate_dry_run_secrets"' EXIT
+          node -e 'const fs=require("node:fs");const v=process.env.ALERT_HMAC_KEY;if(!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(v||"")||Buffer.from(v,"base64").length<32||Buffer.from(v,"base64").length>128||Buffer.from(v,"base64").toString("base64")!==v)process.exit(1);fs.writeFileSync(process.argv[1],JSON.stringify({ALERT_HMAC_KEY:v}),{mode:0o600});' "$candidate_dry_run_secrets"
+          timeout --signal=TERM --kill-after=15s 3m ./node_modules/.bin/wrangler versions upload --config "$GATEWAY_CONFIG" --name "$GATEWAY_NAME" \
             --preview-alias "c-${GITHUB_SHA:0:12}" --tag "$GITHUB_SHA" --message "candidate ${GITHUB_SHA}" \
-            --strict --dry-run --outdir "$RUNNER_TEMP/gateway-dry-run" >/dev/null
+            --secrets-file "$candidate_dry_run_secrets" --strict --dry-run --outdir "$RUNNER_TEMP/gateway-dry-run" >/dev/null
+          rm -f -- "$candidate_dry_run_secrets"
+          trap - EXIT
+          unset ALERT_HMAC_KEY
       - name: Candidate-first deploy, attestation, promotion, and rollback
         shell: bash
         env:
@@ -78,94 +95,608 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          [[ "$GATEWAY_JOB_STARTED_EPOCH" =~ ^[0-9]{10}$ ]]
+          gateway_operation_deadline_epoch=$((GATEWAY_JOB_STARTED_EPOCH+3300))
+          gateway_rollback_reserve_seconds=1200
+          gateway_promotion_deadline_epoch=$((gateway_operation_deadline_epoch-gateway_rollback_reserve_seconds))
           api=https://api.cloudflare.com/client/v4
           alias="c-${GITHUB_SHA:0:12}"
           message="release-health-alert-gateway ${GITHUB_SHA} config=${EXPECTED_CONFIG_SHA256} source=${EXPECTED_SOURCE_SHA256}"
-          previous_version_id= candidate_version_id= bootstrap_dir= bootstrap_config= traffic_mutated=false bootstrap=false
-          api_get() { curl --fail --silent --show-error --max-time 20 --proto '=https' -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api/$1" -o "$2"; jq -e '.success==true' "$2" >/dev/null; }
-          sole_version() { jq -r '[(.result.deployments//.result//[])[]]|sort_by(.created_on)|last|select((.versions|length)==1 and .versions[0].percentage==100)|.versions[0].version_id//empty' "$1"; }
-          binding_ok() { jq -e --arg ns "$RATE_LIMITER_NAMESPACE_ID" '((.result.resources.bindings//.result.bindings//[])|length)==2 and any((.result.resources.bindings//.result.bindings//[])[];.=={name:"ALERT_INGEST_RATE_LIMITER",type:"ratelimit",namespace_id:$ns,simple:{limit:60,period:60}}) and any((.result.resources.bindings//.result.bindings//[])[];.name=="ALERT_HMAC_KEY" and .type=="secret_text")' "$1" >/dev/null; }
+          promotion_message="promote ${GITHUB_SHA}"
+          domain_inventory_path="accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains?service=$GATEWAY_NAME"
+          hostname_inventory_path="accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains?hostname=$GATEWAY_DOMAIN"
+          previous_deployment_id= previous_version_id= previous_domain_id= previous_domain_snapshot= candidate_deployment_id= candidate_version_id= candidate_domain_id= candidate_secrets= bootstrap_dir= bootstrap_config= bootstrap_secrets=
+          traffic_mutated=false domain_preexisting=false domain_attach_attempted=false domain_created_by_run=false bootstrap=false bootstrap_mutation_attempted=false committed=false legacy_contained_previous=false rollback_mode=false
+          rollback_message="automatic rollback after ${GITHUB_SHA}"
+          request_timeout_seconds() {
+            local maximum="$1" now remaining
+            if test "$rollback_mode" = false && { test "$traffic_mutated" = true || test "$bootstrap_mutation_attempted" = true; } && test "$committed" != true; then
+              now="$(date +%s)" || return 1
+              [[ "$now" =~ ^[0-9]{10}$ ]] || return 1
+              remaining=$((gateway_promotion_deadline_epoch-now))
+              test "$remaining" -gt 0 || return 1
+              if test "$remaining" -lt "$maximum"; then maximum="$remaining"; fi
+            fi
+            printf '%s' "$maximum"
+          }
+          bounded_sleep() {
+            local delay="$1" now remaining
+            if test "$rollback_mode" = false && { test "$traffic_mutated" = true || test "$bootstrap_mutation_attempted" = true; } && test "$committed" != true; then
+              now="$(date +%s)" || return 1
+              [[ "$now" =~ ^[0-9]{10}$ ]] || return 1
+              remaining=$((gateway_promotion_deadline_epoch-now))
+              test "$remaining" -gt "$delay" || return 1
+            fi
+            sleep "$delay"
+          }
+          require_forward_budget() {
+            local minimum="$1" now remaining
+            now="$(date +%s)" || return 1
+            [[ "$now" =~ ^[0-9]{10}$ ]] || return 1
+            remaining=$((gateway_promotion_deadline_epoch-now))
+            test "$remaining" -ge "$minimum"
+          }
+          api_get() {
+            local path="$1" output="$2" temporary request_timeout
+            rm -f -- "$output"
+            temporary="$(mktemp "${output}.tmp.XXXXXX")" || return 1
+            request_timeout="$(request_timeout_seconds 20)" || { rm -f -- "$temporary"; return 1; }
+            if curl --fail --silent --show-error --max-time "$request_timeout" --proto '=https' -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api/$path" -o "$temporary" && jq -e '.success==true' "$temporary" >/dev/null; then
+              mv -f -- "$temporary" "$output"
+            else
+              rm -f -- "$temporary" "$output"
+              return 1
+            fi
+          }
+          api_get_status() {
+            local path="$1" output="$2" temporary code request_timeout
+            rm -f -- "$output"
+            temporary="$(mktemp "${output}.tmp.XXXXXX")" || return 1
+            request_timeout="$(request_timeout_seconds 20)" || { rm -f -- "$temporary"; return 1; }
+            if code="$(curl --silent --show-error --max-time "$request_timeout" --proto '=https' -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" --write-out '%{http_code}' "$api/$path" -o "$temporary")" && [[ "$code" =~ ^[0-9]{3}$ ]] && jq -e 'type=="object" and (.success|type)=="boolean"' "$temporary" >/dev/null; then
+              mv -f -- "$temporary" "$output"
+              printf '%s' "$code"
+            else
+              rm -f -- "$temporary" "$output"
+              return 1
+            fi
+          }
+          api_post_json() {
+            local path="$1" body="$2" output="$3" temporary request_timeout
+            rm -f -- "$output"
+            temporary="$(mktemp "${output}.tmp.XXXXXX")" || return 1
+            request_timeout="$(request_timeout_seconds 20)" || { rm -f -- "$temporary"; return 1; }
+            if curl --fail --silent --show-error --max-time "$request_timeout" --proto '=https' -X POST -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'Content-Type: application/json' --data-binary "@$body" "$api/$path" -o "$temporary" && jq -e '.success==true' "$temporary" >/dev/null; then
+              mv -f -- "$temporary" "$output"
+            else
+              rm -f -- "$temporary" "$output"
+              return 1
+            fi
+          }
+          api_put_json() {
+            local path="$1" body="$2" output="$3" temporary request_timeout
+            rm -f -- "$output"
+            temporary="$(mktemp "${output}.tmp.XXXXXX")" || return 1
+            request_timeout="$(request_timeout_seconds 20)" || { rm -f -- "$temporary"; return 1; }
+            if curl --fail --silent --show-error --max-time "$request_timeout" --proto '=https' -X PUT -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'Content-Type: application/json' --data-binary "@$body" "$api/$path" -o "$temporary" && jq -e '.success==true' "$temporary" >/dev/null; then
+              mv -f -- "$temporary" "$output"
+            else
+              rm -f -- "$temporary" "$output"
+              return 1
+            fi
+          }
+          api_delete() {
+            local path="$1" output="$2" temporary request_timeout
+            rm -f -- "$output"
+            temporary="$(mktemp "${output}.tmp.XXXXXX")" || return 1
+            request_timeout="$(request_timeout_seconds 20)" || { rm -f -- "$temporary"; return 1; }
+            if curl --fail --silent --show-error --max-time "$request_timeout" --proto '=https' -X DELETE -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api/$path" -o "$temporary" && jq -e '.success==true' "$temporary" >/dev/null; then
+              mv -f -- "$temporary" "$output"
+            else
+              rm -f -- "$temporary" "$output"
+              return 1
+            fi
+          }
+          latest_deployment_id() { jq -er '.result.deployments|select(type=="array" and length>0)|.[0]|select((.versions|type)=="array" and (.versions|length)==1 and .versions[0].percentage==100)|.id|select(type=="string")' "$1"; }
+          latest_version_id() { jq -er '.result.deployments|select(type=="array" and length>0)|.[0]|select((.versions|type)=="array" and (.versions|length)==1 and .versions[0].percentage==100)|.versions[0].version_id|select(type=="string")' "$1"; }
+          valid_uuid() { [[ "$1" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]; }
+          valid_domain_id() { [[ "$1" =~ ^[a-f0-9]{32}$ ]]; }
+          deployment_ok() { jq -e --arg deployment "$2" --arg version "$3" '.result.id==$deployment and (.result.versions|type)=="array" and (.result.versions|length)==1 and .result.versions[0].version_id==$version and .result.versions[0].percentage==100' "$1" >/dev/null; }
+          promoted_deployment_ok() { jq -e --arg deployment "$2" --arg version "$3" --arg message "$4" '.result.id==$deployment and .result.source=="api" and .result.strategy=="percentage" and (.result.created_on|type)=="string" and (.result.versions|type)=="array" and (.result.versions|length)==1 and .result.versions[0].version_id==$version and .result.versions[0].percentage==100 and .result.annotations["workers/message"]==$message' "$1" >/dev/null; }
+          binding_ok() { jq -e --arg ns "$RATE_LIMITER_NAMESPACE_ID" '((.result.resources.bindings//.result.bindings//[])|length)==3 and any((.result.resources.bindings//.result.bindings//[])[];.=={name:"ALERT_INGEST_RATE_LIMITER",type:"ratelimit",namespace_id:$ns,simple:{limit:60,period:60}}) and any((.result.resources.bindings//.result.bindings//[])[];.name=="ALERT_HMAC_KEY" and .type=="secret_text") and any((.result.resources.bindings//.result.bindings//[])[];.=={name:"CF_VERSION_METADATA",type:"version_metadata"})' "$1" >/dev/null; }
+          legacy_binding_ok() { jq -e --arg ns "$RATE_LIMITER_NAMESPACE_ID" '((.result.resources.bindings//.result.bindings//[])|length)==2 and any((.result.resources.bindings//.result.bindings//[])[];.=={name:"ALERT_INGEST_RATE_LIMITER",type:"ratelimit",namespace_id:$ns,simple:{limit:60,period:60}}) and any((.result.resources.bindings//.result.bindings//[])[];.name=="ALERT_HMAC_KEY" and .type=="secret_text")' "$1" >/dev/null; }
+          known_settings_binding_ok() { binding_ok "$1" || legacy_binding_ok "$1"; }
+          exact_secret_ok() { jq -e '[.result[]|select(.name=="ALERT_HMAC_KEY" and .type=="secret_text")]|length==1 and (.result|length)==1' "$1" >/dev/null; }
+          bootstrap_version_owned() { jq -e --arg id "$2" --arg sha "$GITHUB_SHA" '.result.id==$id and ((.result.annotations//.result.metadata.annotations//{}) as $a|$a["workers/tag"]==$sha and $a["workers/message"]==("contained bootstrap "+$sha))' "$1" >/dev/null; }
+          legacy_contained_version_ok() { jq -e --arg id "$2" '.result.id==$id and ((.result.annotations//.result.metadata.annotations//{}) as $a|($a["workers/tag"]|type)=="string" and ($a["workers/tag"]|test("^[a-f0-9]{40}$")) and $a["workers/message"]==("contained bootstrap "+$a["workers/tag"]))' "$1" >/dev/null && legacy_binding_ok "$1"; }
+          candidate_version_ok() { jq -e --arg id "$2" --arg sha "$GITHUB_SHA" --arg msg "$message" --arg alias "$alias" '.result.metadata as $metadata|(.result.annotations//.result.metadata.annotations//{}) as $annotations|([$metadata.hasPreview?,$metadata.has_preview?]|map(select(type=="boolean"))) as $preview_flags|.result.id==$id and ($metadata.created_on|type)=="string" and ($preview_flags|length)>=1 and all($preview_flags[];.==true) and $annotations["workers/tag"]==$sha and $annotations["workers/message"]==$msg and $annotations["workers/alias"]==$alias' "$1" >/dev/null && binding_ok "$1"; }
+          rollback_deployment_ok() { if test "$2" = "$previous_deployment_id"; then deployment_ok "$1" "$2" "$previous_version_id"; else promoted_deployment_ok "$1" "$2" "$previous_version_id" "$rollback_message"; fi; }
+          observability_ok() { jq -e '.result.observability.enabled==true and .result.observability.head_sampling_rate==1 and .result.observability.logs.enabled==true and .result.observability.logs.head_sampling_rate==1 and .result.observability.logs.invocation_logs==true and .result.logpush==false and ((.result.tail_consumers//[])|length)==0' "$1" >/dev/null; }
+          domain_ok() { jq -e --arg id "$2" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" '.result.id==$id and .result.hostname==$h and .result.service==$s and .result.zone_name==$z and (.result.zone_id|type)=="string" and (.result.zone_id|test("^[a-f0-9]{32}$")) and (.result.environment//"production")=="production"' "$1" >/dev/null; }
+          domain_snapshot() { jq -cS '.result|{id,cert_id,hostname,service,zone_id,zone_name,environment:(.environment//"production")}' "$1"; }
+          domain_list_complete() { jq -e '(.result|type)=="array" and ((has("result_info")|not) or ((.result_info|type)=="object" and .result_info.page==1 and (.result_info.per_page|type)=="number" and .result_info.per_page>=(.result|length) and .result_info.count==(.result|length) and (.result_info.total_pages|type)=="number" and .result_info.total_pages>=0 and .result_info.total_pages<=1))' "$1" >/dev/null; }
+          script_routes_absent() {
+            local input="$1" expected_present="$2"
+            jq -e --arg service "$GATEWAY_NAME" --argjson expected_present "$expected_present" '(.result|type)=="array" and (([.result[]|select(.id==$service)]) as $matches|if $expected_present then ($matches|length)==1 and ($matches[0]|has("routes")) and ($matches[0].routes|type)=="array" and ($matches[0].routes|length)==0 else ($matches|length)==0 end)' "$input" >/dev/null
+          }
+          timestamp_gte() { node -e 'const actual=Date.parse(process.argv[1]),bound=Date.parse(process.argv[2]);if(!Number.isFinite(actual)||!Number.isFinite(bound)||actual<bound)process.exit(1)' "$1" "$2"; }
+          make_deployment_body() { jq -n --arg version "$1" --arg message "$2" '{strategy:"percentage",versions:[{version_id:$version,percentage:100}],annotations:{"workers/message":$message}}' > "$3"; }
+          wait_active() {
+            local expected_version="$1" expected_deployment="$2" forbidden_deployment="$3" allowed_transient_version="$4" label="$5" deadline delay active_deployment active_version
+            deadline=$((SECONDS+60)); delay=1
+            while test "$SECONDS" -le "$deadline"; do
+              if api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-${label}-list.json"; then
+                active_deployment="$(latest_deployment_id "$RUNNER_TEMP/gateway-${label}-list.json")" || active_deployment=
+                active_version="$(latest_version_id "$RUNNER_TEMP/gateway-${label}-list.json")" || active_version=
+                if test "$active_version" = "$expected_version" && { test -z "$expected_deployment" || test "$active_deployment" = "$expected_deployment"; } && { test -z "$forbidden_deployment" || test "$active_deployment" != "$forbidden_deployment"; } && valid_uuid "$active_deployment"; then
+                  if api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments/$active_deployment" "$RUNNER_TEMP/gateway-${label}-deployment.json" && deployment_ok "$RUNNER_TEMP/gateway-${label}-deployment.json" "$active_deployment" "$expected_version"; then printf '%s' "$active_deployment"; return 0; fi
+                elif valid_uuid "$active_deployment" && valid_uuid "$active_version" && { test -z "$allowed_transient_version" || test "$active_version" != "$allowed_transient_version"; }; then
+                  return 2
+                fi
+              fi
+              bounded_sleep "$delay" || return 1
+              if test "$delay" -lt 5; then delay=$((delay*2)); if test "$delay" -gt 5; then delay=5; fi; fi
+            done
+            return 1
+          }
+          reconcile_traffic_rollback() {
+            local label="$1" deadline delay active_deployment active_version
+            valid_uuid "$previous_deployment_id" || return 1
+            valid_uuid "$previous_version_id" || return 1
+            valid_uuid "$candidate_version_id" || return 1
+            if test -n "$candidate_deployment_id"; then valid_uuid "$candidate_deployment_id" || return 1; fi
+            make_deployment_body "$previous_version_id" "$rollback_message" "$RUNNER_TEMP/gateway-${label}-body.json" || return 1
+            deadline=$((SECONDS+120)); delay=1
+            while test "$SECONDS" -le "$deadline"; do
+              if api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-${label}-list.json"; then
+                active_deployment="$(latest_deployment_id "$RUNNER_TEMP/gateway-${label}-list.json")" || active_deployment=
+                active_version="$(latest_version_id "$RUNNER_TEMP/gateway-${label}-list.json")" || active_version=
+                if valid_uuid "$active_deployment" && valid_uuid "$active_version" && api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments/$active_deployment" "$RUNNER_TEMP/gateway-${label}-deployment.json" && deployment_ok "$RUNNER_TEMP/gateway-${label}-deployment.json" "$active_deployment" "$active_version"; then
+                  if test "$active_version" = "$previous_version_id" && rollback_deployment_ok "$RUNNER_TEMP/gateway-${label}-deployment.json" "$active_deployment"; then
+                    printf '%s' "$active_deployment"
+                    return 0
+                  fi
+                  if test "$active_version" != "$candidate_version_id" || { test -n "$candidate_deployment_id" && test "$active_deployment" != "$candidate_deployment_id"; } || ! promoted_deployment_ok "$RUNNER_TEMP/gateway-${label}-deployment.json" "$active_deployment" "$candidate_version_id" "$promotion_message"; then
+                    return 2
+                  fi
+                  api_post_json "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments?force=true" "$RUNNER_TEMP/gateway-${label}-body.json" "$RUNNER_TEMP/gateway-${label}-response.json" || :
+                fi
+              fi
+              bounded_sleep "$delay" || return 1
+              if test "$delay" -lt 10; then delay=$((delay*2)); if test "$delay" -gt 10; then delay=10; fi; fi
+            done
+            return 1
+          }
+          attest_rollback_active() {
+            local expected_deployment="$1" label="$2" active_deployment active_version
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-${label}-list.json" || return 1
+            active_deployment="$(latest_deployment_id "$RUNNER_TEMP/gateway-${label}-list.json")" || return 1
+            active_version="$(latest_version_id "$RUNNER_TEMP/gateway-${label}-list.json")" || return 1
+            test "$active_deployment" = "$expected_deployment" && test "$active_version" = "$previous_version_id" || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments/$active_deployment" "$RUNNER_TEMP/gateway-${label}-deployment.json" || return 1
+            rollback_deployment_ok "$RUNNER_TEMP/gateway-${label}-deployment.json" "$active_deployment"
+          }
+          wait_domain() {
+            local expected_domain="$1" label="$2" deadline delay observed_domain
+            deadline=$((SECONDS+120)); delay=1
+            while test "$SECONDS" -le "$deadline"; do
+              if api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-${label}-domains.json" && domain_list_complete "$RUNNER_TEMP/gateway-${label}-domains.json" && api_get "$hostname_inventory_path" "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" && domain_list_complete "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" && jq -e --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" '(.result|length)==1 and all(.result[];.hostname==$h and .service==$s and .zone_name==$z and (.environment//"production")=="production")' "$RUNNER_TEMP/gateway-${label}-domains.json" >/dev/null && api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" "$RUNNER_TEMP/gateway-${label}-scripts.json" && script_routes_absent "$RUNNER_TEMP/gateway-${label}-scripts.json" true && api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/subdomain" "$RUNNER_TEMP/gateway-${label}-subdomain.json" && jq -e '.result.enabled==false and .result.previews_enabled==true' "$RUNNER_TEMP/gateway-${label}-subdomain.json" >/dev/null; then
+                observed_domain="$(jq -er '.result[0].id' "$RUNNER_TEMP/gateway-${label}-domains.json")" || observed_domain=
+                if valid_domain_id "$observed_domain" && jq -e --arg id "$observed_domain" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" >/dev/null && { test -z "$expected_domain" || test "$observed_domain" = "$expected_domain"; } && api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$observed_domain" "$RUNNER_TEMP/gateway-${label}-domain.json" && domain_ok "$RUNNER_TEMP/gateway-${label}-domain.json" "$observed_domain"; then printf '%s' "$observed_domain"; return 0; fi
+              fi
+              bounded_sleep "$delay" || return 1
+              if test "$delay" -lt 5; then delay=$((delay*2)); if test "$delay" -gt 5; then delay=5; fi; fi
+            done
+            return 1
+          }
+          wait_domain_absent() {
+            local label="$1" deadline delay
+            deadline=$((SECONDS+60)); delay=1
+            while test "$SECONDS" -le "$deadline"; do
+              if api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-${label}-domains.json" && domain_list_complete "$RUNNER_TEMP/gateway-${label}-domains.json" && jq -e '(.result|length)==0' "$RUNNER_TEMP/gateway-${label}-domains.json" >/dev/null && api_get "$hostname_inventory_path" "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" && domain_list_complete "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" && jq -e '(.result|length)==0' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" >/dev/null && api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" "$RUNNER_TEMP/gateway-${label}-scripts.json" && script_routes_absent "$RUNNER_TEMP/gateway-${label}-scripts.json" true && api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/subdomain" "$RUNNER_TEMP/gateway-${label}-subdomain.json" && jq -e '.result.enabled==false and .result.previews_enabled==true' "$RUNNER_TEMP/gateway-${label}-subdomain.json" >/dev/null; then return 0; fi
+              bounded_sleep "$delay" || return 1
+              if test "$delay" -lt 5; then delay=$((delay*2)); if test "$delay" -gt 5; then delay=5; fi; fi
+            done
+            return 1
+          }
+          reconcile_domain_attach_response() {
+            local label="$1" deadline delay service_count hostname_count observed_domain hostname_domain returned_domain
+            deadline=$((SECONDS+120)); delay=1
+            while test "$SECONDS" -le "$deadline"; do
+              if api_put_json "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" "$RUNNER_TEMP/gateway-domain-attach-body.json" "$RUNNER_TEMP/gateway-${label}-response.json"; then
+                returned_domain="$(jq -er '.result.id' "$RUNNER_TEMP/gateway-${label}-response.json")" || return 2
+                valid_domain_id "$returned_domain" || return 2
+                domain_ok "$RUNNER_TEMP/gateway-${label}-response.json" "$returned_domain" || return 2
+                printf '%s' "$returned_domain"
+                return 0
+              fi
+              if api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-${label}-domains.json" && domain_list_complete "$RUNNER_TEMP/gateway-${label}-domains.json" && api_get "$hostname_inventory_path" "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" && domain_list_complete "$RUNNER_TEMP/gateway-${label}-hostname-domains.json"; then
+                service_count="$(jq -er '.result|length' "$RUNNER_TEMP/gateway-${label}-domains.json")" || return 2
+                hostname_count="$(jq -er '.result|length' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json")" || return 2
+                if test "$service_count" = 0 && test "$hostname_count" = 0; then
+                  :
+                elif test "$service_count" = 1 && test "$hostname_count" = 1; then
+                  observed_domain="$(jq -er '.result[0].id' "$RUNNER_TEMP/gateway-${label}-domains.json")" || return 2
+                  hostname_domain="$(jq -er '.result[0].id' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json")" || return 2
+                  valid_domain_id "$observed_domain" && test "$hostname_domain" = "$observed_domain" || return 2
+                  jq -e --arg id "$observed_domain" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s and .result[0].zone_name==$z and (.result[0].environment//"production")=="production"' "$RUNNER_TEMP/gateway-${label}-domains.json" >/dev/null || return 2
+                  jq -e --arg id "$observed_domain" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" >/dev/null || return 2
+                  api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$observed_domain" "$RUNNER_TEMP/gateway-${label}-domain.json" || return 2
+                  domain_ok "$RUNNER_TEMP/gateway-${label}-domain.json" "$observed_domain" || return 2
+                else
+                  return 2
+                fi
+              fi
+              bounded_sleep "$delay" || return 1
+              if test "$delay" -lt 10; then delay=$((delay*2)); if test "$delay" -gt 10; then delay=10; fi; fi
+            done
+            return 1
+          }
+          reconcile_owned_domain_rollback() {
+            local label="$1" deadline delay observed_domain
+            deadline=$((SECONDS+120)); delay=1
+            while test "$SECONDS" -le "$deadline"; do
+              if api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-${label}-domains.json" && domain_list_complete "$RUNNER_TEMP/gateway-${label}-domains.json" && api_get "$hostname_inventory_path" "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" && domain_list_complete "$RUNNER_TEMP/gateway-${label}-hostname-domains.json"; then
+                if jq -e '(.result|length)==0' "$RUNNER_TEMP/gateway-${label}-domains.json" >/dev/null; then
+                  wait_domain_absent "${label}-absent"
+                  return $?
+                fi
+                if test "$domain_created_by_run" != true || ! valid_domain_id "$candidate_domain_id"; then return 2; fi
+                if ! jq -e --arg id "$candidate_domain_id" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s and .result[0].zone_name==$z and (.result[0].environment//"production")=="production"' "$RUNNER_TEMP/gateway-${label}-domains.json" >/dev/null || ! jq -e --arg id "$candidate_domain_id" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" >/dev/null; then return 2; fi
+                observed_domain="$(jq -er '.result[0].id' "$RUNNER_TEMP/gateway-${label}-domains.json")" || return 2
+                if test "$observed_domain" != "$candidate_domain_id" || ! api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$observed_domain" "$RUNNER_TEMP/gateway-${label}-domain.json" || ! domain_ok "$RUNNER_TEMP/gateway-${label}-domain.json" "$observed_domain"; then return 2; fi
+                api_delete "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$observed_domain" "$RUNNER_TEMP/gateway-${label}-delete.json" || :
+              fi
+              bounded_sleep "$delay" || return 1
+              if test "$delay" -lt 10; then delay=$((delay*2)); if test "$delay" -gt 10; then delay=10; fi; fi
+            done
+            return 1
+          }
+          contain_bootstrap() {
+            local label="$1" deadline delay code domain_absent routes_safe subdomain_safe active_deployment active_version bootstrap_owned
+            jq -n '{enabled:false,previews_enabled:true}' > "$RUNNER_TEMP/gateway-bootstrap-subdomain-body.json" || return 1
+            deadline=$((SECONDS+60)); delay=1
+            while test "$SECONDS" -le "$deadline"; do
+              code="$(api_get_status "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-${label}-deployments.json")" || code=
+              domain_absent=false routes_safe=false
+              if api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-${label}-domains.json" && domain_list_complete "$RUNNER_TEMP/gateway-${label}-domains.json" && jq -e '(.result|length)==0' "$RUNNER_TEMP/gateway-${label}-domains.json" >/dev/null && api_get "$hostname_inventory_path" "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" && domain_list_complete "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" && jq -e '(.result|length)==0' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" >/dev/null; then domain_absent=true; fi
+              if api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" "$RUNNER_TEMP/gateway-${label}-scripts.json"; then
+                if test "$code" = 404 && script_routes_absent "$RUNNER_TEMP/gateway-${label}-scripts.json" false; then routes_safe=true; fi
+                if test "$code" = 200 && script_routes_absent "$RUNNER_TEMP/gateway-${label}-scripts.json" true; then routes_safe=true; fi
+              fi
+              if test "$code" = 404 && test "$domain_absent" = true && test "$routes_safe" = true; then return 0; fi
+              if test "$code" = 200 && jq -e '.success==true' "$RUNNER_TEMP/gateway-${label}-deployments.json" >/dev/null; then
+                subdomain_safe=false bootstrap_owned=false
+                if api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/subdomain" "$RUNNER_TEMP/gateway-${label}-subdomain.json" && jq -e '.result.enabled==false and .result.previews_enabled==true' "$RUNNER_TEMP/gateway-${label}-subdomain.json" >/dev/null; then
+                  subdomain_safe=true
+                fi
+                active_deployment="$(latest_deployment_id "$RUNNER_TEMP/gateway-${label}-deployments.json")" || active_deployment=
+                active_version="$(latest_version_id "$RUNNER_TEMP/gateway-${label}-deployments.json")" || active_version=
+                if valid_uuid "$active_deployment" && valid_uuid "$active_version" && api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments/$active_deployment" "$RUNNER_TEMP/gateway-${label}-deployment.json" && deployment_ok "$RUNNER_TEMP/gateway-${label}-deployment.json" "$active_deployment" "$active_version" && api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/versions/$active_version" "$RUNNER_TEMP/gateway-${label}-version.json" && bootstrap_version_owned "$RUNNER_TEMP/gateway-${label}-version.json" "$active_version"; then
+                  bootstrap_owned=true
+                fi
+                if test "$subdomain_safe" = true && test "$domain_absent" = true && test "$routes_safe" = true; then return 0; fi
+                if test "$subdomain_safe" = false && test "$domain_absent" = true && test "$routes_safe" = true && test "$bootstrap_owned" = true; then
+                  api_post_json "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/subdomain" "$RUNNER_TEMP/gateway-bootstrap-subdomain-body.json" "$RUNNER_TEMP/gateway-${label}-subdomain-post.json" || :
+                fi
+              fi
+              bounded_sleep "$delay" || return 1
+              if test "$delay" -lt 5; then delay=$((delay*2)); if test "$delay" -gt 5; then delay=5; fi; fi
+            done
+            return 1
+          }
+          check_health() {
+            local url="$1" label="$2" expected_version="$3" preview_host="${4:-}" headers body temporary_headers temporary_body status request_timeout
+            local -a preview_header=()
+            if test -n "$preview_host"; then preview_header=(-H "X-SSAI-Preview-Health-Host: $preview_host"); fi
+            headers="$RUNNER_TEMP/gateway-${label}.headers"
+            body="$RUNNER_TEMP/gateway-${label}.json"
+            rm -f -- "$headers" "$body"
+            temporary_headers="$(mktemp "${headers}.tmp.XXXXXX")" || return 1
+            temporary_body="$(mktemp "${body}.tmp.XXXXXX")" || { rm -f -- "$temporary_headers"; return 1; }
+            request_timeout="$(request_timeout_seconds 15)" || { rm -f -- "$temporary_headers" "$temporary_body"; return 1; }
+            if status="$(curl --silent --show-error --max-time "$request_timeout" --max-filesize 1024 --proto '=https' "${preview_header[@]}" --dump-header "$temporary_headers" --write-out '%{http_code}' "$url" -o "$temporary_body")" && test "$status" = 200 && test "$(wc -c < "$temporary_headers")" -le 8192 && jq -e --arg version "$expected_version" 'keys==["component","schema","status","version_id"] and .schema=="ssai-release-health-alert-gateway-health-v2" and .component=="release-health-alert-gateway" and .status=="healthy" and .version_id==$version' "$temporary_body" >/dev/null && tr -d '\r' < "$temporary_headers" | grep -Eiq '^content-type:[[:space:]]*application/json;[[:space:]]*charset=utf-8' && tr -d '\r' < "$temporary_headers" | grep -Eiq '^cache-control:.*no-store' && tr -d '\r' < "$temporary_headers" | grep -Eiq '^x-content-type-options:[[:space:]]*nosniff' && ! tr -d '\r' < "$temporary_headers" | grep -Eiq '^(location|set-cookie):'; then
+              if mv -f -- "$temporary_headers" "$headers" && mv -f -- "$temporary_body" "$body"; then return 0; fi
+            fi
+            rm -f -- "$temporary_headers" "$temporary_body" "$headers" "$body"
+            return 1
+          }
+          wait_health() {
+            local url="$1" label="$2" expected_version="$3" deadline delay
+            deadline=$((SECONDS+180)); delay=1
+            while test "$SECONDS" -le "$deadline"; do
+              if check_health "$url" "$label" "$expected_version"; then return 0; fi
+              bounded_sleep "$delay" || return 1
+              if test "$delay" -lt 10; then delay=$((delay*2)); if test "$delay" -gt 10; then delay=10; fi; fi
+            done
+            return 1
+          }
+          attest_candidate_ingress() {
+            local label="$1"
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/subdomain" "$RUNNER_TEMP/gateway-${label}-subdomain.json" || return 1
+            jq -e '.result.enabled==false and .result.previews_enabled==true' "$RUNNER_TEMP/gateway-${label}-subdomain.json" >/dev/null || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" "$RUNNER_TEMP/gateway-${label}-scripts.json" || return 1
+            script_routes_absent "$RUNNER_TEMP/gateway-${label}-scripts.json" true || return 1
+            api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-${label}-domains.json" || return 1
+            domain_list_complete "$RUNNER_TEMP/gateway-${label}-domains.json" || return 1
+            jq -e --arg id "$candidate_domain_id" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s and .result[0].zone_name==$z and (.result[0].environment//"production")=="production"' "$RUNNER_TEMP/gateway-${label}-domains.json" >/dev/null || return 1
+            api_get "$hostname_inventory_path" "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" || return 1
+            domain_list_complete "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" || return 1
+            jq -e --arg id "$candidate_domain_id" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" >/dev/null || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$candidate_domain_id" "$RUNNER_TEMP/gateway-${label}-domain.json" || return 1
+            domain_ok "$RUNNER_TEMP/gateway-${label}-domain.json" "$candidate_domain_id" || return 1
+            if test "$domain_preexisting" = true; then test "$(domain_snapshot "$RUNNER_TEMP/gateway-${label}-domain.json")" = "$previous_domain_snapshot" || return 1; fi
+          }
+          attest_candidate_provider_state() {
+            local label="$1" active_deployment active_version observed_domain
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-${label}-begin-list.json" || return 1
+            active_deployment="$(latest_deployment_id "$RUNNER_TEMP/gateway-${label}-begin-list.json")" || return 1
+            active_version="$(latest_version_id "$RUNNER_TEMP/gateway-${label}-begin-list.json")" || return 1
+            test "$active_deployment" = "$candidate_deployment_id" && test "$active_version" = "$candidate_version_id" || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments/$active_deployment" "$RUNNER_TEMP/gateway-${label}-begin-deployment.json" || return 1
+            promoted_deployment_ok "$RUNNER_TEMP/gateway-${label}-begin-deployment.json" "$active_deployment" "$candidate_version_id" "$promotion_message" || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/versions/$candidate_version_id" "$RUNNER_TEMP/gateway-${label}-version.json" || return 1
+            candidate_version_ok "$RUNNER_TEMP/gateway-${label}-version.json" "$candidate_version_id" || return 1
+            observed_domain="$(wait_domain "$candidate_domain_id" "${label}-ready")" || return 1
+            test "$observed_domain" = "$candidate_domain_id" || return 1
+            attest_candidate_ingress "${label}-before-health" || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/settings" "$RUNNER_TEMP/gateway-${label}-before-health-settings.json" || return 1
+            binding_ok "$RUNNER_TEMP/gateway-${label}-before-health-settings.json" && observability_ok "$RUNNER_TEMP/gateway-${label}-before-health-settings.json" || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/secrets" "$RUNNER_TEMP/gateway-${label}-before-health-secrets.json" || return 1
+            exact_secret_ok "$RUNNER_TEMP/gateway-${label}-before-health-secrets.json" || return 1
+            check_health "https://$GATEWAY_DOMAIN/healthz" "${label}-health" "$candidate_version_id" || return 1
+            attest_candidate_ingress "${label}-after-health" || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/settings" "$RUNNER_TEMP/gateway-${label}-after-health-settings.json" || return 1
+            binding_ok "$RUNNER_TEMP/gateway-${label}-after-health-settings.json" && observability_ok "$RUNNER_TEMP/gateway-${label}-after-health-settings.json" || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/secrets" "$RUNNER_TEMP/gateway-${label}-after-health-secrets.json" || return 1
+            exact_secret_ok "$RUNNER_TEMP/gateway-${label}-after-health-secrets.json" || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-${label}-end-list.json" || return 1
+            active_deployment="$(latest_deployment_id "$RUNNER_TEMP/gateway-${label}-end-list.json")" || return 1
+            active_version="$(latest_version_id "$RUNNER_TEMP/gateway-${label}-end-list.json")" || return 1
+            test "$active_deployment" = "$candidate_deployment_id" && test "$active_version" = "$candidate_version_id" || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments/$active_deployment" "$RUNNER_TEMP/gateway-${label}-end-deployment.json" || return 1
+            promoted_deployment_ok "$RUNNER_TEMP/gateway-${label}-end-deployment.json" "$active_deployment" "$candidate_version_id" "$promotion_message"
+          }
+          attest_previous_provider_state() {
+            local expected_deployment="$1" label="$2" observed_domain
+            attest_rollback_active "$expected_deployment" "${label}-begin" || return 1
+            if test "$domain_preexisting" = true; then
+              observed_domain="$(wait_domain "$previous_domain_id" "${label}-domain")" || return 1
+              test "$observed_domain" = "$previous_domain_id" || return 1
+              test "$(domain_snapshot "$RUNNER_TEMP/gateway-${label}-domain-domain.json")" = "$previous_domain_snapshot" || return 1
+              wait_health "https://$GATEWAY_DOMAIN/healthz" "${label}-health" "$previous_version_id" || return 1
+            else
+              wait_domain_absent "${label}-no-ingress" || return 1
+            fi
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/versions/$previous_version_id" "$RUNNER_TEMP/gateway-${label}-version.json" || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/settings" "$RUNNER_TEMP/gateway-${label}-settings.json" || return 1
+            if test "$legacy_contained_previous" = true; then
+              test "$domain_preexisting" = false || return 1
+              legacy_contained_version_ok "$RUNNER_TEMP/gateway-${label}-version.json" "$previous_version_id" || return 1
+            else
+              jq -e --arg id "$previous_version_id" '.result.id==$id' "$RUNNER_TEMP/gateway-${label}-version.json" >/dev/null || return 1
+              binding_ok "$RUNNER_TEMP/gateway-${label}-version.json" || return 1
+            fi
+            known_settings_binding_ok "$RUNNER_TEMP/gateway-${label}-settings.json" || return 1
+            observability_ok "$RUNNER_TEMP/gateway-${label}-settings.json" || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/secrets" "$RUNNER_TEMP/gateway-${label}-secrets.json" || return 1
+            exact_secret_ok "$RUNNER_TEMP/gateway-${label}-secrets.json" || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/subdomain" "$RUNNER_TEMP/gateway-${label}-subdomain.json" || return 1
+            jq -e '.result.enabled==false and .result.previews_enabled==true' "$RUNNER_TEMP/gateway-${label}-subdomain.json" >/dev/null || return 1
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" "$RUNNER_TEMP/gateway-${label}-scripts.json" || return 1
+            script_routes_absent "$RUNNER_TEMP/gateway-${label}-scripts.json" true || return 1
+            if test "$domain_preexisting" = true; then
+              api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-${label}-service-domains.json" || return 1
+              domain_list_complete "$RUNNER_TEMP/gateway-${label}-service-domains.json" || return 1
+              jq -e --arg id "$previous_domain_id" '(.result|length)==1 and .result[0].id==$id' "$RUNNER_TEMP/gateway-${label}-service-domains.json" >/dev/null || return 1
+              api_get "$hostname_inventory_path" "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" || return 1
+              domain_list_complete "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" || return 1
+              jq -e --arg id "$previous_domain_id" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" >/dev/null || return 1
+              api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$previous_domain_id" "$RUNNER_TEMP/gateway-${label}-domain-final.json" || return 1
+              domain_ok "$RUNNER_TEMP/gateway-${label}-domain-final.json" "$previous_domain_id" || return 1
+              test "$(domain_snapshot "$RUNNER_TEMP/gateway-${label}-domain-final.json")" = "$previous_domain_snapshot" || return 1
+            else
+              api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-${label}-service-domains.json" || return 1
+              domain_list_complete "$RUNNER_TEMP/gateway-${label}-service-domains.json" || return 1
+              jq -e '(.result|length)==0' "$RUNNER_TEMP/gateway-${label}-service-domains.json" >/dev/null || return 1
+              api_get "$hostname_inventory_path" "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" || return 1
+              domain_list_complete "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" || return 1
+              jq -e '(.result|length)==0' "$RUNNER_TEMP/gateway-${label}-hostname-domains.json" >/dev/null || return 1
+            fi
+            attest_rollback_active "$expected_deployment" "${label}-end"
+          }
           finish() {
             rc=$?
-            if test "$rc" -ne 0 && test "$traffic_mutated" = true; then
-              test -n "$previous_version_id" || exit 97
-              ./node_modules/.bin/wrangler versions deploy "${previous_version_id}@100%" --config "$GATEWAY_CONFIG" --name "$GATEWAY_NAME" --message "automatic rollback after ${GITHUB_SHA}" --yes
-              api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-rollback.json"
-              test "$(sole_version "$RUNNER_TEMP/gateway-rollback.json")" = "$previous_version_id" || exit 98
+            trap - EXIT
+            set +e
+            rollback_mode=true
+            if test "$committed" != true && test "$rc" -eq 0; then rc=93; fi
+            version_rollback_rc=0 domain_rollback_rc=0 bootstrap_containment_rc=0 cleanup_rc=0
+            rollback_deployment_id= safe_to_rollback_traffic=true
+            if test "$committed" != true && test "$domain_preexisting" = false; then
+              if test "$domain_attach_attempted" = true; then
+                reconcile_owned_domain_rollback rollback-domain || { domain_rollback_rc=96; safe_to_rollback_traffic=false; }
+              elif test "$traffic_mutated" = true; then
+                wait_domain_absent rollback-domain-never-attached || { domain_rollback_rc=96; safe_to_rollback_traffic=false; }
+              fi
             fi
-            rm -rf -- "$RUNNER_TEMP/gateway-dry-run" "$RUNNER_TEMP/gateway-bootstrap-dry-run"
-            test -z "$bootstrap_dir" || rm -rf -- "$bootstrap_dir"
-            rm -f -- "$RUNNER_TEMP"/gateway-*.json "$RUNNER_TEMP"/gateway-*.jsonl "$RUNNER_TEMP"/gateway-*.headers
+            if test "$committed" != true && test "$traffic_mutated" = true && test "$safe_to_rollback_traffic" = true; then
+              rollback_deployment_id="$(reconcile_traffic_rollback rollback-traffic)" || version_rollback_rc=95
+              if test "$version_rollback_rc" -eq 0 && ! valid_uuid "$rollback_deployment_id"; then version_rollback_rc=95; fi
+            fi
+            if test "$committed" != true && test "$traffic_mutated" = true && test "$version_rollback_rc" -eq 0 && test "$domain_rollback_rc" -eq 0; then
+              attest_previous_provider_state "$rollback_deployment_id" rollback-final || version_rollback_rc=98
+            fi
+            if test "$committed" != true && test "$bootstrap_mutation_attempted" = true; then
+              contain_bootstrap bootstrap-containment || bootstrap_containment_rc=94
+            fi
+            if test -n "$candidate_secrets"; then rm -f -- "$candidate_secrets" || cleanup_rc=99; fi
+            if test -n "$bootstrap_secrets"; then rm -f -- "$bootstrap_secrets" || cleanup_rc=99; fi
+            unset ALERT_HMAC_KEY
+            rm -rf -- "$RUNNER_TEMP/gateway-dry-run" "$RUNNER_TEMP/gateway-bootstrap-dry-run" || cleanup_rc=99
+            if test -n "$bootstrap_dir"; then rm -rf -- "$bootstrap_dir" || cleanup_rc=99; fi
+            rm -f -- "$RUNNER_TEMP"/gateway-*.json "$RUNNER_TEMP"/gateway-*.jsonl "$RUNNER_TEMP"/gateway-*.headers "$RUNNER_TEMP"/gateway-*.tmp.* || cleanup_rc=99
+            if test "$version_rollback_rc" -ne 0; then echo "::error::Gateway traffic rollback was not proven (code $version_rollback_rc)."; fi
+            if test "$domain_rollback_rc" -ne 0; then echo "::error::Gateway domain rollback was not proven (code $domain_rollback_rc)."; fi
+            if test "$safe_to_rollback_traffic" = false; then echo "::error::Gateway candidate traffic was intentionally left active because removing or disproving run-created ingress was not proven."; fi
+            if test "$bootstrap_containment_rc" -ne 0; then echo "::error::Gateway bootstrap containment was not proven (code $bootstrap_containment_rc)."; fi
+            if test "$cleanup_rc" -ne 0; then echo "::error::Gateway runner cleanup was not proven (code $cleanup_rc)."; fi
+            if test "$version_rollback_rc" -ne 0; then rc="$version_rollback_rc"; elif test "$domain_rollback_rc" -ne 0; then rc="$domain_rollback_rc"; elif test "$bootstrap_containment_rc" -ne 0; then rc="$bootstrap_containment_rc"; elif test "$cleanup_rc" -ne 0; then rc="$cleanup_rc"; fi
             exit "$rc"
           }
           trap finish EXIT
           [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[a-f0-9]{32}$ ]]; test "${#CLOUDFLARE_API_TOKEN}" -ge 20
           node -e "const v=process.env.ALERT_HMAC_KEY;if(!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(v||'')||Buffer.from(v,'base64').length<32||Buffer.from(v,'base64').length>128||Buffer.from(v,'base64').toString('base64')!==v)process.exit(1)"
+          candidate_secrets="$RUNNER_TEMP/gateway-candidate-secrets.json"
+          node -e 'const fs=require("node:fs");const secret=process.env.ALERT_HMAC_KEY;if(!secret)process.exit(1);fs.writeFileSync(process.argv[1],JSON.stringify({ALERT_HMAC_KEY:secret}),{mode:0o600});' "$candidate_secrets"
+          test "$(stat -c '%a' "$candidate_secrets")" = 600
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID" "$RUNNER_TEMP/gateway-account.json"
           jq -e --arg id "$CLOUDFLARE_ACCOUNT_ID" '.result.id==$id' "$RUNNER_TEMP/gateway-account.json" >/dev/null
-          code="$(curl --silent --show-error --max-time 20 --proto '=https' -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" --write-out '%{http_code}' "$api/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" -o "$RUNNER_TEMP/gateway-preflight.json")"
+          api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-domain-preflight-list.json"
+          domain_list_complete "$RUNNER_TEMP/gateway-domain-preflight-list.json"
+          api_get "$hostname_inventory_path" "$RUNNER_TEMP/gateway-hostname-preflight-list.json"
+          domain_list_complete "$RUNNER_TEMP/gateway-hostname-preflight-list.json"
+          domain_count="$(jq -er '.result|length' "$RUNNER_TEMP/gateway-domain-preflight-list.json")"
+          hostname_domain_count="$(jq -er '.result|length' "$RUNNER_TEMP/gateway-hostname-preflight-list.json")"
+          if test "$domain_count" = 1; then
+            test "$hostname_domain_count" = 1
+            domain_preexisting=true
+            previous_domain_id="$(jq -er '.result[0].id' "$RUNNER_TEMP/gateway-domain-preflight-list.json")"
+            valid_domain_id "$previous_domain_id"
+            jq -e --arg id "$previous_domain_id" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s' "$RUNNER_TEMP/gateway-hostname-preflight-list.json" >/dev/null
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$previous_domain_id" "$RUNNER_TEMP/gateway-domain-preflight.json"
+            domain_ok "$RUNNER_TEMP/gateway-domain-preflight.json" "$previous_domain_id"
+            previous_domain_snapshot="$(domain_snapshot "$RUNNER_TEMP/gateway-domain-preflight.json")"
+          elif test "$domain_count" = 0; then
+            test "$hostname_domain_count" = 0
+          else
+            exit 40
+          fi
+          code="$(api_get_status "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-preflight.json")"
           if test "$code" = 200; then
             jq -e '.success==true' "$RUNNER_TEMP/gateway-preflight.json" >/dev/null
-            previous_version_id="$(sole_version "$RUNNER_TEMP/gateway-preflight.json")"; [[ "$previous_version_id" =~ ^[a-f0-9-]{36}$ ]]
-            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/versions/$previous_version_id" "$RUNNER_TEMP/gateway-previous.json"
-            jq -e --arg id "$previous_version_id" '.result.id==$id' "$RUNNER_TEMP/gateway-previous.json" >/dev/null
-            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/secrets" "$RUNNER_TEMP/gateway-secrets.json"
-            jq -e '[.result[]|select(.name=="ALERT_HMAC_KEY" and .type=="secret_text")]|length==1 and (.result|length)==1' "$RUNNER_TEMP/gateway-secrets.json" >/dev/null
+            previous_deployment_id="$(latest_deployment_id "$RUNNER_TEMP/gateway-preflight.json")"
+            previous_version_id="$(latest_version_id "$RUNNER_TEMP/gateway-preflight.json")"
           elif test "$code" = 404; then
-            test "$ALLOW_FIRST_BOOTSTRAP" = true; bootstrap=true
-            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" "$RUNNER_TEMP/gateway-domains.json"
-            jq -e --arg h "$GATEWAY_DOMAIN" '[.result[]|select(.hostname==$h)]|length==0' "$RUNNER_TEMP/gateway-domains.json" >/dev/null
+            test "$ALLOW_FIRST_BOOTSTRAP" = true; test "$domain_preexisting" = false; bootstrap=true
+            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" "$RUNNER_TEMP/gateway-bootstrap-preflight-scripts.json"
+            script_routes_absent "$RUNNER_TEMP/gateway-bootstrap-preflight-scripts.json" false
             bootstrap_dir="$RUNNER_TEMP/gateway-bootstrap"
             install -d -m 700 -- "$bootstrap_dir"
             cp -R -- "$(dirname "$GATEWAY_CONFIG")/." "$bootstrap_dir/"
             bootstrap_config="$bootstrap_dir/$(basename "$GATEWAY_CONFIG")"
+            bootstrap_secrets="$bootstrap_dir/bootstrap-secrets.json"
             jq '.routes=[]' "$GATEWAY_CONFIG" > "$bootstrap_config"
-            ./node_modules/.bin/wrangler deploy --config "$bootstrap_config" --name "$GATEWAY_NAME" --dry-run --outdir "$RUNNER_TEMP/gateway-bootstrap-dry-run" >/dev/null
-            ./node_modules/.bin/wrangler deploy --config "$bootstrap_config" --name "$GATEWAY_NAME" --message "contained bootstrap ${GITHUB_SHA}" --tag "$GITHUB_SHA"
-            printf '%s' "$ALERT_HMAC_KEY" | ./node_modules/.bin/wrangler secret put ALERT_HMAC_KEY --config "$bootstrap_config" --name "$GATEWAY_NAME"
+            node -e 'const fs=require("node:fs");const secret=process.env.ALERT_HMAC_KEY;if(!secret)process.exit(1);fs.writeFileSync(process.argv[1],JSON.stringify({ALERT_HMAC_KEY:secret}),{mode:0o600});' "$bootstrap_secrets"
+            timeout --signal=TERM --kill-after=15s 3m ./node_modules/.bin/wrangler deploy --config "$bootstrap_config" --name "$GATEWAY_NAME" --secrets-file "$bootstrap_secrets" --dry-run --outdir "$RUNNER_TEMP/gateway-bootstrap-dry-run" >/dev/null
+            require_forward_budget 900
+            bootstrap_mutation_attempted=true
+            timeout --signal=TERM --kill-after=15s 10m ./node_modules/.bin/wrangler deploy --config "$bootstrap_config" --name "$GATEWAY_NAME" --secrets-file "$bootstrap_secrets" --message "contained bootstrap ${GITHUB_SHA}" --tag "$GITHUB_SHA"
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-preflight.json"
-            previous_version_id="$(sole_version "$RUNNER_TEMP/gateway-preflight.json")"; [[ "$previous_version_id" =~ ^[a-f0-9-]{36}$ ]]
-            api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" "$RUNNER_TEMP/gateway-domains.json"
-            jq -e --arg h "$GATEWAY_DOMAIN" '[.result[]|select(.hostname==$h)]|length==0' "$RUNNER_TEMP/gateway-domains.json" >/dev/null
+            previous_deployment_id="$(latest_deployment_id "$RUNNER_TEMP/gateway-preflight.json")"
+            previous_version_id="$(latest_version_id "$RUNNER_TEMP/gateway-preflight.json")"
           else exit 41; fi
+          valid_uuid "$previous_deployment_id"; valid_uuid "$previous_version_id"
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments/$previous_deployment_id" "$RUNNER_TEMP/gateway-previous-deployment.json"
+          deployment_ok "$RUNNER_TEMP/gateway-previous-deployment.json" "$previous_deployment_id" "$previous_version_id"
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/versions/$previous_version_id" "$RUNNER_TEMP/gateway-previous.json"
+          jq -e --arg id "$previous_version_id" '.result.id==$id' "$RUNNER_TEMP/gateway-previous.json" >/dev/null
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/secrets" "$RUNNER_TEMP/gateway-secrets.json"
+          exact_secret_ok "$RUNNER_TEMP/gateway-secrets.json"
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/settings" "$RUNNER_TEMP/gateway-preflight-settings.json"
+          observability_ok "$RUNNER_TEMP/gateway-preflight-settings.json"
+          known_settings_binding_ok "$RUNNER_TEMP/gateway-preflight-settings.json"
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/subdomain" "$RUNNER_TEMP/gateway-preflight-subdomain.json"
+          jq -e '.result.enabled==false and .result.previews_enabled==true' "$RUNNER_TEMP/gateway-preflight-subdomain.json" >/dev/null
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" "$RUNNER_TEMP/gateway-preflight-scripts.json"
+          script_routes_absent "$RUNNER_TEMP/gateway-preflight-scripts.json" true
+          if binding_ok "$RUNNER_TEMP/gateway-previous.json"; then
+            :
+          elif test "$bootstrap" = false && test "$domain_preexisting" = false && legacy_contained_version_ok "$RUNNER_TEMP/gateway-previous.json" "$previous_version_id" && wait_domain_absent legacy-contained-preflight; then
+            legacy_contained_previous=true
+          else
+            exit 42
+          fi
+          if test "$bootstrap" = true; then
+            wait_domain_absent bootstrap-post-deploy
+          fi
+          if test "$domain_preexisting" = true; then
+            test "$(wait_domain "$previous_domain_id" preflight-existing)" = "$previous_domain_id"
+            test "$(domain_snapshot "$RUNNER_TEMP/gateway-preflight-existing-domain.json")" = "$previous_domain_snapshot"
+            wait_health "https://$GATEWAY_DOMAIN/healthz" preflight-live "$previous_version_id"
+          fi
+          if test -n "$bootstrap_secrets"; then rm -f -- "$bootstrap_secrets"; bootstrap_secrets=; fi
+          require_forward_budget 360
           upload_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          WRANGLER_OUTPUT_FILE_PATH="$RUNNER_TEMP/gateway-candidate.jsonl" ./node_modules/.bin/wrangler versions upload --config "$GATEWAY_CONFIG" --name "$GATEWAY_NAME" --preview-alias "$alias" --tag "$GITHUB_SHA" --message "$message" --strict
-          candidate_version_id="$(jq -rs '[.[]|select(.type=="version-upload")]|last|.version_id//empty' "$RUNNER_TEMP/gateway-candidate.jsonl")"
-          preview_url="$(jq -rs '[.[]|select(.type=="version-upload")]|last|.preview_alias_url//empty' "$RUNNER_TEMP/gateway-candidate.jsonl")"
-          [[ "$candidate_version_id" =~ ^[a-f0-9-]{36}$ ]]; test "$candidate_version_id" != "$previous_version_id"
+          rm -f -- "$RUNNER_TEMP/gateway-candidate.jsonl"
+          WRANGLER_OUTPUT_FILE_PATH="$RUNNER_TEMP/gateway-candidate.jsonl" timeout --signal=TERM --kill-after=15s 5m ./node_modules/.bin/wrangler versions upload --config "$GATEWAY_CONFIG" --name "$GATEWAY_NAME" --secrets-file "$candidate_secrets" --preview-alias "$alias" --tag "$GITHUB_SHA" --message "$message" --strict
+          rm -f -- "$candidate_secrets"
+          candidate_secrets=
+          unset ALERT_HMAC_KEY
+          jq -se --arg worker "$GATEWAY_NAME" '[.[]|select(.type=="version-upload")] as $events|($events|length)==1 and ($events[0]|.version==1 and .worker_name==$worker and (.worker_tag|type)=="string" and (.worker_tag|length)>0 and (.version_id|type)=="string" and (.preview_url|type)=="string" and (.preview_alias_url|type)=="string" and (.timestamp|type)=="string")' "$RUNNER_TEMP/gateway-candidate.jsonl" >/dev/null
+          candidate_version_id="$(jq -rs '[.[]|select(.type=="version-upload")][0].version_id//empty' "$RUNNER_TEMP/gateway-candidate.jsonl")"
+          preview_url="$(jq -rs '[.[]|select(.type=="version-upload")][0].preview_alias_url//empty' "$RUNNER_TEMP/gateway-candidate.jsonl")"
+          candidate_event_timestamp="$(jq -rs '[.[]|select(.type=="version-upload")][0].timestamp//empty' "$RUNNER_TEMP/gateway-candidate.jsonl")"
+          timestamp_gte "$candidate_event_timestamp" "$upload_started"
+          valid_uuid "$candidate_version_id"; test "$candidate_version_id" != "$previous_version_id"
           preview_host="$(node -e "const u=new URL(process.argv[1]);if(u.protocol!=='https:'||u.pathname!=='/'||u.search||u.hash)process.exit(1);process.stdout.write(u.hostname)" "$preview_url")"
           [[ "$preview_host" =~ ^${alias}-${GATEWAY_NAME}\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.workers\.dev$ ]]
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/versions/$candidate_version_id" "$RUNNER_TEMP/gateway-candidate-version.json"
-          jq -e --arg id "$candidate_version_id" --arg sha "$GITHUB_SHA" --arg msg "$message" --arg a "$alias" --arg started "$upload_started" '.result.id==$id and .result.metadata.created_on>=$started and .result.metadata.has_preview==true and .result.annotations["workers/tag"]==$sha and .result.annotations["workers/message"]==$msg and .result.annotations["workers/alias"]==$a' "$RUNNER_TEMP/gateway-candidate-version.json" >/dev/null
-          binding_ok "$RUNNER_TEMP/gateway-candidate-version.json"
-          status="$(curl --silent --show-error --max-time 15 --max-filesize 1024 --proto '=https' --dump-header "$RUNNER_TEMP/gateway-preview.headers" --write-out '%{http_code}' -H "X-SSAI-Preview-Health-Host: $preview_host" "$preview_url/healthz" -o "$RUNNER_TEMP/gateway-preview.json")"
-          test "$status" = 200; test "$(wc -c < "$RUNNER_TEMP/gateway-preview.headers")" -le 8192
-          jq -e 'keys==["component","schema","status"] and .schema=="ssai-release-health-alert-gateway-health-v1" and .status=="healthy"' "$RUNNER_TEMP/gateway-preview.json" >/dev/null
-          ! tr -d '\r' < "$RUNNER_TEMP/gateway-preview.headers" | grep -Eiq '^(location|set-cookie):'
+          candidate_version_ok "$RUNNER_TEMP/gateway-candidate-version.json" "$candidate_version_id"
+          candidate_created_on="$(jq -er '.result.metadata.created_on' "$RUNNER_TEMP/gateway-candidate-version.json")"
+          timestamp_gte "$candidate_created_on" "$upload_started"
+          check_health "https://$preview_host/healthz" preview "$candidate_version_id" "$preview_host"
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-recheck.json"
-          test "$(sole_version "$RUNNER_TEMP/gateway-recheck.json")" = "$previous_version_id"
-          ! jq -e --arg c "$candidate_version_id" 'any((.result.deployments//.result//[])[].versions[]?;.version_id==$c)' "$RUNNER_TEMP/gateway-recheck.json" >/dev/null
+          test "$(latest_deployment_id "$RUNNER_TEMP/gateway-recheck.json")" = "$previous_deployment_id"
+          test "$(latest_version_id "$RUNNER_TEMP/gateway-recheck.json")" = "$previous_version_id"
+          ! jq -e --arg c "$candidate_version_id" 'any(.result.deployments[].versions[]?;.version_id==$c)' "$RUNNER_TEMP/gateway-recheck.json" >/dev/null
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments/$previous_deployment_id" "$RUNNER_TEMP/gateway-recheck-deployment.json"
+          deployment_ok "$RUNNER_TEMP/gateway-recheck-deployment.json" "$previous_deployment_id" "$previous_version_id"
+          now_epoch="$(date +%s)"
+          [[ "$now_epoch" =~ ^[0-9]{10}$ ]]
+          test "$now_epoch" -le "$gateway_promotion_deadline_epoch"
+          require_forward_budget 300
           promoted="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          make_deployment_body "$candidate_version_id" "$promotion_message" "$RUNNER_TEMP/gateway-promotion-body.json"
           traffic_mutated=true
-          ./node_modules/.bin/wrangler versions deploy "${candidate_version_id}@100%" --config "$GATEWAY_CONFIG" --name "$GATEWAY_NAME" --message "promote ${GITHUB_SHA}" --yes
-          ./node_modules/.bin/wrangler triggers deploy --config "$GATEWAY_CONFIG" --name "$GATEWAY_NAME"
-          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-post.json"
-          test "$(sole_version "$RUNNER_TEMP/gateway-post.json")" = "$candidate_version_id"
-          jq -e --arg t "$promoted" '[(.result.deployments//.result//[])[]]|sort_by(.created_on)|last|.created_on >= $t' "$RUNNER_TEMP/gateway-post.json" >/dev/null
-          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains" "$RUNNER_TEMP/gateway-domains.json"
+          expected_candidate_deployment=
+          if api_post_json "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-promotion-body.json" "$RUNNER_TEMP/gateway-promotion-response.json"; then
+            possible_candidate_deployment="$(jq -er '.result.id' "$RUNNER_TEMP/gateway-promotion-response.json")"
+            if valid_uuid "$possible_candidate_deployment" && promoted_deployment_ok "$RUNNER_TEMP/gateway-promotion-response.json" "$possible_candidate_deployment" "$candidate_version_id" "$promotion_message"; then expected_candidate_deployment="$possible_candidate_deployment"; fi
+          fi
+          candidate_deployment_id="$(wait_active "$candidate_version_id" "$expected_candidate_deployment" "$previous_deployment_id" "$previous_version_id" promote)"
+          valid_uuid "$candidate_deployment_id"; test "$candidate_deployment_id" != "$previous_deployment_id"
+          api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments/$candidate_deployment_id" "$RUNNER_TEMP/gateway-post-deployment.json"
+          promoted_deployment_ok "$RUNNER_TEMP/gateway-post-deployment.json" "$candidate_deployment_id" "$candidate_version_id" "$promotion_message"
+          candidate_deployed_on="$(jq -er '.result.created_on' "$RUNNER_TEMP/gateway-post-deployment.json")"
+          timestamp_gte "$candidate_deployed_on" "$promoted"
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/settings" "$RUNNER_TEMP/gateway-settings.json"
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/secrets" "$RUNNER_TEMP/gateway-secrets.json"
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/subdomain" "$RUNNER_TEMP/gateway-subdomain.json"
-          jq -e --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '[.result[]|select(.hostname==$h and .service==$s and .environment=="production")]|length==1' "$RUNNER_TEMP/gateway-domains.json" >/dev/null
-          jq -e --arg ns "$RATE_LIMITER_NAMESPACE_ID" '(.result.bindings|length)==2 and any(.result.bindings[];.=={name:"ALERT_INGEST_RATE_LIMITER",type:"ratelimit",namespace_id:$ns,simple:{limit:60,period:60}}) and any(.result.bindings[];.name=="ALERT_HMAC_KEY" and .type=="secret_text")' "$RUNNER_TEMP/gateway-settings.json" >/dev/null
+          binding_ok "$RUNNER_TEMP/gateway-settings.json"; observability_ok "$RUNNER_TEMP/gateway-settings.json"
           jq -e '[.result[]|select(.name=="ALERT_HMAC_KEY" and .type=="secret_text")]|length==1 and (.result|length)==1' "$RUNNER_TEMP/gateway-secrets.json" >/dev/null
           jq -e '.result.enabled==false and .result.previews_enabled==true' "$RUNNER_TEMP/gateway-subdomain.json" >/dev/null
-          status="$(curl --silent --show-error --max-time 15 --max-filesize 1024 --proto '=https' --dump-header "$RUNNER_TEMP/gateway-live.headers" --write-out '%{http_code}' https://alerts.scalesmall.ai/healthz -o "$RUNNER_TEMP/gateway-live.json")"
-          test "$status" = 200; test "$(wc -c < "$RUNNER_TEMP/gateway-live.headers")" -le 8192
-          jq -e 'keys==["component","schema","status"] and .schema=="ssai-release-health-alert-gateway-health-v1" and .component=="release-health-alert-gateway" and .status=="healthy"' "$RUNNER_TEMP/gateway-live.json" >/dev/null
-          tr -d '\r' < "$RUNNER_TEMP/gateway-live.headers" | grep -Eiq '^content-type:[[:space:]]*application/json;[[:space:]]*charset=utf-8'
-          tr -d '\r' < "$RUNNER_TEMP/gateway-live.headers" | grep -Eiq '^cache-control:.*no-store'
-          tr -d '\r' < "$RUNNER_TEMP/gateway-live.headers" | grep -Eiq '^x-content-type-options:[[:space:]]*nosniff'; ! tr -d '\r' < "$RUNNER_TEMP/gateway-live.headers" | grep -Eiq '^(location|set-cookie):'
-          jq -n --arg sha "$GITHUB_SHA" --arg version "$candidate_version_id" --arg previous "$previous_version_id" --arg config "$EXPECTED_CONFIG_SHA256" --arg source "$EXPECTED_SOURCE_SHA256" --argjson bootstrap "$bootstrap" '{schema:"ssai-release-health-alert-gateway-deployment-evidence-v2",commit_sha:$sha,candidate_version_id:$version,previous_version_id:$previous,config_sha256:$config,source_sha256:$source,first_bootstrap:$bootstrap,traffic_percent:100,health:"healthy",rate_limit_namespace:"735104001",expected_secret_names:["ALERT_HMAC_KEY"],rollback_armed:true}' > "$RUNNER_TEMP/gateway-evidence.json"
+          if test "$domain_preexisting" = true; then
+            candidate_domain_id="$(wait_domain "$previous_domain_id" post-existing)"
+            test "$candidate_domain_id" = "$previous_domain_id"
+            test "$(domain_snapshot "$RUNNER_TEMP/gateway-post-existing-domain.json")" = "$previous_domain_snapshot"
+          else
+            api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-domain-attach-service-preflight.json"
+            domain_list_complete "$RUNNER_TEMP/gateway-domain-attach-service-preflight.json"
+            jq -e '(.result|length)==0' "$RUNNER_TEMP/gateway-domain-attach-service-preflight.json" >/dev/null
+            api_get "$hostname_inventory_path" "$RUNNER_TEMP/gateway-domain-attach-hostname-preflight.json"
+            domain_list_complete "$RUNNER_TEMP/gateway-domain-attach-hostname-preflight.json"
+            jq -e '(.result|length)==0' "$RUNNER_TEMP/gateway-domain-attach-hostname-preflight.json" >/dev/null
+            jq -n --arg hostname "$GATEWAY_DOMAIN" --arg service "$GATEWAY_NAME" --arg zone_name "$GATEWAY_ZONE_NAME" '{hostname:$hostname,service:$service,zone_name:$zone_name}' > "$RUNNER_TEMP/gateway-domain-attach-body.json"
+            domain_attach_attempted=true
+            candidate_domain_id="$(reconcile_domain_attach_response domain-attach)"
+            valid_domain_id "$candidate_domain_id"
+            domain_created_by_run=true
+            test "$(wait_domain "$candidate_domain_id" post-attach)" = "$candidate_domain_id"
+          fi
+          wait_health "https://$GATEWAY_DOMAIN/healthz" live "$candidate_version_id"
+          attest_candidate_provider_state final
+          require_forward_budget 30
+          jq -n --arg sha "$GITHUB_SHA" --arg deployment "$candidate_deployment_id" --arg version "$candidate_version_id" --arg previous_deployment "$previous_deployment_id" --arg previous "$previous_version_id" --arg domain "$candidate_domain_id" --arg config "$EXPECTED_CONFIG_SHA256" --arg source "$EXPECTED_SOURCE_SHA256" --argjson bootstrap "$bootstrap" --argjson domain_preexisting "$domain_preexisting" --argjson legacy_contained_previous "$legacy_contained_previous" '{schema:"ssai-release-health-alert-gateway-deployment-evidence-v3",commit_sha:$sha,candidate_deployment_id:$deployment,candidate_version_id:$version,previous_deployment_id:$previous_deployment,previous_version_id:$previous,domain_id:$domain,domain_preexisting:$domain_preexisting,config_sha256:$config,source_sha256:$source,first_bootstrap:$bootstrap,legacy_contained_previous:$legacy_contained_previous,traffic_percent:100,health:"healthy",health_schema:"ssai-release-health-alert-gateway-health-v2",version_metadata_binding:"CF_VERSION_METADATA",rate_limit_namespace:"735104001",expected_secret_names:["ALERT_HMAC_KEY"],rollback_armed:true}' > "$RUNNER_TEMP/gateway-evidence.json"
           jq -c . "$RUNNER_TEMP/gateway-evidence.json"; { echo '### Gateway deployment evidence'; echo '```json'; jq . "$RUNNER_TEMP/gateway-evidence.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          traffic_mutated=false
+          committed=true
