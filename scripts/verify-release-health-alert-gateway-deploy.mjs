@@ -71,6 +71,8 @@ for (const required of [
   'has("result_info")|not', '(.result_info|has("page")|not)', '(.result_info|has("per_page")|not)', '(.result_info|has("count")|not)', '(.result_info|has("total_pages")|not)', '(.result_info.total_pages|floor)==.result_info.total_pages', 'domain_preexisting=true', 'domain_attach_attempted=true', 'domain_created_by_run=true', 'reconcile_domain_attach_response()',
   '(.result.zone_id|type)=="string"', '.result.zone_id|test("^[a-f0-9]{32}$")',
   '(.result.cert_id|type)=="string"', '.result.cert_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")',
+  'domain_identity_compatible()', 'domain_identity_ok()', 'record_domain_ownership()', 'restore_domain_ownership()',
+  'domain_ownership_file="$RUNNER_TEMP/gateway-domain-ownership.json"',
   'test "$domain_created_by_run" != true || ! valid_domain_id "$candidate_domain_id"',
   '{hostname:$hostname,service:$service,zone_name:$zone_name}', 'domain_ok()', 'wait_domain()', 'wait_domain_absent()',
   'api_delete "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$observed_domain"', 'reconcile_owned_domain_rollback()',
@@ -104,11 +106,14 @@ assert.ok(trafficRollbackFunction.indexOf('promoted_deployment_ok "$RUNNER_TEMP/
 assert.equal((workflow.match(/gateway-promotion-body\.json/g) ?? []).length > 0, true);
 assert.doesNotMatch(workflow.split('          traffic_mutated=true')[1], /gateway-promotion-body\.json[^\n]*\?force=true/, 'Normal promotion must remain unforced');
 assert.doesNotMatch(workflow, /\b(?:domain_snapshot|previous_domain_snapshot)\b/, 'Repeated domain_ok checks supersede brittle serialized snapshots');
+const domainIdentityLine = workflow.split('\n').find((line) => line.includes('domain_identity_ok()'));
 const domainOkLine = workflow.split('\n').find((line) => line.includes('domain_ok()'));
-assert.ok(domainOkLine, 'The exact custom-domain identity validator must exist');
+assert.ok(domainIdentityLine, 'The exact custom-domain identity validator must exist');
+assert.ok(domainOkLine, 'The full custom-domain readiness validator must exist');
 for (const requiredIdentityCheck of ['.result.id==$id', '.result.hostname==$h', '.result.service==$s', '.result.zone_name==$z', '(.result.environment//"production")=="production"']) {
-  assert.ok(domainOkLine.includes(requiredIdentityCheck), `Domain identity must retain ${requiredIdentityCheck}`);
+  assert.ok(domainIdentityLine.includes(requiredIdentityCheck), `Domain identity must retain ${requiredIdentityCheck}`);
 }
+assert.ok(domainOkLine.includes('domain_identity_ok "$1" "$2"'), 'Certificate readiness must build on exact stable domain identity');
 const exactSecretFunction = workflow.split('          exact_secret_ok() {')[1].split('\n')[0];
 for (const requiredSecretCheck of ['(.result|type)=="array"', '(.result|length)==1', '.result[0].name=="ALERT_HMAC_KEY"', '.result[0].type=="secret_text"']) {
   assert.ok(exactSecretFunction.includes(requiredSecretCheck), `Exact secret inventory must retain ${requiredSecretCheck}`);
@@ -134,7 +139,11 @@ assert.equal((workflow.match(/api_delete "accounts\/\$CLOUDFLARE_ACCOUNT_ID\/wor
 assert.ok(workflow.indexOf('traffic_mutated=true') < workflow.indexOf('api_post_json "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-promotion-body.json"'));
 assert.ok(workflow.indexOf('      - name: Record hard job budget') < workflow.indexOf('      - uses: actions/checkout@'), 'The hard job budget must start before checkout and setup');
 assert.ok(workflow.indexOf('api_post_json "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-promotion-body.json"') < workflow.indexOf('domain_attach_attempted=true'));
-assert.ok(workflow.indexOf('domain_attach_attempted=true') < workflow.indexOf('candidate_domain_id="$(reconcile_domain_attach_response domain-attach)"'));
+assert.ok(workflow.indexOf('domain_attach_attempted=true') < workflow.indexOf('reconcile_domain_attach_response domain-attach'));
+assert.doesNotMatch(workflow, /candidate_domain_id="\$\(reconcile_domain_attach_response/, 'The domain attach helper must run in the parent shell so ownership state survives');
+const attachCallIndex = workflow.indexOf('reconcile_domain_attach_response domain-attach');
+assert.ok(attachCallIndex < workflow.indexOf('valid_domain_id "$candidate_domain_id"', attachCallIndex));
+assert.ok(workflow.indexOf('record_domain_ownership "$returned_domain"') < workflow.indexOf('return 0', workflow.indexOf('record_domain_ownership "$returned_domain"')), 'A successful attach response must persist ownership before returning');
 const bootstrapDeployMutation = 'wrangler deploy --config "$bootstrap_config" --name "$GATEWAY_NAME" --secrets-file "$bootstrap_secrets" --message';
 assert.ok(workflow.indexOf('require_forward_budget 900') < workflow.indexOf('bootstrap_mutation_attempted=true'), 'Bootstrap must reserve a complete forward and containment budget before mutation');
 assert.ok(workflow.indexOf('bootstrap_mutation_attempted=true') < workflow.indexOf(bootstrapDeployMutation), 'Bootstrap containment must be armed before the real Wrangler deploy');
@@ -395,28 +404,71 @@ assert.equal(mayDeleteAttachedDomain({ domainCreatedByRun: false, candidateDomai
 assert.equal(mayDeleteAttachedDomain({ domainCreatedByRun: true, candidateDomainId: 'a'.repeat(32), observedDomainId: 'b'.repeat(32) }), false, 'Rollback must never delete a domain whose immutable ID differs from this run response');
 assert.equal(mayDeleteAttachedDomain({ domainCreatedByRun: true, candidateDomainId: 'a'.repeat(32), observedDomainId: 'a'.repeat(32) }), true, 'Rollback may delete only the exact immutable domain ID proven to have been returned to this run');
 const intendedDomain = { id: 'a'.repeat(32), hostname: 'alerts.scalesmall.ai', service: config.name, zone_name: 'scalesmall.ai', environment: 'production' };
+const identityReadyDomain = { ...intendedDomain, zone_id: 'b'.repeat(32) };
+const fullyReadyDomain = { ...identityReadyDomain, cert_id: '11111111-1111-4111-8111-111111111111' };
+const domainIdentityCompatible = (domain, id = intendedDomain.id) => domain?.id === id
+  && (domain.hostname == null || domain.hostname === intendedDomain.hostname)
+  && (domain.service == null || domain.service === intendedDomain.service)
+  && (domain.zone_name == null || domain.zone_name === intendedDomain.zone_name)
+  && (domain.zone_id == null || /^[a-f0-9]{32}$/.test(domain.zone_id))
+  && (domain.environment == null || domain.environment === 'production');
+const domainIdentityReady = (domain, id = intendedDomain.id) => domainIdentityCompatible(domain, id)
+  && domain.hostname === intendedDomain.hostname
+  && domain.service === intendedDomain.service
+  && domain.zone_name === intendedDomain.zone_name
+  && /^[a-f0-9]{32}$/.test(domain.zone_id ?? '');
+const domainFullyReady = (domain, id = intendedDomain.id) => domainIdentityReady(domain, id)
+  && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(domain.cert_id ?? '');
+assert.equal(domainIdentityReady(identityReadyDomain), true, 'Stable domain identity must be recordable before certificate readiness');
+assert.equal(domainFullyReady(identityReadyDomain), false, 'Missing certificate readiness must remain ineligible for final ingress attestation');
+assert.equal(domainFullyReady(fullyReadyDomain), true, 'Full provider readiness must still require a valid certificate identity');
+assert.equal(domainIdentityCompatible({ id: intendedDomain.id, hostname: null, service: null, zone_name: null, zone_id: null, cert_id: null }), true, 'A partial acknowledged response may converge only when it contains no contradictory identity');
+assert.equal(domainIdentityCompatible({ ...identityReadyDomain, cert_id: 'pending' }), true, 'A transitional certificate value must remain a readiness concern, not an identity conflict');
+assert.equal(domainFullyReady({ ...identityReadyDomain, cert_id: 'pending' }), false, 'A transitional certificate value must never pass final readiness');
+assert.equal(domainIdentityCompatible({ id: intendedDomain.id, hostname: 'other.scalesmall.ai' }), false, 'A contradictory partial response must fail closed');
 const reconcileDomainAttach = (attempts) => {
+  let returnedId;
+  let putAttempted = false;
   for (const attempt of attempts) {
-    if (attempt.put?.success === true) {
-      if (JSON.stringify(attempt.put.result) === JSON.stringify(intendedDomain)) return { status: 'owned', id: intendedDomain.id };
-      return { status: 'conflict' };
+    if (!putAttempted && attempt.put) {
+      putAttempted = true;
+      if (attempt.put.success === true) {
+        const result = attempt.put.result;
+        if (/^[a-f0-9]{32}$/.test(result?.id ?? '')) {
+          if (!domainIdentityCompatible(result, result.id)) return { status: 'conflict' };
+          returnedId = result.id;
+          if (domainIdentityReady(result, returnedId)) return { status: 'owned', id: returnedId };
+        }
+      }
     }
     const service = attempt.serviceInventory;
     const hostname = attempt.hostnameInventory;
     if (!Array.isArray(service) || !Array.isArray(hostname)) continue;
     if (service.length === 0 && hostname.length === 0) continue;
-    if (service.length === 1 && hostname.length === 1 && JSON.stringify(service[0]) === JSON.stringify(intendedDomain) && JSON.stringify(hostname[0]) === JSON.stringify(intendedDomain) && attempt.directDomainValid === true) return { status: 'owned', id: intendedDomain.id };
+    if (!returnedId) return { status: 'conflict' };
+    if (service.length === 1 && hostname.length === 1 && service[0].id === hostname[0].id && (!returnedId || returnedId === service[0].id) && JSON.stringify(service[0]) === JSON.stringify(intendedDomain) && JSON.stringify(hostname[0]) === JSON.stringify(intendedDomain) && attempt.directDomainValid === true) return { status: 'owned', id: intendedDomain.id };
     return { status: 'conflict' };
   }
   return { status: 'timeout' };
 };
 assert.deepEqual(reconcileDomainAttach([
   { put: { success: false }, serviceInventory: [intendedDomain], hostnameInventory: [intendedDomain], directDomainValid: true },
-]), { status: 'owned', id: intendedDomain.id }, 'A committed PUT with a lost response must converge from exact dual-inventory and direct-detail proof without another mutation');
+]), { status: 'conflict' }, 'A lost PUT response must not claim ownership from inventory that a concurrent actor could have created');
 assert.deepEqual(reconcileDomainAttach([
   { put: { success: false }, serviceInventory: [], hostnameInventory: [] },
-  { put: { success: true, result: intendedDomain } },
-]), { status: 'owned', id: intendedDomain.id }, 'An uncommitted ambiguous PUT may be retried from complete empty inventories');
+  { put: { success: true, result: identityReadyDomain } },
+]), { status: 'timeout' }, 'An ambiguous attach mutation must not be repeated after complete empty inventory observations');
+assert.deepEqual(reconcileDomainAttach([
+  { put: { success: true, result: { id: intendedDomain.id, hostname: intendedDomain.hostname, service: intendedDomain.service, zone_name: intendedDomain.zone_name, zone_id: null, cert_id: null } }, serviceInventory: [], hostnameInventory: [] },
+  { serviceInventory: [intendedDomain], hostnameInventory: [intendedDomain], directDomainValid: true },
+]), { status: 'owned', id: intendedDomain.id }, 'A partial successful PUT must converge without requiring certificate readiness in its immediate response');
+assert.deepEqual(reconcileDomainAttach([
+  { put: { success: true, result: { ...identityReadyDomain, hostname: 'other.scalesmall.ai' } } },
+]), { status: 'conflict' }, 'A successful PUT with contradictory identity must fail closed');
+assert.deepEqual(reconcileDomainAttach([
+  { put: { success: true, result: { hostname: intendedDomain.hostname, service: intendedDomain.service } }, serviceInventory: [], hostnameInventory: [] },
+  { serviceInventory: [intendedDomain], hostnameInventory: [intendedDomain], directDomainValid: true },
+]), { status: 'conflict' }, 'A successful response without a valid causal ID must not infer destructive ownership from later inventory');
 assert.deepEqual(reconcileDomainAttach([
   { put: { success: false }, serviceInventory: [intendedDomain], hostnameInventory: [{ ...intendedDomain, id: 'b'.repeat(32) }], directDomainValid: true },
 ]), { status: 'conflict' }, 'Conflicting service and hostname domain identities must fail closed');
@@ -427,9 +479,18 @@ assert.deepEqual(reconcileDomainAttach([
   { put: { success: false }, serviceInventory: [intendedDomain, intendedDomain], hostnameInventory: [intendedDomain], directDomainValid: true },
 ]), { status: 'conflict' }, 'A duplicate service inventory must fail closed');
 const domainAttachFunction = workflow.split('          reconcile_domain_attach_response() {')[1].split('          reconcile_owned_domain_rollback() {')[0];
-const reconciledDomainProof = 'domain_ok "$RUNNER_TEMP/gateway-${label}-domain.json" "$observed_domain" || return 2';
-assert.ok(domainAttachFunction.indexOf(reconciledDomainProof) < domainAttachFunction.indexOf('printf \'%s\' "$observed_domain"', domainAttachFunction.indexOf(reconciledDomainProof)), 'Exact direct domain proof must precede returning the reconciled immutable ID');
-assert.ok(domainAttachFunction.indexOf('printf \'%s\' "$observed_domain"', domainAttachFunction.indexOf(reconciledDomainProof)) < domainAttachFunction.indexOf('return 0', domainAttachFunction.indexOf(reconciledDomainProof)), 'Read-after-write reconciliation must return success immediately after emitting the exact ID');
+assert.equal((domainAttachFunction.match(/api_put_json /g) ?? []).length, 1, 'Domain attach may issue only one mutation before bounded read-only convergence');
+assert.ok(domainAttachFunction.indexOf('put_attempted=true') < domainAttachFunction.indexOf('api_put_json '), 'The one-shot mutation guard must be armed before the provider call');
+assert.ok(domainAttachFunction.includes('domain_identity_compatible "$RUNNER_TEMP/gateway-${label}-response.json" "$returned_domain" || return 2'), 'The immediate response must reject contradictory identity while allowing incomplete readiness');
+assert.ok(domainAttachFunction.includes('domain_identity_ok "$RUNNER_TEMP/gateway-${label}-response.json" "$returned_domain"'), 'Stable response identity must be separated from certificate readiness');
+assert.ok(domainAttachFunction.includes('record_domain_ownership "$observed_domain"'), 'Read-after-write reconciliation must persist the exact immutable ID before returning');
+assert.ok(domainAttachFunction.includes('test -n "$returned_domain" || return 2'), 'Inventory reconciliation must never claim ownership without the exact ID returned to this run');
+assert.doesNotMatch(domainAttachFunction, /domain_ok .*return 2/, 'Certificate provisioning must not be classified as an immediate attach conflict');
+const rollbackFunction = workflow.split('          reconcile_owned_domain_rollback() {')[1].split('          contain_bootstrap() {')[0];
+assert.ok(rollbackFunction.indexOf('restore_domain_ownership') < rollbackFunction.indexOf('api_delete '), 'Rollback must recover persisted ownership before any exact-ID delete');
+assert.ok(rollbackFunction.indexOf('wait_domain_absent "${label}-absent"') < rollbackFunction.indexOf('restore_domain_ownership'), 'Rollback must prove a never-committed attach absent without requiring an ownership journal');
+assert.ok(rollbackFunction.includes('domain_identity_ok "$RUNNER_TEMP/gateway-${label}-domain.json" "$observed_domain"'), 'Rollback must prove exact stable domain identity even while certificate provisioning is incomplete');
+assert.doesNotMatch(rollbackFunction, /domain_ok .*observed_domain/, 'Certificate readiness must not prevent deletion of an exact run-owned provisioning domain');
 const rollbackOrder = ({ domainPreexisting, domainAttempted, domainCleanupProven, domainAbsenceProven }) => {
   if (domainPreexisting) return ['traffic', 'previous-attestation'];
   if (domainAttempted && !domainCleanupProven) return ['leave-candidate'];
@@ -694,6 +755,105 @@ assert.equal(exactNormalIngress({ domains: [exactDomain], hostnameDomains: [{ ..
 assert.equal(exactNormalIngress({ domains: [exactDomain], hostnameDomains: [exactDomain], routes: [{ pattern: 'scalesmall.ai/*', script: config.name }], subdomain: safeSubdomain }), false, 'An ordinary route bound to the service must fail closed');
 assert.equal(exactNormalIngress({ domains: [exactDomain], hostnameDomains: [exactDomain], routes: [], subdomain: { enabled: true, previews_enabled: true } }), false, 'A public workers.dev ingress must fail closed');
 assert.equal(exactNormalIngress({ domains: [exactDomain], hostnameDomains: [exactDomain], subdomain: safeSubdomain }), false, 'Missing ordinary-route evidence must fail closed');
+
+if (process.platform !== 'win32') {
+  const shellStart = workflow.indexOf('          valid_domain_id() {');
+  const shellEnd = workflow.indexOf('          contain_bootstrap() {', shellStart);
+  assert.ok(shellStart >= 0 && shellEnd > shellStart, 'The exact domain reconciliation functions must be extractable for Bash state-machine tests');
+  const domainFunctions = workflow.slice(shellStart, shellEnd).split('\n').map((line) => line.startsWith('          ') ? line.slice(10) : line).join('\n');
+  const bashHarness = String.raw`set -Eeuo pipefail
+${domainFunctions}
+GATEWAY_DOMAIN=alerts.scalesmall.ai
+GATEWAY_NAME=ssai-release-health-alert-gateway
+GATEWAY_ZONE_NAME=scalesmall.ai
+CLOUDFLARE_ACCOUNT_ID=cccccccccccccccccccccccccccccccc
+GITHUB_SHA=dddddddddddddddddddddddddddddddddddddddd
+GITHUB_RUN_ID=123456789
+GITHUB_RUN_ATTEMPT=1
+RUNNER_TEMP="$(mktemp -d)"
+trap 'rm -rf -- "$RUNNER_TEMP"' EXIT
+domain_ownership_file="$RUNNER_TEMP/gateway-domain-ownership.json"
+domain_inventory_path=service-inventory
+hostname_inventory_path=hostname-inventory
+DOMAIN_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ZONE_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+candidate_domain_id=
+domain_created_by_run=false
+bounded_sleep() { return 0; }
+api_get() { return 1; }
+api_put_json() {
+  jq -n --arg id "$DOMAIN_ID" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" --arg zone "$ZONE_ID" '{success:true,result:{id:$id,hostname:$h,service:$s,zone_name:$z,zone_id:$zone,cert_id:"pending",environment:"production"}}' > "$3"
+}
+reconcile_domain_attach_response partial-success
+test "$candidate_domain_id" = "$DOMAIN_ID"
+test "$domain_created_by_run" = true
+test -f "$domain_ownership_file"
+candidate_domain_id=
+domain_created_by_run=false
+restore_domain_ownership
+test "$candidate_domain_id" = "$DOMAIN_ID"
+test "$domain_created_by_run" = true
+
+rm -f -- "$domain_ownership_file"
+candidate_domain_id=
+domain_created_by_run=false
+api_put_json() { return 1; }
+write_domain_list() {
+  jq -n --arg id "$DOMAIN_ID" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" '{success:true,result:[{id:$id,hostname:$h,service:$s,zone_name:$z,environment:"production"}]}' > "$1"
+}
+api_get() { write_domain_list "$2"; }
+if reconcile_domain_attach_response lost-response; then exit 31; else rc=$?; fi
+test "$rc" -eq 2
+test "$domain_created_by_run" = false
+test ! -e "$domain_ownership_file"
+
+delete_calls=0
+api_get() { printf '%s\n' '{"success":true,"result":[]}' > "$2"; }
+wait_domain_absent() { return 0; }
+api_delete() { delete_calls=$((delete_calls+1)); return 1; }
+if reconcile_owned_domain_rollback absent; then rc=0; else rc=$?; fi
+test "$rc" -eq 0
+test "$delete_calls" -eq 0
+
+record_domain_ownership "$DOMAIN_ID"
+candidate_domain_id=
+domain_created_by_run=false
+deleted=false
+delete_calls=0
+api_get() {
+  case "$1" in
+    "$domain_inventory_path"|"$hostname_inventory_path")
+      if test "$deleted" = true; then printf '%s\n' '{"success":true,"result":[]}' > "$2"; else write_domain_list "$2"; fi
+      ;;
+    *)
+      jq -n --arg id "$DOMAIN_ID" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" --arg z "$GATEWAY_ZONE_NAME" --arg zone "$ZONE_ID" '{success:true,result:{id:$id,hostname:$h,service:$s,zone_name:$z,zone_id:$zone,cert_id:"pending",environment:"production"}}' > "$2"
+      ;;
+  esac
+}
+api_delete() {
+  test "$1" = "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$DOMAIN_ID"
+  delete_calls=$((delete_calls+1))
+  deleted=true
+  printf '%s\n' '{"success":true,"result":null}' > "$2"
+}
+wait_domain_absent() { test "$deleted" = true; }
+if reconcile_owned_domain_rollback owned; then rc=0; else rc=$?; fi
+test "$rc" -eq 0
+test "$delete_calls" -eq 1
+
+record_domain_ownership "$DOMAIN_ID"
+candidate_domain_id=
+domain_created_by_run=false
+GITHUB_RUN_ATTEMPT=2
+deleted=false
+delete_calls=0
+if reconcile_owned_domain_rollback wrong-attempt; then exit 32; else rc=$?; fi
+test "$rc" -eq 2
+test "$delete_calls" -eq 0
+`;
+  const shellResult = spawnSync('bash', ['-s'], { cwd: fileURLToPath(root), input: bashHarness, encoding: 'utf8' });
+  assert.equal(shellResult.status, 0, `Bash domain reconciliation state-machine tests failed:\n${shellResult.stdout}\n${shellResult.stderr}`);
+}
 
 const expectedConfig = process.env.SSAI_EXPECTED_ALERT_GATEWAY_CONFIG_SHA256;
 const expectedSource = process.env.SSAI_EXPECTED_ALERT_GATEWAY_SOURCE_SHA256;
