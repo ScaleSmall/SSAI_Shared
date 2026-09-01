@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { cp, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -139,6 +139,66 @@ const finishFunction = workflow.split('          finish() {')[1].split('        
 assert.ok(finishFunction.indexOf('reconcile_owned_domain_rollback rollback-domain') < finishFunction.indexOf('reconcile_traffic_rollback rollback-traffic'), 'A newly attached domain must be removed before predecessor traffic can be restored');
 assert.ok(finishFunction.includes('safe_to_rollback_traffic=false'), 'Failed domain cleanup must retain safe candidate traffic');
 assert.ok(finishFunction.indexOf('test "$safe_to_rollback_traffic" = true') < finishFunction.indexOf('reconcile_traffic_rollback rollback-traffic'), 'Traffic rollback must be gated by proven ingress cleanup');
+const gatewayFailureStages = [
+  'account-id-shape', 'api-token-shape', 'signing-key-shape', 'secret-file-write', 'secret-file-mode',
+  'account-get', 'account-validate', 'service-domain-get', 'service-domain-validate', 'hostname-domain-get',
+  'hostname-domain-validate', 'domain-count', 'preexisting-domain-id', 'preexisting-domain-hostname',
+  'preexisting-domain-detail-get', 'preexisting-domain-detail-validate', 'deployments-get', 'deployment-list-validate',
+  'deployment-id', 'version-id', 'bootstrap-authorization', 'bootstrap-script-routes', 'bootstrap-staging', 'bootstrap-dry-run',
+  'bootstrap-deploy', 'deployment-ids-validate', 'deployment-detail-get', 'deployment-detail-validate',
+  'version-detail-get', 'version-detail-validate', 'secrets-get', 'secrets-validate', 'settings-get',
+  'settings-observability', 'settings-bindings', 'subdomain-get', 'subdomain-validate', 'scripts-get',
+  'script-routes', 'active-version-bindings', 'bootstrap-domain-absence', 'domain-ready', 'live-health', 'preflight-secret-cleanup',
+  'candidate-upload', 'candidate-preview', 'promotion', 'ingress', 'final-attestation', 'unclassified',
+];
+const reporterStart = workflow.indexOf('          report_gateway_failure_stage() {');
+const reporterEnd = workflow.indexOf('          request_timeout_seconds() {', reporterStart);
+assert.ok(reporterStart >= 0 && reporterEnd > reporterStart, 'Gateway diagnostics must have one bounded reporter');
+const reporterFunction = workflow.slice(reporterStart, reporterEnd);
+const reporterAllowlistLine = reporterFunction.split('\n').find((line) => line.trim().endsWith(') ;;') && line.includes('|'));
+assert.ok(reporterAllowlistLine, 'Gateway diagnostic reporter must use one literal allowlist');
+assert.deepEqual(reporterAllowlistLine.trim().slice(0, -4).split('|'), gatewayFailureStages, 'Gateway diagnostic stage allowlist must remain exact and closed');
+assert.ok(reporterFunction.includes('*) stage=unclassified ;;'), 'Unknown gateway diagnostic stages must fail closed to unclassified');
+assert.doesNotMatch(reporterFunction, /BASH_COMMAND|CLOUDFLARE_|RUNNER_TEMP|GATEWAY_DOMAIN|https?:|response|headers|GITHUB_(?:ENV|OUTPUT|STEP_SUMMARY)/i, 'Gateway diagnostic output must not expose command, provider, URL, environment, or response data');
+assert.equal((workflow.match(/Gateway deployment failed at an allowlisted stage/g) ?? []).length, 1, 'Gateway failure diagnostics must emit one fixed annotation');
+assert.ok(finishFunction.includes('if test "$forward_rc" -ne 0; then report_gateway_failure_stage "$gateway_failure_stage"; fi'), 'Only failed forward execution may emit the allowlisted diagnostic stage');
+const stageAssignments = [...workflow.matchAll(/^\s+gateway_failure_stage=([^\s]+)\s*$/gm)].map((match) => match[1]);
+assert.equal((workflow.match(/gateway_failure_stage=/g) ?? []).length, stageAssignments.length, 'Gateway failure stages must only use bare literal assignments');
+assert.deepEqual([...new Set(stageAssignments)].sort(), gatewayFailureStages.filter((stage) => stage !== 'unclassified').sort(), 'Every non-fallback gateway stage must be reachable and allowlisted');
+const assertStageOwnsCommand = (stage, command) => {
+  const stageIndex = workflow.indexOf(`gateway_failure_stage=${stage}`);
+  const nextStageIndex = workflow.indexOf('gateway_failure_stage=', stageIndex + 1);
+  const commandIndex = workflow.indexOf(command, stageIndex);
+  assert.ok(stageIndex >= 0 && commandIndex > stageIndex && (nextStageIndex < 0 || commandIndex < nextStageIndex), `${stage} must remain active through ${command}`);
+};
+for (const [stage, command] of [
+  ['account-id-shape', '[[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[a-f0-9]{32}$ ]]'],
+  ['api-token-shape', 'test "${#CLOUDFLARE_API_TOKEN}" -ge 20'],
+  ['signing-key-shape', 'const v=process.env.ALERT_HMAC_KEY'],
+  ['account-get', 'api_get "accounts/$CLOUDFLARE_ACCOUNT_ID"'],
+  ['service-domain-get', 'api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-domain-preflight-list.json"'],
+  ['bootstrap-staging', 'node -e \'const fs=require("node:fs");const secret=process.env.ALERT_HMAC_KEY'],
+  ['deployment-ids-validate', 'valid_uuid "$previous_deployment_id"; valid_uuid "$previous_version_id"'],
+  ['active-version-bindings', 'if binding_ok "$RUNNER_TEMP/gateway-previous.json"; then'],
+  ['domain-ready', 'test "$(wait_domain "$previous_domain_id" preflight-existing)" = "$previous_domain_id"'],
+  ['live-health', 'wait_health "https://$GATEWAY_DOMAIN/healthz" preflight-live "$previous_version_id"'],
+  ['preflight-secret-cleanup', 'if test -n "$bootstrap_secrets"; then rm -f -- "$bootstrap_secrets"'],
+  ['candidate-upload', 'require_forward_budget 360'],
+  ['candidate-preview', 'check_health "https://$preview_host/healthz" preview'],
+  ['promotion', 'promoted="$(date -u +%Y-%m-%dT%H:%M:%SZ)"'],
+  ['ingress', 'api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/settings" "$RUNNER_TEMP/gateway-settings.json"'],
+  ['final-attestation', 'attest_candidate_provider_state final'],
+]) assertStageOwnsCommand(stage, command);
+if (process.platform !== 'win32') {
+  const runnableReporter = reporterFunction.replace(/^ {10}/gm, '');
+  const runDiagnosticHarness = (stage) => spawnSync('bash', ['--noprofile', '--norc', '-c', `set -euo pipefail\n${runnableReporter}\ngateway_failure_stage=${stage}\nfinish_test() { rc=$?; trap - EXIT; set +e; if test "$rc" -ne 0; then report_gateway_failure_stage "$gateway_failure_stage"; fi; exit "$rc"; }\ntrap finish_test EXIT\nfalse\n`], { encoding: 'utf8' });
+  const classifiedFailure = runDiagnosticHarness('settings-bindings');
+  assert.equal(classifiedFailure.status, 1, 'Gateway diagnostics must preserve a representative failure exit code');
+  assert.equal(classifiedFailure.stdout.trim(), '::error::Gateway deployment failed at an allowlisted stage (stage=settings-bindings).');
+  const unclassifiedFailure = runDiagnosticHarness('not-an-allowlisted-stage');
+  assert.equal(unclassifiedFailure.status, 1, 'Unknown diagnostic stages must preserve the original failure exit code');
+  assert.equal(unclassifiedFailure.stdout.trim(), '::error::Gateway deployment failed at an allowlisted stage (stage=unclassified).');
+}
 const candidateAttestation = workflow.split('          attest_candidate_provider_state() {')[1].split('          attest_previous_provider_state() {')[0];
 const healthIndex = candidateAttestation.indexOf('check_health "https://$GATEWAY_DOMAIN/healthz"');
 const postHealthIngressIndex = candidateAttestation.indexOf('attest_candidate_ingress "${label}-after-health"');

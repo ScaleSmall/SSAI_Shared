@@ -405,6 +405,14 @@ requireText(alertGatewayDeployment, 'require_forward_budget 300', 'minimum alert
 requireText(alertGatewayDeployment, 'rollback_mode=true', 'reserved alert-gateway rollback mode');
 requireText(alertGatewayDeployment, 'trap - EXIT', 'non-recursive alert-gateway cleanup trap');
 requireText(alertGatewayDeployment, 'set +e', 'best-effort alert-gateway rollback sequence');
+requireText(alertGatewayDeployment, 'gateway_failure_stage=account-id-shape', 'initialized alert-gateway failure stage');
+requireText(alertGatewayDeployment, 'report_gateway_failure_stage()', 'closed alert-gateway failure-stage reporter');
+requireText(alertGatewayDeployment, '*) stage=unclassified ;;', 'fail-closed alert-gateway diagnostic fallback');
+requireText(alertGatewayDeployment, 'Gateway deployment failed at an allowlisted stage (stage=%s).', 'redacted alert-gateway failure-stage annotation');
+requireText(alertGatewayDeployment, 'report_gateway_failure_stage "$gateway_failure_stage"', 'normalized alert-gateway failure-stage emission');
+rejectPattern(alertGatewayDeployment, /gateway_failure_stage=(?:"|'|\$|\{)/, 'dynamic alert-gateway diagnostic stage assignment');
+const alertGatewayFailureReporter = alertGatewayDeployment.split('          report_gateway_failure_stage() {')[1].split('          request_timeout_seconds() {')[0];
+rejectPattern(alertGatewayFailureReporter, /BASH_COMMAND|CLOUDFLARE_|RUNNER_TEMP|GATEWAY_DOMAIN|https?:|response|headers|GITHUB_(?:ENV|OUTPUT|STEP_SUMMARY)/i, 'sensitive alert-gateway failure diagnostics');
 rejectPattern(alertGatewayDeployment, /\$RUNNER_TEMP\/gateway-bootstrap\.jsonc/, 'detached alert-gateway bootstrap config');
 rejectPattern(alertGatewayDeployment, /wrangler\s+secret\s+put/i, 'non-atomic alert-gateway bootstrap secret mutation');
 rejectPattern(alertGatewayDeployment, /wrangler\s+versions\s+deploy|wrangler\s+triggers\s+deploy/i, 'Wrangler alert-gateway production mutation');

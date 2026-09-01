@@ -107,7 +107,16 @@ jobs:
           hostname_inventory_path="accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains?hostname=$GATEWAY_DOMAIN"
           previous_deployment_id= previous_version_id= previous_domain_id= candidate_deployment_id= candidate_version_id= candidate_domain_id= candidate_secrets= bootstrap_dir= bootstrap_config= bootstrap_secrets=
           traffic_mutated=false domain_preexisting=false domain_attach_attempted=false domain_created_by_run=false bootstrap=false bootstrap_mutation_attempted=false committed=false legacy_contained_previous=false rollback_mode=false
+          gateway_failure_stage=account-id-shape
           rollback_message="automatic rollback after ${GITHUB_SHA}"
+          report_gateway_failure_stage() {
+            local stage="${1:-unclassified}"
+            case "$stage" in
+              account-id-shape|api-token-shape|signing-key-shape|secret-file-write|secret-file-mode|account-get|account-validate|service-domain-get|service-domain-validate|hostname-domain-get|hostname-domain-validate|domain-count|preexisting-domain-id|preexisting-domain-hostname|preexisting-domain-detail-get|preexisting-domain-detail-validate|deployments-get|deployment-list-validate|deployment-id|version-id|bootstrap-authorization|bootstrap-script-routes|bootstrap-staging|bootstrap-dry-run|bootstrap-deploy|deployment-ids-validate|deployment-detail-get|deployment-detail-validate|version-detail-get|version-detail-validate|secrets-get|secrets-validate|settings-get|settings-observability|settings-bindings|subdomain-get|subdomain-validate|scripts-get|script-routes|active-version-bindings|bootstrap-domain-absence|domain-ready|live-health|preflight-secret-cleanup|candidate-upload|candidate-preview|promotion|ingress|final-attestation|unclassified) ;;
+              *) stage=unclassified ;;
+            esac
+            printf '::error::Gateway deployment failed at an allowlisted stage (stage=%s).\n' "$stage"
+          }
           request_timeout_seconds() {
             local maximum="$1" now remaining
             if test "$rollback_mode" = false && { test "$traffic_mutated" = true || test "$bootstrap_mutation_attempted" = true; } && test "$committed" != true; then
@@ -507,6 +516,8 @@ jobs:
             set +e
             rollback_mode=true
             if test "$committed" != true && test "$rc" -eq 0; then rc=93; fi
+            forward_rc="$rc"
+            if test "$forward_rc" -ne 0; then report_gateway_failure_stage "$gateway_failure_stage"; fi
             version_rollback_rc=0 domain_rollback_rc=0 bootstrap_containment_rc=0 cleanup_rc=0
             rollback_deployment_id= safe_to_rollback_traffic=true
             if test "$committed" != true && test "$domain_preexisting" = false; then
@@ -541,41 +552,64 @@ jobs:
             exit "$rc"
           }
           trap finish EXIT
-          [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[a-f0-9]{32}$ ]]; test "${#CLOUDFLARE_API_TOKEN}" -ge 20
+          [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[a-f0-9]{32}$ ]]
+          gateway_failure_stage=api-token-shape
+          test "${#CLOUDFLARE_API_TOKEN}" -ge 20
+          gateway_failure_stage=signing-key-shape
           node -e "const v=process.env.ALERT_HMAC_KEY;if(!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(v||'')||Buffer.from(v,'base64').length<32||Buffer.from(v,'base64').length>128||Buffer.from(v,'base64').toString('base64')!==v)process.exit(1)"
           candidate_secrets="$RUNNER_TEMP/gateway-candidate-secrets.json"
+          gateway_failure_stage=secret-file-write
           node -e 'const fs=require("node:fs");const secret=process.env.ALERT_HMAC_KEY;if(!secret)process.exit(1);fs.writeFileSync(process.argv[1],JSON.stringify({ALERT_HMAC_KEY:secret}),{mode:0o600});' "$candidate_secrets"
+          gateway_failure_stage=secret-file-mode
           test "$(stat -c '%a' "$candidate_secrets")" = 600
+          gateway_failure_stage=account-get
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID" "$RUNNER_TEMP/gateway-account.json"
+          gateway_failure_stage=account-validate
           jq -e --arg id "$CLOUDFLARE_ACCOUNT_ID" '.result.id==$id' "$RUNNER_TEMP/gateway-account.json" >/dev/null
+          gateway_failure_stage=service-domain-get
           api_get "$domain_inventory_path" "$RUNNER_TEMP/gateway-domain-preflight-list.json"
+          gateway_failure_stage=service-domain-validate
           domain_list_complete "$RUNNER_TEMP/gateway-domain-preflight-list.json"
+          gateway_failure_stage=hostname-domain-get
           api_get "$hostname_inventory_path" "$RUNNER_TEMP/gateway-hostname-preflight-list.json"
+          gateway_failure_stage=hostname-domain-validate
           domain_list_complete "$RUNNER_TEMP/gateway-hostname-preflight-list.json"
+          gateway_failure_stage=domain-count
           domain_count="$(jq -er '.result|length' "$RUNNER_TEMP/gateway-domain-preflight-list.json")"
           hostname_domain_count="$(jq -er '.result|length' "$RUNNER_TEMP/gateway-hostname-preflight-list.json")"
           if test "$domain_count" = 1; then
             test "$hostname_domain_count" = 1
             domain_preexisting=true
+            gateway_failure_stage=preexisting-domain-id
             previous_domain_id="$(jq -er '.result[0].id' "$RUNNER_TEMP/gateway-domain-preflight-list.json")"
             valid_domain_id "$previous_domain_id"
+            gateway_failure_stage=preexisting-domain-hostname
             jq -e --arg id "$previous_domain_id" --arg h "$GATEWAY_DOMAIN" --arg s "$GATEWAY_NAME" '(.result|length)==1 and .result[0].id==$id and .result[0].hostname==$h and .result[0].service==$s' "$RUNNER_TEMP/gateway-hostname-preflight-list.json" >/dev/null
+            gateway_failure_stage=preexisting-domain-detail-get
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/domains/$previous_domain_id" "$RUNNER_TEMP/gateway-domain-preflight.json"
+            gateway_failure_stage=preexisting-domain-detail-validate
             domain_ok "$RUNNER_TEMP/gateway-domain-preflight.json" "$previous_domain_id"
           elif test "$domain_count" = 0; then
             test "$hostname_domain_count" = 0
           else
             exit 40
           fi
+          gateway_failure_stage=deployments-get
           code="$(api_get_status "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-preflight.json")"
           if test "$code" = 200; then
+            gateway_failure_stage=deployment-list-validate
             jq -e '.success==true' "$RUNNER_TEMP/gateway-preflight.json" >/dev/null
+            gateway_failure_stage=deployment-id
             previous_deployment_id="$(latest_deployment_id "$RUNNER_TEMP/gateway-preflight.json")"
+            gateway_failure_stage=version-id
             previous_version_id="$(latest_version_id "$RUNNER_TEMP/gateway-preflight.json")"
           elif test "$code" = 404; then
+            gateway_failure_stage=bootstrap-authorization
             test "$ALLOW_FIRST_BOOTSTRAP" = true; test "$domain_preexisting" = false; bootstrap=true
+            gateway_failure_stage=bootstrap-script-routes
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" "$RUNNER_TEMP/gateway-bootstrap-preflight-scripts.json"
             script_routes_absent "$RUNNER_TEMP/gateway-bootstrap-preflight-scripts.json" false
+            gateway_failure_stage=bootstrap-staging
             bootstrap_dir="$RUNNER_TEMP/gateway-bootstrap"
             install -d -m 700 -- "$bootstrap_dir"
             cp -R -- "$(dirname "$GATEWAY_CONFIG")/." "$bootstrap_dir/"
@@ -583,28 +617,48 @@ jobs:
             bootstrap_secrets="$bootstrap_dir/bootstrap-secrets.json"
             jq '.routes=[]' "$GATEWAY_CONFIG" > "$bootstrap_config"
             node -e 'const fs=require("node:fs");const secret=process.env.ALERT_HMAC_KEY;if(!secret)process.exit(1);fs.writeFileSync(process.argv[1],JSON.stringify({ALERT_HMAC_KEY:secret}),{mode:0o600});' "$bootstrap_secrets"
+            gateway_failure_stage=bootstrap-dry-run
             timeout --signal=TERM --kill-after=15s 3m ./node_modules/.bin/wrangler deploy --config "$bootstrap_config" --name "$GATEWAY_NAME" --secrets-file "$bootstrap_secrets" --dry-run --outdir "$RUNNER_TEMP/gateway-bootstrap-dry-run" >/dev/null
             require_forward_budget 900
             bootstrap_mutation_attempted=true
+            gateway_failure_stage=bootstrap-deploy
             timeout --signal=TERM --kill-after=15s 10m ./node_modules/.bin/wrangler deploy --config "$bootstrap_config" --name "$GATEWAY_NAME" --secrets-file "$bootstrap_secrets" --message "contained bootstrap ${GITHUB_SHA}" --tag "$GITHUB_SHA"
+            gateway_failure_stage=deployments-get
             api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-preflight.json"
+            gateway_failure_stage=deployment-id
             previous_deployment_id="$(latest_deployment_id "$RUNNER_TEMP/gateway-preflight.json")"
+            gateway_failure_stage=version-id
             previous_version_id="$(latest_version_id "$RUNNER_TEMP/gateway-preflight.json")"
           else exit 41; fi
+          gateway_failure_stage=deployment-ids-validate
           valid_uuid "$previous_deployment_id"; valid_uuid "$previous_version_id"
+          gateway_failure_stage=deployment-detail-get
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments/$previous_deployment_id" "$RUNNER_TEMP/gateway-previous-deployment.json"
+          gateway_failure_stage=deployment-detail-validate
           deployment_ok "$RUNNER_TEMP/gateway-previous-deployment.json" "$previous_deployment_id" "$previous_version_id"
+          gateway_failure_stage=version-detail-get
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/versions/$previous_version_id" "$RUNNER_TEMP/gateway-previous.json"
+          gateway_failure_stage=version-detail-validate
           jq -e --arg id "$previous_version_id" '.result.id==$id' "$RUNNER_TEMP/gateway-previous.json" >/dev/null
+          gateway_failure_stage=secrets-get
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/secrets" "$RUNNER_TEMP/gateway-secrets.json"
+          gateway_failure_stage=secrets-validate
           exact_secret_ok "$RUNNER_TEMP/gateway-secrets.json"
+          gateway_failure_stage=settings-get
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/settings" "$RUNNER_TEMP/gateway-preflight-settings.json"
+          gateway_failure_stage=settings-observability
           observability_ok "$RUNNER_TEMP/gateway-preflight-settings.json"
+          gateway_failure_stage=settings-bindings
           known_settings_binding_ok "$RUNNER_TEMP/gateway-preflight-settings.json"
+          gateway_failure_stage=subdomain-get
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/subdomain" "$RUNNER_TEMP/gateway-preflight-subdomain.json"
+          gateway_failure_stage=subdomain-validate
           jq -e '.result.enabled==false and .result.previews_enabled==true' "$RUNNER_TEMP/gateway-preflight-subdomain.json" >/dev/null
+          gateway_failure_stage=scripts-get
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" "$RUNNER_TEMP/gateway-preflight-scripts.json"
+          gateway_failure_stage=script-routes
           script_routes_absent "$RUNNER_TEMP/gateway-preflight-scripts.json" true
+          gateway_failure_stage=active-version-bindings
           if binding_ok "$RUNNER_TEMP/gateway-previous.json"; then
             :
           elif test "$bootstrap" = false && test "$domain_preexisting" = false && legacy_contained_version_ok "$RUNNER_TEMP/gateway-previous.json" "$previous_version_id" && wait_domain_absent legacy-contained-preflight; then
@@ -613,13 +667,18 @@ jobs:
             exit 42
           fi
           if test "$bootstrap" = true; then
+            gateway_failure_stage=bootstrap-domain-absence
             wait_domain_absent bootstrap-post-deploy
           fi
           if test "$domain_preexisting" = true; then
+            gateway_failure_stage=domain-ready
             test "$(wait_domain "$previous_domain_id" preflight-existing)" = "$previous_domain_id"
+            gateway_failure_stage=live-health
             wait_health "https://$GATEWAY_DOMAIN/healthz" preflight-live "$previous_version_id"
           fi
+          gateway_failure_stage=preflight-secret-cleanup
           if test -n "$bootstrap_secrets"; then rm -f -- "$bootstrap_secrets"; bootstrap_secrets=; fi
+          gateway_failure_stage=candidate-upload
           require_forward_budget 360
           upload_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           rm -f -- "$RUNNER_TEMP/gateway-candidate.jsonl"
@@ -639,6 +698,7 @@ jobs:
           candidate_version_ok "$RUNNER_TEMP/gateway-candidate-version.json" "$candidate_version_id"
           candidate_created_on="$(jq -er '.result.metadata.created_on' "$RUNNER_TEMP/gateway-candidate-version.json")"
           timestamp_gte "$candidate_created_on" "$upload_started"
+          gateway_failure_stage=candidate-preview
           check_health "https://$preview_host/healthz" preview "$candidate_version_id" "$preview_host"
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/deployments" "$RUNNER_TEMP/gateway-recheck.json"
           test "$(latest_deployment_id "$RUNNER_TEMP/gateway-recheck.json")" = "$previous_deployment_id"
@@ -650,6 +710,7 @@ jobs:
           [[ "$now_epoch" =~ ^[0-9]{10}$ ]]
           test "$now_epoch" -le "$gateway_promotion_deadline_epoch"
           require_forward_budget 300
+          gateway_failure_stage=promotion
           promoted="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           make_deployment_body "$candidate_version_id" "$promotion_message" "$RUNNER_TEMP/gateway-promotion-body.json"
           traffic_mutated=true
@@ -664,6 +725,7 @@ jobs:
           promoted_deployment_ok "$RUNNER_TEMP/gateway-post-deployment.json" "$candidate_deployment_id" "$candidate_version_id" "$promotion_message"
           candidate_deployed_on="$(jq -er '.result.created_on' "$RUNNER_TEMP/gateway-post-deployment.json")"
           timestamp_gte "$candidate_deployed_on" "$promoted"
+          gateway_failure_stage=ingress
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/settings" "$RUNNER_TEMP/gateway-settings.json"
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/secrets" "$RUNNER_TEMP/gateway-secrets.json"
           api_get "accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$GATEWAY_NAME/subdomain" "$RUNNER_TEMP/gateway-subdomain.json"
@@ -688,6 +750,7 @@ jobs:
             test "$(wait_domain "$candidate_domain_id" post-attach)" = "$candidate_domain_id"
           fi
           wait_health "https://$GATEWAY_DOMAIN/healthz" live "$candidate_version_id"
+          gateway_failure_stage=final-attestation
           attest_candidate_provider_state final
           require_forward_budget 30
           jq -n --arg sha "$GITHUB_SHA" --arg deployment "$candidate_deployment_id" --arg version "$candidate_version_id" --arg previous_deployment "$previous_deployment_id" --arg previous "$previous_version_id" --arg domain "$candidate_domain_id" --arg config "$EXPECTED_CONFIG_SHA256" --arg source "$EXPECTED_SOURCE_SHA256" --argjson bootstrap "$bootstrap" --argjson domain_preexisting "$domain_preexisting" --argjson legacy_contained_previous "$legacy_contained_previous" '{schema:"ssai-release-health-alert-gateway-deployment-evidence-v3",commit_sha:$sha,candidate_deployment_id:$deployment,candidate_version_id:$version,previous_deployment_id:$previous_deployment,previous_version_id:$previous,domain_id:$domain,domain_preexisting:$domain_preexisting,config_sha256:$config,source_sha256:$source,first_bootstrap:$bootstrap,legacy_contained_previous:$legacy_contained_previous,traffic_percent:100,health:"healthy",health_schema:"ssai-release-health-alert-gateway-health-v2",version_metadata_binding:"CF_VERSION_METADATA",rate_limit_namespace:"735104001",expected_secret_names:["ALERT_HMAC_KEY"],rollback_armed:true}' > "$RUNNER_TEMP/gateway-evidence.json"
