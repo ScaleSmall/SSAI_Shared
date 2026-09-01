@@ -284,7 +284,7 @@ jobs:
           set -euo pipefail
           curl --fail --silent --show-error --max-time 15 --proto '=https' \
             "$ALERT_HEALTH_URL" -o "$RUNNER_TEMP/alert-health.json"
-          jq -e '.schema == "ssai-release-health-alert-gateway-health-v1" and .status == "healthy"' \
+          jq -e 'keys == ["component","schema","status","version_id"] and .schema == "ssai-release-health-alert-gateway-health-v2" and .component == "release-health-alert-gateway" and .status == "healthy" and (.version_id|type) == "string" and (.version_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"))' \
             "$RUNNER_TEMP/alert-health.json" >/dev/null
 
       - name: Materialize exact mode-bound deploy configuration

@@ -76,6 +76,8 @@ for (const required of [
   "'/repos/ScaleSmall/SSAI_Shared/commits/main'",
   "'/repos/ScaleSmall/SSAI_Shared/actions/workflows/344170407/runs?event=workflow_dispatch&branch=main&per_page=100'",
   'https://alerts.scalesmall.ai/healthz',
+  'ssai-release-health-alert-gateway-health-v2',
+  '.version_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")',
   '--secrets-file "$RUNNER_TEMP/controller-secrets.json"',
   'wrangler rollback "$ROLLBACK_VERSION_ID"',
   'wrangler secret delete "$key"',
