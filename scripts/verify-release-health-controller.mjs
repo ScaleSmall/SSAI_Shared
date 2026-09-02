@@ -267,13 +267,18 @@ function controllerEnv(mode, additions = {}) {
 // Deterministic scheduling and provider-evidence boundaries.
 assert.equal(currentLogicalSlot(at('2026-08-27T20:15:00Z')), baseSlot);
 assert.equal(evaluationWindow(at('2026-08-27T20:15:00Z'), baseSlot, at('2026-08-27T20:15:00Z')).eligible, true);
+assert.equal(evaluationWindow(at('2026-08-27T20:11:16Z'), baseSlot, at('2026-08-27T20:11:16Z')).eligible, true);
 for (const minuteOffset of [10, 11, 12, 13, 14]) {
   const tick = baseSlot * 60_000 + minuteOffset * 60_000;
   assert.equal(evaluationWindow(tick, baseSlot, tick).eligible, true);
+  assert.equal(evaluationWindow(tick + 16_000, baseSlot, tick + 16_000).eligible, true);
 }
 assert.equal(evaluationWindow(baseSlot * 60_000 + 9 * 60_000, baseSlot).eligible, false);
+assert.equal(evaluationWindow(baseSlot * 60_000 + 10 * 60_000 - 1, baseSlot).eligible, false);
 assert.equal(evaluationWindow(baseSlot * 60_000 + 15 * 60_000, baseSlot).eligible, false);
 assert.equal(evaluationWindow(at('2026-08-27T20:16:00Z'), baseSlot, at('2026-08-27T20:15:00Z')).eligible, false);
+assert.equal(evaluationWindow(baseSlot * 60_000 + 15 * 60_000, baseSlot, baseSlot * 60_000 + 14 * 60_000 + 16_000).eligible, false);
+assert.equal(evaluationWindow(baseSlot * 60_000 + 10 * 60_000 + 16_000, baseSlot, baseSlot * 60_000 + 10 * 60_000 - 1).eligible, false);
 const native = runEvidence({
   id: 11,
   workflowId: 315630665,
@@ -709,7 +714,7 @@ assert.equal(circuitHarness.database.prepare('PRAGMA table_info(alert_outbox)').
 
 // Public /healthz and internal Durable Object /evaluate boundaries.
 assert.equal(typeof worker.fetch, 'function');
-let healthClock = at('2026-08-27T20:02:00Z');
+let healthClock = at('2026-08-27T20:02:16Z');
 const healthHarness = sqliteHarness();
 const healthLogs = [];
 const healthEnv = controllerEnv('observe', {
@@ -765,6 +770,7 @@ assert.equal(publicHealth.status, 200, JSON.stringify(publicHealthBody));
 assert.equal(publicHealthBody.status, 'healthy');
 assert.equal(publicHealthBody.mode, 'observe');
 assert.equal(publicHealthBody.last_completed_tick, new Date(healthClock).toISOString());
+assert.equal(publicHealthBody.last_scheduled_time, '2026-08-27T20:02:16.000Z');
 assert.equal(publicHealthBody.last_decision, 'outside-window');
 assert.equal(publicHealthBody.source_digest, controllerSourceDigest);
 assert.equal(publicHealthBody.profile_digest, controllerProfileDigest);
@@ -867,8 +873,8 @@ assert.equal((await object.fetch(new Request('https://controller.internal/evalua
   method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scheduledTime: 1, nowMs: 1, extra: 1 }),
 }))).status, 400);
 const [firstBoundary, concurrentBoundary] = await Promise.all([
-  object.fetch(boundaryRequest(at('2026-08-27T20:15:00Z'), at('2026-08-27T20:15:00Z'))),
-  object.fetch(boundaryRequest(at('2026-08-27T20:15:00Z'), at('2026-08-27T20:15:00Z'))),
+  object.fetch(boundaryRequest(at('2026-08-27T20:15:16Z'), at('2026-08-27T20:15:16Z'))),
+  object.fetch(boundaryRequest(at('2026-08-27T20:15:16Z'), at('2026-08-27T20:15:16Z'))),
 ]);
 assert.equal(firstBoundary.status, 200);
 assert.equal((await firstBoundary.json()).decision, 'would_dispatch');
@@ -876,7 +882,7 @@ assert.equal(concurrentBoundary.status, 200);
 assert.equal((await concurrentBoundary.json()).decision, 'would_dispatch');
 object = new ReleaseHealthControllerObject(boundaryHarness.state, observeEnv);
 const secondBoundary = await object.fetch(boundaryRequest(
-  at('2026-08-27T20:30:00Z'), at('2026-08-27T20:30:00Z'),
+  at('2026-08-27T20:30:16Z'), at('2026-08-27T20:30:16Z'),
 ));
 const secondBoundaryResult = await secondBoundary.json();
 assert.match(secondBoundaryResult.activation_proof, /^[a-f0-9]{64}$/);
@@ -900,7 +906,7 @@ const activeEnv = controllerEnv('active', {
 });
 object = new ReleaseHealthControllerObject(boundaryHarness.state, activeEnv);
 const activeResponse = await object.fetch(boundaryRequest(
-  at('2026-08-27T20:45:00Z'), at('2026-08-27T20:45:00Z'),
+  at('2026-08-27T20:45:16Z'), at('2026-08-27T20:45:16Z'),
 ));
 assert.equal(activeResponse.status, 200);
 assert.equal((await activeResponse.json()).decision, 'dispatched');
