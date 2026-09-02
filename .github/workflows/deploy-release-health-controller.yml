@@ -841,7 +841,7 @@ jobs:
                   and .config_digest == $config
                   and .last_completed_tick == null and .last_scheduled_time == null and .last_decision == null
                   and .alerts == {pending:0,dead:0}
-                  and .checks == {fresh:false,no_dead_alerts:true,no_terminal_failure:false,no_internal_failure:false}
+                  and .checks == {fresh:false,no_dead_alerts:true,no_terminal_failure:true,no_internal_failure:true}
                 ' "$RUNNER_TEMP/bootstrap-domain-health.json" >/dev/null; then
                 health_ready=true
                 break
@@ -891,8 +891,8 @@ jobs:
             && health.last_decision === null
             && health.checks?.fresh === false
             && health.checks?.no_dead_alerts === true
-            && health.checks?.no_terminal_failure === false
-            && health.checks?.no_internal_failure === false;
+            && health.checks?.no_terminal_failure === true
+            && health.checks?.no_internal_failure === true;
           const scheduled = canonical(health.last_scheduled_time);
           const completed = canonical(health.last_completed_tick);
           const historical = scheduled !== null

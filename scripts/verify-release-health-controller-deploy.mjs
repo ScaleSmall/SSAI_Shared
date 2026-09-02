@@ -205,6 +205,13 @@ assert.match(bootstrapDomainStep, /service:"ssai-release-health-controller"/);
 assert.match(bootstrapDomainStep, /zone_name:"scalesmall\.ai"/);
 assert.match(bootstrapDomainStep, /test "\$code" = 503/);
 assert.match(bootstrapDomainStep, /last_completed_tick == null and \.last_scheduled_time == null and \.last_decision == null/);
+assert.match(bootstrapDomainStep, /\.checks == \{fresh:false,no_dead_alerts:true,no_terminal_failure:true,no_internal_failure:true\}/);
+assert.doesNotMatch(bootstrapDomainStep, /no_terminal_failure:false|no_internal_failure:false/);
+const bootstrapVirginHealth = bootstrapDomainStep.split(
+  "          const virgin = code === '503'",
+)[1].split('          const scheduled = canonical(health.last_scheduled_time);')[0];
+assert.match(bootstrapVirginHealth, /health\.checks\?\.no_terminal_failure === true/);
+assert.match(bootstrapVirginHealth, /health\.checks\?\.no_internal_failure === true/);
 assert.match(bootstrapDomainStep, /const historical = scheduled !== null/);
 assert.match(bootstrapDomainStep, /no_terminal_failure === true/);
 assert.match(bootstrapDomainStep, /no_internal_failure === true/);
