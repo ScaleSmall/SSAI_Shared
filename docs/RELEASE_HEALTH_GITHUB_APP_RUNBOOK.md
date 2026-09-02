@@ -184,9 +184,9 @@ recorded producer independently, so either authorized producer can restore the o
 Legacy v4, v3, v2, and v1 issue markers remain native historical formats.
 
 The zero-dependency Cloudflare controller is under `workers/release-health-controller`. Its
-canonical sorted-source digest is `cef1079d9e2e19e00e9379f257ea2e79a0629cb2b39fb53ab196d134be99aa38`.
+canonical sorted-source digest is `579ab65ff07253003dfe3c04ba60d3ad7127d140fe4a8bd103afa1cf068303d4`.
 Its activation-profile digest is
-`fcb9b7bc3b9a4816e3f5dd9d004e3816885462a258ffbb9ff48c21b0b37525d1`. The checked-in
+`4e755212df8e49558689b785124d3aa4639ee97fee9c242d4146f213870696f0`. The checked-in
 configuration is `MODE=observe`, exposes only exact public GET
 `https://release-health-controller.scalesmall.ai/healthz`, disables `workers.dev`, and
 schedules evaluation every minute. The health response has no secret or per-request state and
@@ -199,6 +199,9 @@ evaluations emit both diagnostic fields as null, and the public health and signe
 not expose the stage.
 Logical slots are minutes 1, 16, 31, and 46. Evaluation occurs only at ages 10 through 14 minutes
 to provide five bounded same-slot recovery opportunities, and never backfills a new dispatch. A
+transient read-authentication or read-inventory failure while the slot is only `leased` leaves that
+single lease retryable through age 13; an age-14 failure is terminal. Each bounded GitHub attempt
+includes response-body consumption, so a stalled stream cannot bypass the three-attempt policy. A
 final exact native/canary lookup, stable main SHA, and one
 unfiltered fallback inventory must pass before the durable prepare transition. Any exact native or
 canary schedule run in the slot blocks fallback. Only two consecutive canary slots establish

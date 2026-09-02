@@ -74,8 +74,12 @@ are never persisted or logged.
 
 Every GitHub read has an exact allowlisted path and query, immutable security headers, a ten-second
 timeout, bounded streaming response parsing, and at most three transient retries with exponential
-backoff and jitter. The dispatch client is operation-specific and makes exactly one POST. It accepts
-only the exact 200 receipt whose API and HTML URLs bind the returned run ID and repository.
+backoff and jitter. Each retry covers both the response headers and the bounded body stream; invalid
+HTTP evidence, JSON, repository identity, or token scope still fails closed. A transient read-only
+failure while a slot is only `leased` remains retryable through age 13, and the age-14 attempt
+terminalizes any remaining failure. The dispatch client is operation-specific and makes exactly one
+POST. It accepts only the exact 200 receipt whose API and HTML URLs bind the returned run ID and
+repository.
 
 Failure evidence and a deterministic sanitized alert ID/body commit atomically before alert
 delivery. The alert signature is derived only at delivery time and is never stored. Sink failure
