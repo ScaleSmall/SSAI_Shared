@@ -1,9 +1,20 @@
-import { evaluateSlot } from './controller.mjs';
+import { evaluateSlot, failureStages } from './controller.mjs';
 import { ReleaseHealthSlotLedger } from './store.mjs';
 
 export { ReleaseHealthSlotLedger };
 
 const publicHostname = 'release-health-controller.scalesmall.ai';
+const structuredFailureClasses = new Set([
+  'provider-evidence',
+  'transport',
+  'rate-limit',
+  'dispatch-unknown',
+  'circuit-open',
+  'configuration',
+  'internal',
+  'prepared-expired',
+]);
+const structuredFailureStages = new Set(failureStages);
 
 function healthStaleAfterMs(env) {
   if (env.HEALTH_ROUTE !== `https://${publicHostname}/healthz` || env.HEALTH_STALE_AFTER_SECONDS !== '300') {
@@ -88,10 +99,33 @@ function structuredDecision(result) {
   const activationProof = /^[a-f0-9]{64}$/.test(String(result?.activation_proof ?? ''))
     ? result.activation_proof
     : null;
+  const failureClass = structuredFailureClasses.has(result?.failure_class)
+    ? result.failure_class
+    : null;
+  const failureStage = structuredFailureStages.has(result?.failure_stage)
+    ? result.failure_stage
+    : null;
   return Object.freeze({
     event: 'evaluation-completed',
     decision,
     activation_proof: activationProof,
+    failure_class: failureClass,
+    failure_stage: failureStage,
+  });
+}
+
+function boundaryFailureResult(error) {
+  const candidate = error?.result;
+  const failureClass = structuredFailureClasses.has(candidate?.failure_class)
+    ? candidate.failure_class
+    : structuredFailureClasses.has(error?.failureClass) ? error.failureClass : 'internal';
+  const failureStage = structuredFailureStages.has(candidate?.failure_stage)
+    ? candidate.failure_stage
+    : structuredFailureStages.has(error?.failureStage) ? error.failureStage : 'runtime-boundary';
+  return Object.freeze({
+    decision: 'failed-closed',
+    failure_class: failureClass,
+    failure_stage: failureStage,
   });
 }
 
@@ -241,7 +275,7 @@ export class ReleaseHealthControllerObject extends ReleaseHealthSlotLedger {
           requestOptions: this.env.GITHUB_REQUEST_OPTIONS || {},
         });
       } catch (error) {
-        result = error.result || { decision: 'failed-closed', failure_class: 'internal' };
+        result = boundaryFailureResult(error);
         status = 503;
       }
       try {
@@ -254,7 +288,11 @@ export class ReleaseHealthControllerObject extends ReleaseHealthSlotLedger {
           failureClass: result.failure_class || null,
         });
       } catch {
-        result = { decision: 'failed-closed', failure_class: 'internal' };
+        result = {
+          decision: 'failed-closed',
+          failure_class: 'internal',
+          failure_stage: 'failure-record',
+        };
         status = 503;
       }
       logStructured(this.env, structuredDecision(result));

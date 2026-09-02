@@ -6,6 +6,8 @@ import {
   currentLogicalSlot,
   evaluationWindow,
   exactNativeBlocker,
+  failureStages,
+  sanitizedFailureStage,
   twoConsecutiveCanarySlots,
   outstandingStatuses,
   sanitizedAudit,
@@ -208,9 +210,10 @@ function apiHarness({ fallbackInventories = [], dispatch = [], alerts = [] } = {
         return new Response(JSON.stringify(payload()), { status: 200 });
       }
       if (parsed.pathname.includes('/actions/workflows/344170407/runs')) {
-        const runs = fallbackInventories[Math.min(fallbackIndex, fallbackInventories.length - 1)] || [];
+        const action = fallbackInventories[Math.min(fallbackIndex, fallbackInventories.length - 1)] || [];
         fallbackIndex += 1;
-        return new Response(JSON.stringify(payload(runs)), { status: 200 });
+        if (action instanceof Error) throw action;
+        return new Response(JSON.stringify(payload(action)), { status: 200 });
       }
       throw new Error(`Unexpected synthetic URL: ${url}`);
     },
@@ -841,7 +844,9 @@ const unhealthyEnv = controllerEnv('invalid', { CLOCK_NOW: () => healthClock });
 const unhealthyObject = new ReleaseHealthControllerObject(unhealthyHarness.state, unhealthyEnv);
 const failedTick = await unhealthyObject.fetch(boundaryRequest(healthClock, healthClock));
 assert.equal(failedTick.status, 503);
-assert.equal((await failedTick.json()).failure_class, 'internal');
+const failedTickResult = await failedTick.json();
+assert.equal(failedTickResult.failure_class, 'internal');
+assert.equal(failedTickResult.failure_stage, 'runtime-boundary');
 const unhealthy = await unhealthyObject.fetch(new Request('https://controller.internal/healthz'));
 assert.equal(unhealthy.status, 503);
 const unhealthyBody = await unhealthy.json();
@@ -876,6 +881,142 @@ for (const failureClass of [
   assert.equal(status.healthy, false, failureClass);
   assert.equal(status.terminal_failure, true, failureClass);
 }
+
+// Closed, redacted failure stages identify the exact eligible boundary without provider details.
+assert.ok(failureStages.length >= 12);
+assert.equal(new Set(failureStages).size, failureStages.length);
+assert.ok(failureStages.every((stage) => /^[a-z][a-z0-9-]{2,31}$/.test(stage)));
+assert.doesNotMatch(failureStages.join(','), /token|signature|private|hmac|authorization|url|body|request/i);
+assert.equal(sanitizedFailureStage('not-allowlisted'), 'runtime-boundary');
+assert.equal(sanitizedFailureStage('not-allowlisted', 'also-not-allowlisted'), 'runtime-boundary');
+const diagnosticHarness = sqliteHarness();
+const diagnosticLogs = [];
+const diagnosticApi = apiHarness();
+const sensitiveMarker = 'synthetic-sensitive-provider-detail';
+const diagnosticEnv = controllerEnv('observe', {
+  AUTH_PROVIDER: authHarness(),
+  FETCH_IMPL: async (url, options) => {
+    if (String(url).includes('/actions/workflows/315630665/runs')) {
+      const error = new Error(sensitiveMarker);
+      error.name = 'TimeoutError';
+      error.stack = `${sensitiveMarker} stack`;
+      error.url = `https://provider.invalid/${sensitiveMarker}`;
+      error.body = sensitiveMarker;
+      error.requestId = sensitiveMarker;
+      error.failureStage = 'write-auth';
+      throw error;
+    }
+    return diagnosticApi.fetch(url, options);
+  },
+  GITHUB_REQUEST_OPTIONS: {
+    random: () => 0,
+    sleep: async () => {},
+    timeoutSignal: () => new AbortController().signal,
+  },
+  STRUCTURED_LOG: (line) => diagnosticLogs.push(JSON.parse(line)),
+});
+const diagnosticObject = new ReleaseHealthControllerObject(diagnosticHarness.state, diagnosticEnv);
+const diagnosticTime = at('2026-08-27T20:15:16Z');
+const diagnosticResponse = await diagnosticObject.fetch(boundaryRequest(diagnosticTime, diagnosticTime));
+const diagnosticResult = await diagnosticResponse.json();
+assert.equal(diagnosticResponse.status, 200);
+assert.deepEqual(diagnosticResult, {
+  decision: 'failed-closed',
+  failure_class: 'transport',
+  failure_stage: 'native-inventory',
+});
+const diagnosticStore = new ReleaseHealthSlotLedger(diagnosticHarness.state, diagnosticEnv);
+assert.deepEqual(
+  (await diagnosticStore.getSlot(baseSlot, controllerSourceDigest, controllerProfileDigest)).result,
+  diagnosticResult,
+);
+assert.deepEqual(diagnosticLogs.at(-1), {
+  component: 'release-health-controller',
+  event: 'evaluation-completed',
+  decision: 'failed-closed',
+  activation_proof: null,
+  failure_class: 'transport',
+  failure_stage: 'native-inventory',
+});
+assert.doesNotMatch(JSON.stringify({ diagnosticResult, diagnosticLogs }), new RegExp(sensitiveMarker));
+
+const invalidAuthHarness = sqliteHarness();
+const invalidAuthEnv = controllerEnv('observe', {
+  AUTH_PROVIDER: async (_fetch, _env, now) => ({
+    token: sensitiveMarker,
+    expiresAt: now + 3600,
+    permissionMode: 'write',
+  }),
+  FETCH_IMPL: apiHarness().fetch,
+});
+const invalidAuthObject = new ReleaseHealthControllerObject(invalidAuthHarness.state, invalidAuthEnv);
+const invalidAuthResponse = await invalidAuthObject.fetch(boundaryRequest(diagnosticTime, diagnosticTime));
+assert.deepEqual(await invalidAuthResponse.json(), {
+  decision: 'failed-closed',
+  failure_class: 'configuration',
+  failure_stage: 'read-auth',
+});
+
+const nestedAuthHarness = sqliteHarness();
+const nestedAuthStore = new ReleaseHealthSlotLedger(nestedAuthHarness.state, { MODE: 'observe' });
+const nestedAuthProof = await seedActivation(
+  nestedAuthStore,
+  baseSlot,
+  controllerSourceDigest,
+  controllerProfileDigest,
+);
+const nestedAuthPendingSlot = baseSlot + 30;
+await prepare(
+  nestedAuthStore,
+  nestedAuthPendingSlot,
+  controllerSourceDigest,
+  controllerProfileDigest,
+  'd',
+);
+assert.equal((await nestedAuthStore.consumePostPermit(
+  nestedAuthPendingSlot,
+  controllerSourceDigest,
+  controllerProfileDigest,
+  nestedAuthProof,
+  nestedAuthPendingSlot * 60 + 600,
+  nestedAuthPendingSlot * 60_000 + 600_000,
+)).permit, true);
+const nestedAuthEnv = controllerEnv('observe', {
+  AUTH_PROVIDER: invalidAuthEnv.AUTH_PROVIDER,
+  FETCH_IMPL: apiHarness().fetch,
+});
+const nestedAuthObject = new ReleaseHealthControllerObject(nestedAuthHarness.state, nestedAuthEnv);
+const nestedAuthTime = (nestedAuthPendingSlot + 15) * 60_000 + 600_000;
+const nestedAuthResponse = await nestedAuthObject.fetch(boundaryRequest(nestedAuthTime, nestedAuthTime));
+assert.equal(nestedAuthResponse.status, 503);
+assert.deepEqual(await nestedAuthResponse.json(), {
+  decision: 'failed-closed',
+  failure_class: 'configuration',
+  failure_stage: 'read-auth',
+});
+
+const failureRecordHarness = sqliteHarness();
+const failureRecordEnv = controllerEnv('observe', {
+  AUTH_PROVIDER: authHarness(),
+  FETCH_IMPL: diagnosticEnv.FETCH_IMPL,
+  GITHUB_REQUEST_OPTIONS: diagnosticEnv.GITHUB_REQUEST_OPTIONS,
+});
+const failureRecordObject = new ReleaseHealthControllerObject(failureRecordHarness.state, failureRecordEnv);
+failureRecordObject.recordFailureTerminal = async () => {
+  const error = new Error(sensitiveMarker);
+  error.name = 'TimeoutError';
+  error.stack = `${sensitiveMarker} stack`;
+  throw error;
+};
+const failureRecordResponse = await failureRecordObject.fetch(boundaryRequest(diagnosticTime, diagnosticTime));
+const failureRecordResult = await failureRecordResponse.json();
+assert.equal(failureRecordResponse.status, 503);
+assert.deepEqual(failureRecordResult, {
+  decision: 'failed-closed',
+  failure_class: 'transport',
+  failure_stage: 'failure-record',
+});
+assert.doesNotMatch(JSON.stringify(failureRecordResult), new RegExp(sensitiveMarker));
 
 healthHarness.database.prepare(`INSERT INTO alert_outbox(
   alert_id,slot,source_digest,profile_digest,body,state,attempts,next_attempt_ms,
@@ -936,8 +1077,10 @@ assert.match(secondBoundaryResult.activation_proof, /^[a-f0-9]{64}$/);
 assert.deepEqual([...new Set(authModes)], ['read']);
 assert.equal(observeApi.calls.some((call) => call.method === 'POST'), false);
 assert.ok(logs.every((line) => (
-  Object.keys(line).sort().join(',') === 'activation_proof,component,decision,event'
+  Object.keys(line).sort().join(',') === 'activation_proof,component,decision,event,failure_class,failure_stage'
   && line.event === 'evaluation-completed'
+  && line.failure_class === null
+  && line.failure_stage === null
 )));
 
 const activeApi = apiHarness({
@@ -961,6 +1104,38 @@ assert.deepEqual(activeModes, ['read', 'write']);
 assert.equal(activeApi.calls.filter((call) => (
   call.method === 'POST' && call.url.includes('/actions/workflows/344170407/dispatches')
 )).length, 1);
+
+const signingHarness = sqliteHarness();
+const signingStore = new ReleaseHealthSlotLedger(signingHarness.state, { MODE: 'observe' });
+const signingProof = await seedActivation(
+  signingStore,
+  baseSlot,
+  controllerSourceDigest,
+  controllerProfileDigest,
+);
+const signingApi = apiHarness({ fallbackInventories: [[]] });
+const signingRequestId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+const signingEnv = controllerEnv('active', {
+  FETCH_IMPL: signingApi.fetch,
+  AUTH_PROVIDER: authHarness([]),
+  ACTIVATION_PROOF: signingProof,
+  ADMISSION_HMAC_KEY: sensitiveMarker,
+  RANDOM_UUID: () => signingRequestId,
+});
+const signingObject = new ReleaseHealthControllerObject(signingHarness.state, signingEnv);
+const signingTime = (baseSlot + 30) * 60_000 + 600_000;
+const signingResponse = await signingObject.fetch(boundaryRequest(signingTime, signingTime));
+const signingResult = await signingResponse.json();
+assert.deepEqual(signingResult, {
+  decision: 'dispatch-unknown',
+  request_id: signingRequestId.replaceAll('-', ''),
+  failure_class: 'internal',
+  failure_stage: 'dispatch-prepare',
+});
+assert.equal(signingApi.calls.filter((call) => (
+  call.method === 'POST' && call.url.includes('/actions/workflows/344170407/dispatches')
+)).length, 0);
+assert.doesNotMatch(JSON.stringify(signingResult), new RegExp(sensitiveMarker));
 
 const confirmedHarness = sqliteHarness();
 const confirmedStore = new ReleaseHealthSlotLedger(confirmedHarness.state, { MODE: 'observe' });
@@ -1050,7 +1225,14 @@ const wrongSlotRun = runEvidence({
   displayTitle: `Release health independent fallback [slot:${dispatchSlot + 15} request:${preparedEnvelope.request_id}]`,
 });
 const recoveryApi = apiHarness({
-  fallbackInventories: [[], [wrongShaRun, wrongSlotRun], [fallbackRun]],
+  fallbackInventories: [
+    [],
+    [wrongShaRun, wrongSlotRun],
+    Object.assign(new Error(sensitiveMarker), { name: 'TimeoutError' }),
+    Object.assign(new Error(sensitiveMarker), { name: 'TimeoutError' }),
+    Object.assign(new Error(sensitiveMarker), { name: 'TimeoutError' }),
+    [fallbackRun],
+  ],
   dispatch: [new Error('synthetic uncertain transport')],
   alerts: [new Error('synthetic alert sink failure'), new Response('', { status: 202 })],
 });
@@ -1081,9 +1263,11 @@ await object.fetch(boundaryRequest(
   dispatchSlot * 60_000 + 1_140_000,
 ));
 assert.equal(workflowPostCount(), 1);
-assert.equal((await recoveryStore.getSlot(
+const recoveryAfterIndexingLag = await recoveryStore.getSlot(
   dispatchSlot, controllerSourceDigest, controllerProfileDigest,
-)).phase, 'unknown');
+);
+assert.equal(recoveryAfterIndexingLag.phase, 'unknown');
+assert.equal(recoveryAfterIndexingLag.result.failure_stage, 'fallback-dispatch');
 const alertIds = recoveryApi.calls
   .filter((call) => call.url.includes('alerts.scalesmall.ai'))
   .map((call) => call.options.headers['X-SSAI-Alert-Id']);
@@ -1092,6 +1276,18 @@ object = new ReleaseHealthControllerObject(recoveryHarness.state, recoveryEnv);
 await object.fetch(boundaryRequest(
   dispatchSlot * 60_000 + 600_000,
   dispatchSlot * 60_000 + 1_740_000,
+));
+assert.equal(workflowPostCount(), 1);
+const recoveryAfterReadFailure = await recoveryStore.getSlot(
+  dispatchSlot, controllerSourceDigest, controllerProfileDigest,
+);
+assert.equal(recoveryAfterReadFailure.phase, 'unknown');
+assert.equal(recoveryAfterReadFailure.result.failure_stage, 'fallback-inventory');
+assert.doesNotMatch(JSON.stringify(recoveryAfterReadFailure.result), new RegExp(sensitiveMarker));
+object = new ReleaseHealthControllerObject(recoveryHarness.state, recoveryEnv);
+await object.fetch(boundaryRequest(
+  dispatchSlot * 60_000 + 600_000,
+  dispatchSlot * 60_000 + 2_940_000,
 ));
 assert.equal(workflowPostCount(), 1);
 assert.equal((await recoveryStore.getSlot(

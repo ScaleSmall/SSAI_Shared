@@ -299,6 +299,13 @@ requireText(controllerRuntime, "344170407,\n      'workflow_dispatch'", 'single 
 rejectPattern(controllerRuntime, /actions\/workflows\/344170407\/runs\?status=/, 'sequential fallback status inventory');
 requireText(controllerApi, 'export async function dispatchWorkflowOnce', 'operation-specific one-attempt dispatch client');
 requireText(controllerApi, 'attempts: 3', 'bounded GitHub read and token retry client');
+requireText(controllerRuntime, 'export const failureStages = Object.freeze([', 'closed controller failure-stage allowlist');
+requireText(controllerRuntime, "failure_stage: failureStage", 'durable sanitized controller failure stage');
+rejectPattern(controllerRuntime, /cause:\s*error|failure_stage:\s*error|error\.(?:message|stack|url|body|requestId)/, 'raw controller failure detail propagation');
+requireText(controllerIndex, 'failure_class: failureClass', 'sanitized structured failure class');
+requireText(controllerIndex, 'failure_stage: failureStage', 'sanitized structured failure stage');
+requireText(controllerIndex, 'function boundaryFailureResult(error)', 'closed controller boundary result projection');
+rejectPattern(controllerIndex, /result\s*=\s*error\.result\s*\|\|/, 'unprojected controller error result');
 requireText(controllerIndex, "if (request.method !== 'POST')", 'internal evaluate method boundary');
 requireText(controllerIndex, "url.pathname !== '/evaluate' || url.search || url.hash", 'internal evaluate path boundary');
 requireText(releaseHealthRunbook, controllerConfig.vars.CONTROLLER_SOURCE_SHA256, 'controller source digest runbook binding');
