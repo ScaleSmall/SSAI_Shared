@@ -25,6 +25,7 @@ function immutableHeaders(token, contentType = false) {
   }
   return Object.freeze({
     Accept: 'application/vnd.github+json',
+    'Accept-Encoding': 'identity',
     Authorization: `Bearer ${token}`,
     'User-Agent': GITHUB_USER_AGENT,
     'X-GitHub-Api-Version': VERSION,
@@ -32,10 +33,43 @@ function immutableHeaders(token, contentType = false) {
   });
 }
 
-async function readBytes(response, maximum = MAX_BYTES) {
+function bodyTransportFailure() {
+  const failure = Object.assign(
+    new Error('GitHub response body transport failed closed.'),
+    { failureClass: 'transport' },
+  );
+  Object.defineProperty(failure, bodyTransportFailureBrand, { value: true });
+  return failure;
+}
+
+function canonicalContentLength(response, maximum) {
+  const value = response.headers.get('content-length');
+  if (value === null || !/^(?:0|[1-9][0-9]*)$/.test(value)) return null;
+  const length = Number(value);
+  return Number.isSafeInteger(length) && length <= maximum ? length : null;
+}
+
+function responseConsumer(response, attempt, maximum) {
+  return attempt === 3 && canonicalContentLength(response, maximum) !== null
+    ? 'native-buffer'
+    : 'stream';
+}
+
+async function readBytes(response, maximum = MAX_BYTES, consumer = 'stream') {
   const contentLength = response.headers.get('content-length');
   if (contentLength !== null && (!/^\d+$/.test(contentLength) || Number(contentLength) > maximum)) {
     throw new Error('GitHub response length is invalid.');
+  }
+  if (consumer === 'native-buffer') {
+    let buffer;
+    try {
+      buffer = await response.arrayBuffer();
+    } catch {
+      throw bodyTransportFailure();
+    }
+    const result = new Uint8Array(buffer);
+    if (result.byteLength > maximum) throw new Error('GitHub response is too large.');
+    return result;
   }
   if (!response.body) return new Uint8Array();
   const reader = response.body.getReader();
@@ -46,13 +80,8 @@ async function readBytes(response, maximum = MAX_BYTES) {
       let chunk;
       try {
         chunk = await reader.read();
-      } catch (cause) {
-        const failure = Object.assign(
-          new Error('GitHub response body transport failed closed.', { cause }),
-          { failureClass: 'transport' },
-        );
-        Object.defineProperty(failure, bodyTransportFailureBrand, { value: true });
-        throw failure;
+      } catch {
+        throw bodyTransportFailure();
       }
       const { done, value } = chunk;
       if (done) break;
@@ -75,8 +104,8 @@ async function readBytes(response, maximum = MAX_BYTES) {
   return result;
 }
 
-async function readJson(response, maximum = MAX_BYTES) {
-  const bytes = await readBytes(response, maximum);
+async function readJson(response, maximum = MAX_BYTES, consumer = 'stream') {
+  const bytes = await readBytes(response, maximum, consumer);
   let value;
   try {
     value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
@@ -94,6 +123,59 @@ function rateLimited(response) {
     response.status === 403
     && (response.headers.get('x-ratelimit-remaining') === '0' || response.headers.has('retry-after'))
   );
+}
+
+function contentTypeIsJson(response) {
+  const value = response.headers.get('content-type') || '';
+  return /^(?:application\/json|application\/[a-z0-9!#$&^_.+-]+\+json)(?:\s*;|$)/i.test(value);
+}
+
+function contentEncoding(response) {
+  const value = (response.headers.get('content-encoding') || '').trim().toLowerCase();
+  if (!value) return 'none';
+  return ['identity', 'gzip', 'br'].includes(value) ? value : 'other';
+}
+
+function diagnosticElapsed(startedAt, diagnosticClock) {
+  const finishedAt = diagnosticClock();
+  const value = Number.isFinite(startedAt) && Number.isFinite(finishedAt)
+    ? Math.floor(finishedAt - startedAt)
+    : 0;
+  return Math.min(60_000, Math.max(0, Number.isSafeInteger(value) ? value : 0));
+}
+
+function emitAttemptDiagnostic(observer, diagnosticClock, startedAt, {
+  operationKind,
+  attempt,
+  phase,
+  response = null,
+  consumer = 'stream',
+  outcome,
+}) {
+  if (typeof observer !== 'function') return;
+  try {
+    const result = observer(Object.freeze({
+      event: 'github-request-attempt',
+      operation_kind: ['read', 'token-create'].includes(operationKind) ? operationKind : 'read',
+      attempt: Math.min(3, Math.max(1, Number.isSafeInteger(attempt) ? attempt : 1)),
+      phase: ['headers', 'body', 'complete'].includes(phase) ? phase : 'headers',
+      status: response && Number.isSafeInteger(response.status)
+        && response.status >= 100 && response.status <= 599 ? response.status : null,
+      content_type_json: response ? contentTypeIsJson(response) : false,
+      content_length_present: response ? response.headers.has('content-length') : false,
+      content_encoding: response ? contentEncoding(response) : 'none',
+      consumer: consumer === 'native-buffer' ? 'native-buffer' : 'stream',
+      elapsed_ms: diagnosticElapsed(startedAt, diagnosticClock),
+      outcome: ['success', 'transport', 'provider', 'rate-limit'].includes(outcome)
+        ? outcome
+        : 'provider',
+    }));
+    if (result && typeof result.then === 'function') {
+      void Promise.resolve(result).catch(() => {});
+    }
+  } catch {
+    // Diagnostics are deliberately best-effort and never change request control flow.
+  }
 }
 
 function retryable(response) {
@@ -117,51 +199,88 @@ function retryDelay(response, attempt, now, random) {
 async function boundedRequest(fetchImpl, url, init, {
   attempts,
   consume = async (response) => response,
+  maximum = MAX_BYTES,
+  operationKind = 'read',
+  diagnosticObserver = null,
+  diagnosticClock = Date.now,
   clock = Date.now,
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   random = Math.random,
   timeoutSignal = () => AbortSignal.timeout(10_000),
 } = {}) {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    let startedAt = null;
+    try {
+      startedAt = diagnosticClock();
+    } catch {
+      startedAt = null;
+    }
     let response;
     try {
       response = await fetchImpl(url, { ...init, redirect: 'error', signal: timeoutSignal() });
-    } catch (cause) {
+    } catch {
+      emitAttemptDiagnostic(diagnosticObserver, diagnosticClock, startedAt, {
+        operationKind, attempt, phase: 'headers', outcome: 'transport',
+      });
       if (attempt < attempts) {
         await sleep(retryDelay(null, attempt, clock(), random));
         continue;
       }
       throw Object.assign(
-        new Error('GitHub transport failed closed.', { cause }),
+        new Error('GitHub transport failed closed.'),
         { failureClass: 'transport' },
       );
     }
     if (response.redirected) {
+      emitAttemptDiagnostic(diagnosticObserver, diagnosticClock, startedAt, {
+        operationKind, attempt, phase: 'headers', response, outcome: 'provider',
+      });
       throw Object.assign(new Error('GitHub redirect was rejected.'), { failureClass: 'provider-evidence' });
     }
+    const consumer = responseConsumer(response, attempt, maximum);
     if (!response.ok) {
+      const outcome = rateLimited(response) ? 'rate-limit' : 'provider';
+      const errorConsumer = responseConsumer(response, attempt, 65_536);
       if (attempt < attempts && retryable(response)) {
-        await readBytes(response, 65_536).catch(() => {});
+        await readBytes(response, 65_536, errorConsumer).catch(() => {});
+        emitAttemptDiagnostic(diagnosticObserver, diagnosticClock, startedAt, {
+          operationKind, attempt, phase: 'complete', response, consumer: errorConsumer, outcome,
+        });
         await sleep(retryDelay(response, attempt, clock(), random));
         continue;
       }
-      await readBytes(response, 65_536).catch(() => {});
+      await readBytes(response, 65_536, errorConsumer).catch(() => {});
+      emitAttemptDiagnostic(diagnosticObserver, diagnosticClock, startedAt, {
+        operationKind, attempt, phase: 'complete', response, consumer: errorConsumer, outcome,
+      });
       throw Object.assign(new Error('GitHub API failed closed.'), {
         status: response.status,
-        requestId: response.headers.get('x-github-request-id') || null,
         failureClass: rateLimited(response) ? 'rate-limit' : 'provider-evidence',
       });
     }
     try {
-      return await consume(response);
+      const value = await consume(response, consumer);
+      emitAttemptDiagnostic(diagnosticObserver, diagnosticClock, startedAt, {
+        operationKind, attempt, phase: 'complete', response, consumer, outcome: 'success',
+      });
+      return value;
     } catch (cause) {
-      if (!cause?.[bodyTransportFailureBrand]) throw cause;
+      const bodyTransport = cause?.[bodyTransportFailureBrand] === true;
+      emitAttemptDiagnostic(diagnosticObserver, diagnosticClock, startedAt, {
+        operationKind,
+        attempt,
+        phase: 'body',
+        response,
+        consumer,
+        outcome: bodyTransport ? 'transport' : 'provider',
+      });
+      if (!bodyTransport) throw cause;
       if (attempt < attempts) {
         await sleep(retryDelay(null, attempt, clock(), random));
         continue;
       }
       throw Object.assign(
-        new Error('GitHub transport failed closed.', { cause }),
+        new Error('GitHub transport failed closed.'),
         { failureClass: 'transport' },
       );
     }
@@ -189,11 +308,35 @@ export async function githubApi(fetchImpl, path, token, options = {}) {
   }
   if (options.headers || options.body) throw new Error('GitHub read request is immutable.');
   const kind = exactReadPath(path);
-  const value = await boundedRequest(fetchImpl, API + path, {
+  return boundedRequest(fetchImpl, API + path, {
     method: 'GET',
     headers: immutableHeaders(token),
-  }, { ...options, attempts: 3, consume: (response) => readJson(response) });
-  return validateReadPayload(kind, value);
+  }, {
+    ...options,
+    attempts: 3,
+    maximum: MAX_BYTES,
+    operationKind: 'read',
+    consume: async (response, consumer) => validateReadPayload(
+      kind,
+      await readJson(response, MAX_BYTES, consumer),
+    ),
+  });
+}
+
+function validateInstallationTokenPayload(value, permissionMode) {
+  const expiresAt = Math.floor(Date.parse(value.expires_at) / 1000);
+  if (
+    typeof value.token !== 'string' || value.token.length < 8 || value.token.length > 4096
+    || !Number.isSafeInteger(expiresAt)
+    || value.repository_selection !== 'selected'
+    || !Array.isArray(value.repositories) || value.repositories.length !== 1
+    || Number(value.repositories[0]?.id) !== 1183552904
+    || value.repositories[0]?.full_name !== 'ScaleSmall/SSAI_Shared'
+    || value.permissions?.actions !== permissionMode
+    || value.permissions?.contents !== 'read'
+    || value.permissions?.metadata !== 'read'
+  ) throw new Error('Installation token scope is invalid.');
+  return Object.freeze({ token: value.token, expiresAt, permissionMode });
 }
 
 export async function createInstallationAccessToken(
@@ -212,24 +355,20 @@ export async function createInstallationAccessToken(
     contents: 'read',
     metadata: 'read',
   };
-  const value = await boundedRequest(fetchImpl, `${API}/app/installations/${id}/access_tokens`, {
+  return boundedRequest(fetchImpl, `${API}/app/installations/${id}/access_tokens`, {
     method: 'POST',
     headers: immutableHeaders(jwt, true),
     body: JSON.stringify({ repository_ids: [1183552904], permissions }),
-  }, { ...options, attempts: 3, consume: (response) => readJson(response, 262_144) });
-  const expiresAt = Math.floor(Date.parse(value.expires_at) / 1000);
-  if (
-    typeof value.token !== 'string' || value.token.length < 8 || value.token.length > 4096
-    || !Number.isSafeInteger(expiresAt)
-    || value.repository_selection !== 'selected'
-    || !Array.isArray(value.repositories) || value.repositories.length !== 1
-    || Number(value.repositories[0]?.id) !== 1183552904
-    || value.repositories[0]?.full_name !== 'ScaleSmall/SSAI_Shared'
-    || value.permissions?.actions !== permissionMode
-    || value.permissions?.contents !== 'read'
-    || value.permissions?.metadata !== 'read'
-  ) throw new Error('Installation token scope is invalid.');
-  return Object.freeze({ token: value.token, expiresAt, permissionMode });
+  }, {
+    ...options,
+    attempts: 3,
+    maximum: 262_144,
+    operationKind: 'token-create',
+    consume: async (response, consumer) => validateInstallationTokenPayload(
+      await readJson(response, 262_144, consumer),
+      permissionMode,
+    ),
+  });
 }
 
 export function validateDispatchReceipt(value) {

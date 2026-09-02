@@ -48,6 +48,15 @@ function logStructured(env, value) {
   })));
 }
 
+function githubRequestOptions(env) {
+  return Object.freeze({
+    ...(env.GITHUB_REQUEST_OPTIONS || {}),
+    diagnosticObserver(value) {
+      (env.STRUCTURED_LOG || console.log)(JSON.stringify(value));
+    },
+  });
+}
+
 async function boundedJsonRequest(request, maximum = 512) {
   const length = request.headers.get('content-length');
   if (length !== null && (!/^\d+$/.test(length) || Number(length) > maximum)) {
@@ -272,7 +281,7 @@ export class ReleaseHealthControllerObject extends ReleaseHealthSlotLedger {
           authProvider: this.env.AUTH_PROVIDER,
           randomUUID: this.env.RANDOM_UUID,
           timeoutSignal: this.env.TIMEOUT_SIGNAL,
-          requestOptions: this.env.GITHUB_REQUEST_OPTIONS || {},
+          requestOptions: githubRequestOptions(this.env),
         });
       } catch (error) {
         result = boundaryFailureResult(error);

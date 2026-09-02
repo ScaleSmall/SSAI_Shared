@@ -107,6 +107,44 @@ function payload(runs = []) {
   return { total_count: runs.length, workflow_runs: runs };
 }
 
+function trackedJsonResponse(value, {
+  status = 200,
+  headers = {},
+  consumers = [],
+  streamFailure = null,
+  nativeFailure = null,
+  nativeBytes = null,
+} = {}) {
+  const bytes = new TextEncoder().encode(typeof value === 'string' ? value : JSON.stringify(value));
+  const stream = new ReadableStream({
+    start(controller) {
+      if (streamFailure) controller.error(streamFailure);
+      else {
+        controller.enqueue(bytes);
+        controller.close();
+      }
+    },
+  });
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    redirected: false,
+    headers: new Headers({ 'Content-Type': 'application/json; charset=utf-8', ...headers }),
+    body: {
+      getReader() {
+        consumers.push('stream');
+        return stream.getReader();
+      },
+    },
+    async arrayBuffer() {
+      consumers.push('native-buffer');
+      if (nativeFailure) throw nativeFailure;
+      const selected = nativeBytes || bytes;
+      return selected.buffer.slice(selected.byteOffset, selected.byteOffset + selected.byteLength);
+    },
+  };
+}
+
 function sqliteHarness() {
   const database = new DatabaseSync(':memory:');
   const control = { failAfterCallback: false };
@@ -332,6 +370,7 @@ const boundedInventoryPath = '/repos/ScaleSmall/SSAI_Shared/actions/workflows/31
 assert.deepEqual(await githubApi(
   async (_url, options) => {
     assert.equal(options.headers['User-Agent'], GITHUB_USER_AGENT);
+    assert.equal(options.headers['Accept-Encoding'], 'identity');
     return new Response(JSON.stringify(payload()), { status: 200 });
   },
   boundedInventoryPath,
@@ -368,8 +407,9 @@ const retryResult = await githubApi(async (_url, options) => {
   assert.equal(options.redirect, 'error');
   assert.deepEqual(
     Object.keys(options.headers).sort(),
-    ['Accept', 'Authorization', 'User-Agent', 'X-GitHub-Api-Version'].sort(),
+    ['Accept', 'Accept-Encoding', 'Authorization', 'User-Agent', 'X-GitHub-Api-Version'].sort(),
   );
+  assert.equal(options.headers['Accept-Encoding'], 'identity');
   assert.equal(options.headers['User-Agent'], GITHUB_USER_AGENT);
   if (retryCalls === 1) throw new DOMException('synthetic timeout', 'TimeoutError');
   if (retryCalls === 2) return new Response('{}', {
@@ -413,6 +453,7 @@ await assert.rejects(
   }),
   (error) => {
     assert.equal(error.failureClass, 'transport');
+    assert.equal(Object.hasOwn(error, 'cause'), false);
     assert.doesNotMatch(error.message, new RegExp(bodySensitiveMarker));
     assert.doesNotMatch(JSON.stringify(error), new RegExp(bodySensitiveMarker));
     return true;
@@ -422,6 +463,283 @@ assert.equal(bodyRetryCalls, 3);
 assert.equal(bodyAttemptControllers.length, 3);
 assert.equal(new Set(bodyAttemptControllers.map(({ signal }) => signal)).size, 3);
 assert.ok(bodyAttemptControllers.every(({ signal }) => signal.aborted));
+
+const diagnosticKeys = [
+  'attempt',
+  'consumer',
+  'content_encoding',
+  'content_length_present',
+  'content_type_json',
+  'elapsed_ms',
+  'event',
+  'operation_kind',
+  'outcome',
+  'phase',
+  'status',
+].sort();
+function assertSingleProviderBodyDiagnostic(events, operationKind) {
+  assert.equal(events.length, 1);
+  assert.deepEqual(Object.keys(events[0]).sort(), diagnosticKeys);
+  assert.deepEqual((({
+    attempt, operation_kind: kind, phase, outcome,
+  }) => ({ attempt, operation_kind: kind, phase, outcome }))(events[0]), {
+    attempt: 1,
+    operation_kind: operationKind,
+    phase: 'body',
+    outcome: 'provider',
+  });
+  assert.equal(events.some(({ outcome }) => outcome === 'success'), false);
+}
+const consumerDiagnostics = [];
+const consumers = [];
+let consumerAttempts = 0;
+const consumerResult = await githubApi(async () => {
+  consumerAttempts += 1;
+  if (consumerAttempts < 3) {
+    return trackedJsonResponse({ sha: mainSha }, {
+      consumers,
+      streamFailure: new DOMException(bodySensitiveMarker, 'AbortError'),
+      headers: { 'Content-Length': '50', 'Content-Encoding': consumerAttempts === 1 ? 'gzip' : 'br' },
+    });
+  }
+  const value = JSON.stringify({ sha: mainSha });
+  return trackedJsonResponse(value, {
+    consumers,
+    headers: { 'Content-Length': String(Buffer.byteLength(value)), 'Content-Encoding': 'identity' },
+  });
+}, '/repos/ScaleSmall/SSAI_Shared/commits/main', 'synthetic-read-token', {
+  diagnosticClock: (() => {
+    let now = 0;
+    return () => {
+      now += 75_000;
+      return now;
+    };
+  })(),
+  diagnosticObserver: (event) => consumerDiagnostics.push(event),
+  sleep: async () => {},
+  random: () => 0,
+  timeoutSignal: () => new AbortController().signal,
+});
+assert.deepEqual(consumerResult, { sha: mainSha });
+assert.deepEqual(consumers, ['stream', 'stream', 'native-buffer']);
+assert.equal(consumerDiagnostics.length, 3);
+assert.deepEqual(consumerDiagnostics.map(({ attempt, consumer, phase, outcome }) => ({
+  attempt, consumer, phase, outcome,
+})), [
+  { attempt: 1, consumer: 'stream', phase: 'body', outcome: 'transport' },
+  { attempt: 2, consumer: 'stream', phase: 'body', outcome: 'transport' },
+  { attempt: 3, consumer: 'native-buffer', phase: 'complete', outcome: 'success' },
+]);
+assert.deepEqual(consumerDiagnostics.map(({ content_encoding }) => content_encoding), ['gzip', 'br', 'identity']);
+assert.ok(consumerDiagnostics.every((event) => (
+  JSON.stringify(Object.keys(event).sort()) === JSON.stringify(diagnosticKeys)
+  && event.event === 'github-request-attempt'
+  && event.operation_kind === 'read'
+  && event.status === 200
+  && event.content_type_json === true
+  && event.content_length_present === true
+  && event.elapsed_ms === 60_000
+)));
+assert.doesNotMatch(JSON.stringify(consumerDiagnostics), new RegExp(bodySensitiveMarker));
+
+for (const [label, contentLength] of [
+  ['absent', null],
+  ['noncanonical', '000000000000000000000000000000000000000000000050'],
+]) {
+  const guardedConsumers = [];
+  const guardedDiagnostics = [];
+  let guardedAttempt = 0;
+  const guardedResult = await githubApi(async () => {
+    guardedAttempt += 1;
+    const value = JSON.stringify({ sha: mainSha });
+    const headers = contentLength === null ? {} : { 'Content-Length': contentLength };
+    return trackedJsonResponse(value, guardedAttempt < 3 ? {
+      consumers: guardedConsumers,
+      streamFailure: new DOMException(`${bodySensitiveMarker}-${label}`, 'AbortError'),
+      headers,
+    } : { consumers: guardedConsumers, headers });
+  }, '/repos/ScaleSmall/SSAI_Shared/commits/main', 'synthetic-read-token', {
+    diagnosticObserver: (event) => guardedDiagnostics.push(event),
+    sleep: async () => {},
+    random: () => 0,
+    timeoutSignal: () => new AbortController().signal,
+  });
+  assert.deepEqual(guardedResult, { sha: mainSha }, label);
+  assert.deepEqual(guardedConsumers, ['stream', 'stream', 'stream'], label);
+  assert.equal(guardedDiagnostics.at(-1).consumer, 'stream', label);
+  assert.equal(guardedDiagnostics.at(-1).content_length_present, contentLength !== null, label);
+}
+
+const oversizeGuardConsumers = [];
+const oversizeGuardDiagnostics = [];
+let oversizeGuardAttempt = 0;
+await assert.rejects(
+  () => githubApi(async () => {
+    oversizeGuardAttempt += 1;
+    return trackedJsonResponse({ sha: mainSha }, oversizeGuardAttempt < 3 ? {
+      consumers: oversizeGuardConsumers,
+      streamFailure: new DOMException(bodySensitiveMarker, 'AbortError'),
+      headers: { 'Content-Length': '50' },
+    } : {
+      consumers: oversizeGuardConsumers,
+      headers: { 'Content-Length': '1000001' },
+    });
+  }, '/repos/ScaleSmall/SSAI_Shared/commits/main', 'synthetic-read-token', {
+    diagnosticObserver: (event) => oversizeGuardDiagnostics.push(event),
+    sleep: async () => {},
+    random: () => 0,
+    timeoutSignal: () => new AbortController().signal,
+  }),
+  /response length is invalid/,
+);
+assert.deepEqual(oversizeGuardConsumers, ['stream', 'stream']);
+assert.equal(oversizeGuardDiagnostics.at(-1).consumer, 'stream');
+assert.equal(oversizeGuardDiagnostics.at(-1).outcome, 'provider');
+
+const errorBodyDiagnostics = [];
+let errorBodyAttempt = 0;
+await assert.rejects(
+  () => githubApi(async () => {
+    errorBodyAttempt += 1;
+    return trackedJsonResponse('{}', {
+      status: 503,
+      headers: { 'Content-Length': errorBodyAttempt === 3 ? '70000' : '2' },
+    });
+  }, '/repos/ScaleSmall/SSAI_Shared/commits/main', 'synthetic-read-token', {
+    diagnosticObserver: (event) => errorBodyDiagnostics.push(event),
+    sleep: async () => {},
+    random: () => 0,
+    timeoutSignal: () => new AbortController().signal,
+  }),
+  /API failed closed/,
+);
+assert.equal(errorBodyDiagnostics.at(-1).attempt, 3);
+assert.equal(errorBodyDiagnostics.at(-1).consumer, 'stream');
+assert.equal(errorBodyDiagnostics.at(-1).status, 503);
+
+const invalidStatusDiagnostics = [];
+await assert.rejects(
+  () => githubApi(
+    async () => trackedJsonResponse('{}', { status: 99 }),
+    '/repos/ScaleSmall/SSAI_Shared/commits/main',
+    'synthetic-read-token',
+    { diagnosticObserver: (event) => invalidStatusDiagnostics.push(event) },
+  ),
+  /API failed closed/,
+);
+assert.equal(invalidStatusDiagnostics.at(-1).status, null);
+
+const providerRedactionDiagnostics = [];
+let providerRedactionError;
+try {
+  await githubApi(
+    async () => trackedJsonResponse(bodySensitiveMarker, {
+      status: 403,
+      headers: {
+        'Content-Type': 'text/plain',
+        'Content-Encoding': `deflate-${bodySensitiveMarker}`,
+        'X-GitHub-Request-Id': bodySensitiveMarker,
+      },
+    }),
+    '/repos/ScaleSmall/SSAI_Shared/commits/main',
+    'synthetic-read-token',
+    { diagnosticObserver: (event) => providerRedactionDiagnostics.push(event) },
+  );
+} catch (error) {
+  providerRedactionError = error;
+}
+assert.equal(providerRedactionError?.failureClass, 'provider-evidence');
+assert.equal(Object.hasOwn(providerRedactionError, 'requestId'), false);
+assert.equal(Object.hasOwn(providerRedactionError, 'cause'), false);
+assert.equal(providerRedactionDiagnostics.at(-1).content_type_json, false);
+assert.equal(providerRedactionDiagnostics.at(-1).content_encoding, 'other');
+assert.deepEqual(Object.keys(providerRedactionDiagnostics.at(-1)).sort(), diagnosticKeys);
+assert.doesNotMatch(
+  JSON.stringify({ providerRedactionDiagnostics, providerRedactionError }),
+  new RegExp(bodySensitiveMarker),
+);
+
+const nativeCapConsumers = [];
+let nativeCapAttempt = 0;
+await assert.rejects(
+  () => githubApi(async () => {
+    nativeCapAttempt += 1;
+    return trackedJsonResponse({ sha: mainSha }, nativeCapAttempt < 3 ? {
+      consumers: nativeCapConsumers,
+      streamFailure: new DOMException(bodySensitiveMarker, 'AbortError'),
+      headers: { 'Content-Length': '50' },
+    } : {
+      consumers: nativeCapConsumers,
+      headers: { 'Content-Length': '2' },
+      nativeBytes: new Uint8Array(1_000_001),
+    });
+  }, '/repos/ScaleSmall/SSAI_Shared/commits/main', 'synthetic-read-token', {
+    sleep: async () => {},
+    random: () => 0,
+    timeoutSignal: () => new AbortController().signal,
+  }),
+  /response is too large/,
+);
+assert.deepEqual(nativeCapConsumers, ['stream', 'stream', 'native-buffer']);
+
+const nativeFailureConsumers = [];
+const nativeFailureDiagnostics = [];
+let nativeFailureAttempt = 0;
+await assert.rejects(
+  () => githubApi(async () => {
+    nativeFailureAttempt += 1;
+    return trackedJsonResponse({ sha: mainSha }, nativeFailureAttempt < 3 ? {
+      consumers: nativeFailureConsumers,
+      streamFailure: new DOMException(bodySensitiveMarker, 'AbortError'),
+      headers: { 'Content-Length': '50' },
+    } : {
+      consumers: nativeFailureConsumers,
+      nativeFailure: new DOMException(bodySensitiveMarker, 'AbortError'),
+      headers: { 'Content-Length': '50' },
+    });
+  }, '/repos/ScaleSmall/SSAI_Shared/commits/main', 'synthetic-read-token', {
+    diagnosticObserver: (event) => nativeFailureDiagnostics.push(event),
+    sleep: async () => {},
+    random: () => 0,
+    timeoutSignal: () => new AbortController().signal,
+  }),
+  (error) => {
+    assert.equal(error.failureClass, 'transport');
+    assert.equal(Object.hasOwn(error, 'cause'), false);
+    return true;
+  },
+);
+assert.deepEqual(nativeFailureConsumers, ['stream', 'stream', 'native-buffer']);
+assert.deepEqual(
+  (({ attempt, phase, consumer, outcome }) => ({ attempt, phase, consumer, outcome }))(
+    nativeFailureDiagnostics.at(-1),
+  ),
+  { attempt: 3, phase: 'body', consumer: 'native-buffer', outcome: 'transport' },
+);
+assert.doesNotMatch(JSON.stringify(nativeFailureDiagnostics), new RegExp(bodySensitiveMarker));
+
+const observerFailureResult = await githubApi(
+  async () => trackedJsonResponse({ sha: mainSha }),
+  '/repos/ScaleSmall/SSAI_Shared/commits/main',
+  'synthetic-read-token',
+  { diagnosticObserver: () => { throw new Error(bodySensitiveMarker); } },
+);
+assert.deepEqual(observerFailureResult, { sha: mainSha });
+let asyncObserverCalls = 0;
+const asyncObserverFailureResult = await githubApi(
+  async () => trackedJsonResponse({ sha: mainSha }),
+  '/repos/ScaleSmall/SSAI_Shared/commits/main',
+  'synthetic-read-token',
+  {
+    diagnosticObserver: async () => {
+      asyncObserverCalls += 1;
+      throw new Error(bodySensitiveMarker);
+    },
+  },
+);
+await new Promise((resolve) => setImmediate(resolve));
+assert.deepEqual(asyncObserverFailureResult, { sha: mainSha });
+assert.equal(asyncObserverCalls, 1);
 let malformedJsonCalls = 0;
 await assert.rejects(
   () => githubApi(async () => {
@@ -435,17 +753,35 @@ await assert.rejects(
 );
 assert.equal(malformedJsonCalls, 1);
 let malformedPayloadCalls = 0;
+const malformedCommitDiagnostics = [];
 await assert.rejects(
   () => githubApi(async () => {
     malformedPayloadCalls += 1;
     return new Response(JSON.stringify({ sha: 'not-a-commit' }), { status: 200 });
   }, '/repos/ScaleSmall/SSAI_Shared/commits/main', 'synthetic-read-token', {
+    diagnosticObserver: (event) => malformedCommitDiagnostics.push(event),
     sleep: async () => {},
     timeoutSignal: () => new AbortController().signal,
   }),
   /commit response is invalid/,
 );
 assert.equal(malformedPayloadCalls, 1);
+assertSingleProviderBodyDiagnostic(malformedCommitDiagnostics, 'read');
+let malformedWorkflowPayloadCalls = 0;
+const malformedWorkflowDiagnostics = [];
+await assert.rejects(
+  () => githubApi(async () => {
+    malformedWorkflowPayloadCalls += 1;
+    return new Response(JSON.stringify({ total_count: 0, workflow_runs: [{}] }), { status: 200 });
+  }, boundedInventoryPath, 'synthetic-read-token', {
+    diagnosticObserver: (event) => malformedWorkflowDiagnostics.push(event),
+    sleep: async () => {},
+    timeoutSignal: () => new AbortController().signal,
+  }),
+  /workflow-run response is invalid/,
+);
+assert.equal(malformedWorkflowPayloadCalls, 1);
+assertSingleProviderBodyDiagnostic(malformedWorkflowDiagnostics, 'read');
 let nonRetryableHttpCalls = 0;
 await assert.rejects(
   () => githubApi(async () => {
@@ -471,9 +807,11 @@ await assert.rejects(
   /length is invalid/,
 );
 let tokenCalls = 0;
+const tokenDiagnostics = [];
 const tokenValue = await createInstallationAccessToken(async (_url, options) => {
   tokenCalls += 1;
   assert.equal(options.headers['User-Agent'], GITHUB_USER_AGENT);
+  assert.equal(options.headers['Accept-Encoding'], 'identity');
   const body = JSON.parse(options.body);
   assert.deepEqual(body, {
     repository_ids: [1183552904],
@@ -488,11 +826,21 @@ const tokenValue = await createInstallationAccessToken(async (_url, options) => 
     permissions: { actions: 'read', contents: 'read', metadata: 'read' },
   }), { status: 201 });
 }, '12345', 'synthetic-app-jwt', 'read', {
+  diagnosticObserver: (event) => tokenDiagnostics.push(event),
   sleep: async () => {},
   timeoutSignal: () => new AbortController().signal,
 });
 assert.equal(tokenCalls, 2);
 assert.equal(tokenValue.permissionMode, 'read');
+assert.deepEqual(tokenDiagnostics.map(({ attempt, operation_kind, outcome }) => ({
+  attempt, operation_kind, outcome,
+})), [
+  { attempt: 1, operation_kind: 'token-create', outcome: 'provider' },
+  { attempt: 2, operation_kind: 'token-create', outcome: 'success' },
+]);
+assert.ok(tokenDiagnostics.every((event) => (
+  JSON.stringify(Object.keys(event).sort()) === JSON.stringify(diagnosticKeys)
+)));
 let tokenBodyRetryCalls = 0;
 let tokenBodySignalCalls = 0;
 const tokenAfterBodyRetry = await createInstallationAccessToken(async (_url, options) => {
@@ -528,6 +876,7 @@ assert.equal(tokenBodySignalCalls, 3);
 assert.equal(tokenAfterBodyRetry.permissionMode, 'read');
 assert.equal(tokenAfterBodyRetry.token, 'synthetic-token-after-body-retry');
 let invalidScopeCalls = 0;
+const invalidScopeDiagnostics = [];
 await assert.rejects(
   () => createInstallationAccessToken(async () => {
     invalidScopeCalls += 1;
@@ -539,12 +888,14 @@ await assert.rejects(
       permissions: { actions: 'write', contents: 'read', metadata: 'read' },
     }), { status: 201 });
   }, '12345', 'synthetic-app-jwt', 'read', {
+    diagnosticObserver: (event) => invalidScopeDiagnostics.push(event),
     sleep: async () => {},
     timeoutSignal: () => new AbortController().signal,
   }),
   /scope is invalid/,
 );
 assert.equal(invalidScopeCalls, 1);
+assertSingleProviderBodyDiagnostic(invalidScopeDiagnostics, 'token-create');
 let writeTokenCalls = 0;
 const writeTokenValue = await createInstallationAccessToken(async (_url, options) => {
   writeTokenCalls += 1;
@@ -579,6 +930,7 @@ const ambiguous = await dispatchWorkflowOnce(async (_url, options) => {
   assert.equal(options.method, 'POST');
   assert.equal(options.redirect, 'error');
   assert.equal(options.headers['User-Agent'], GITHUB_USER_AGENT);
+  assert.equal(options.headers['Accept-Encoding'], 'identity');
   throw new DOMException('synthetic timeout', 'TimeoutError');
 }, 'synthetic-write-token', dispatchInputs, { timeoutSignal: () => new AbortController().signal });
 assert.equal(dispatchCalls, 1);
@@ -1341,6 +1693,26 @@ assert.deepEqual(diagnosticLogs.at(-1), {
   failure_class: 'transport',
   failure_stage: 'native-inventory',
 });
+const requestAttemptLogs = diagnosticLogs.filter(({ event }) => event === 'github-request-attempt');
+assert.equal(requestAttemptLogs.length, 4);
+assert.ok(requestAttemptLogs.every((event) => (
+  JSON.stringify(Object.keys(event).sort()) === JSON.stringify(diagnosticKeys)
+)));
+assert.deepEqual(requestAttemptLogs.slice(-3).map((event) => ({
+  attempt: event.attempt,
+  operation_kind: event.operation_kind,
+  phase: event.phase,
+  status: event.status,
+  consumer: event.consumer,
+  outcome: event.outcome,
+})), [1, 2, 3].map((attempt) => ({
+  attempt,
+  operation_kind: 'read',
+  phase: 'headers',
+  status: null,
+  consumer: 'stream',
+  outcome: 'transport',
+})));
 assert.doesNotMatch(JSON.stringify({ diagnosticResult, diagnosticLogs }), new RegExp(sensitiveMarker));
 
 const invalidAuthHarness = sqliteHarness();
@@ -1479,11 +1851,19 @@ const secondBoundaryResult = await secondBoundary.json();
 assert.match(secondBoundaryResult.activation_proof, /^[a-f0-9]{64}$/);
 assert.deepEqual([...new Set(authModes)], ['read']);
 assert.equal(observeApi.calls.some((call) => call.method === 'POST'), false);
-assert.ok(logs.every((line) => (
+const evaluationLogs = logs.filter(({ event }) => event === 'evaluation-completed');
+assert.ok(evaluationLogs.length > 0);
+assert.ok(evaluationLogs.every((line) => (
   Object.keys(line).sort().join(',') === 'activation_proof,component,decision,event,failure_class,failure_stage'
   && line.event === 'evaluation-completed'
   && line.failure_class === null
   && line.failure_stage === null
+)));
+const githubAttemptLogs = logs.filter(({ event }) => event === 'github-request-attempt');
+assert.ok(githubAttemptLogs.length > 0);
+assert.ok(githubAttemptLogs.every((line) => (
+  JSON.stringify(Object.keys(line).sort()) === JSON.stringify(diagnosticKeys)
+  && line.outcome === 'success'
 )));
 
 const activeApi = apiHarness({
