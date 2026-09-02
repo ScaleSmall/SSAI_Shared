@@ -81,6 +81,15 @@ terminalizes any remaining failure. The dispatch client is operation-specific an
 POST. It accepts only the exact 200 receipt whose API and HTML URLs bind the returned run ID and
 repository.
 
+GitHub requests pin `Accept-Encoding: identity`. Attempts one and two consume the response through
+the existing capped stream reader. Attempt three may use the runtime-native buffer consumer only
+when `Content-Length` is canonical and no larger than that operation's existing cap; the actual
+buffer length is checked again before JSON parsing and all existing payload validation. Each
+attempt emits one best-effort diagnostic with only its operation kind, attempt, closed phase,
+sanitized response shape, selected consumer, capped elapsed time, and closed outcome. Diagnostics
+never contain a URL, credential, installation or request identity, body, response bytes, raw header,
+or exception detail, and logging failure never changes request behavior.
+
 Failure evidence and a deterministic sanitized alert ID/body commit atomically before alert
 delivery. The alert signature is derived only at delivery time and is never stored. Sink failure
 leaves the evidence and outbox item intact for a bounded retry with the same idempotency ID. Observe
