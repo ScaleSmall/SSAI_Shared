@@ -27,11 +27,9 @@ export function currentLogicalSlot(nowMs) {
 export function evaluationWindow(actualMs, slot, scheduledMs = actualMs) {
   const actualAge = Math.floor(actualMs / 60_000) - slot;
   const scheduledAge = Math.floor(scheduledMs / 60_000) - slot;
-  const scheduled = new Date(scheduledMs);
   return Object.freeze({
     age: actualAge,
-    eligible: scheduled.getUTCSeconds() === 0
-      && scheduledAge >= 10 && scheduledAge < 15
+    eligible: scheduledAge >= 10 && scheduledAge < 15
       && actualAge >= 10 && actualAge < 15,
   });
 }

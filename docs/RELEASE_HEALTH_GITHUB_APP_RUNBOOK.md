@@ -184,9 +184,9 @@ recorded producer independently, so either authorized producer can restore the o
 Legacy v4, v3, v2, and v1 issue markers remain native historical formats.
 
 The zero-dependency Cloudflare controller is under `workers/release-health-controller`. Its
-canonical sorted-source digest is `7076478a2b98f986c153551942ce9698ad81c730cf02560b60e26e975c2b8379`.
+canonical sorted-source digest is `2e1fbea8f012e42b6afd78e3faac4fe7c3b800b2670d9aa8fcff2daac15e84a0`.
 Its activation-profile digest is
-`7130eed4e555d404b150a8a71af1be6e5a4e5398e8a8179bae9059a0046f9615`. The checked-in
+`6182a29f7b1768595a213d2105a7d7691c46ee3521ec69af316e2030a5c28a50`. The checked-in
 configuration is `MODE=observe`, exposes only exact public GET
 `https://release-health-controller.scalesmall.ai/healthz`, disables `workers.dev`, and
 schedules evaluation every minute. The health response has no secret or per-request state and
