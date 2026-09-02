@@ -1,5 +1,5 @@
 import { githubApi, installationToken } from './github-app.mjs';
-import { dispatchWorkflowOnce } from './github-api.mjs';
+import { dispatchWorkflowOnce, WORKFLOW_RUN_PAGE_SIZE } from './github-api.mjs';
 import { encodeEnvelope, signEnvelope } from './envelope.mjs';
 import { verifyActivationProfileEnvironment } from './activation-profile.mjs';
 import { deliverSignedAlert, prepareAlert } from './alerts.mjs';
@@ -114,10 +114,10 @@ function validateAuth(value, mode, nowEpochSecond) {
   return value.token;
 }
 
-async function workflowRuns(fetchImpl, token, workflowId, event = 'schedule', requestOptions = {}) {
+export async function workflowRuns(fetchImpl, token, workflowId, event = 'schedule', requestOptions = {}) {
   const payload = await githubApi(
     fetchImpl,
-    `/repos/ScaleSmall/SSAI_Shared/actions/workflows/${workflowId}/runs?event=${event}&branch=main&per_page=100`,
+    `/repos/ScaleSmall/SSAI_Shared/actions/workflows/${workflowId}/runs?event=${event}&branch=main&per_page=${WORKFLOW_RUN_PAGE_SIZE}`,
     token,
     requestOptions,
   );
