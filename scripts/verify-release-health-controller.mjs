@@ -386,6 +386,78 @@ const retryResult = await githubApi(async (_url, options) => {
 assert.deepEqual(retryResult, { sha: mainSha });
 assert.equal(retryCalls, 3);
 assert.deepEqual(retryDelays, [100, 1000]);
+const bodySensitiveMarker = 'synthetic-sensitive-body-stream-detail';
+let bodyRetryCalls = 0;
+const bodyAttemptControllers = [];
+await assert.rejects(
+  () => githubApi(async (_url, options) => {
+    bodyRetryCalls += 1;
+    const attemptController = bodyAttemptControllers.at(-1);
+    assert.equal(options.signal, attemptController.signal);
+    return new Response(new ReadableStream({
+      start(controller) {
+        const fail = () => controller.error(options.signal.reason);
+        if (options.signal.aborted) fail();
+        else options.signal.addEventListener('abort', fail, { once: true });
+      },
+    }), { status: 200 });
+  }, '/repos/ScaleSmall/SSAI_Shared/commits/main', 'synthetic-read-token', {
+    sleep: async () => {},
+    random: () => 0,
+    timeoutSignal: () => {
+      const controller = new AbortController();
+      bodyAttemptControllers.push(controller);
+      queueMicrotask(() => controller.abort(new DOMException(bodySensitiveMarker, 'TimeoutError')));
+      return controller.signal;
+    },
+  }),
+  (error) => {
+    assert.equal(error.failureClass, 'transport');
+    assert.doesNotMatch(error.message, new RegExp(bodySensitiveMarker));
+    assert.doesNotMatch(JSON.stringify(error), new RegExp(bodySensitiveMarker));
+    return true;
+  },
+);
+assert.equal(bodyRetryCalls, 3);
+assert.equal(bodyAttemptControllers.length, 3);
+assert.equal(new Set(bodyAttemptControllers.map(({ signal }) => signal)).size, 3);
+assert.ok(bodyAttemptControllers.every(({ signal }) => signal.aborted));
+let malformedJsonCalls = 0;
+await assert.rejects(
+  () => githubApi(async () => {
+    malformedJsonCalls += 1;
+    return new Response('{', { status: 200 });
+  }, '/repos/ScaleSmall/SSAI_Shared/commits/main', 'synthetic-read-token', {
+    sleep: async () => {},
+    timeoutSignal: () => new AbortController().signal,
+  }),
+  /response schema is invalid/,
+);
+assert.equal(malformedJsonCalls, 1);
+let malformedPayloadCalls = 0;
+await assert.rejects(
+  () => githubApi(async () => {
+    malformedPayloadCalls += 1;
+    return new Response(JSON.stringify({ sha: 'not-a-commit' }), { status: 200 });
+  }, '/repos/ScaleSmall/SSAI_Shared/commits/main', 'synthetic-read-token', {
+    sleep: async () => {},
+    timeoutSignal: () => new AbortController().signal,
+  }),
+  /commit response is invalid/,
+);
+assert.equal(malformedPayloadCalls, 1);
+let nonRetryableHttpCalls = 0;
+await assert.rejects(
+  () => githubApi(async () => {
+    nonRetryableHttpCalls += 1;
+    return new Response('{}', { status: 404 });
+  }, '/repos/ScaleSmall/SSAI_Shared/commits/main', 'synthetic-read-token', {
+    sleep: async () => {},
+    timeoutSignal: () => new AbortController().signal,
+  }),
+  /API failed closed/,
+);
+assert.equal(nonRetryableHttpCalls, 1);
 await assert.rejects(
   () => githubApi(async () => new Response('{}'), '/repos/ScaleSmall/SSAI_Shared/unknown', 'synthetic-token'),
   /not allowed/,
@@ -421,6 +493,58 @@ const tokenValue = await createInstallationAccessToken(async (_url, options) => 
 });
 assert.equal(tokenCalls, 2);
 assert.equal(tokenValue.permissionMode, 'read');
+let tokenBodyRetryCalls = 0;
+let tokenBodySignalCalls = 0;
+const tokenAfterBodyRetry = await createInstallationAccessToken(async (_url, options) => {
+  tokenBodyRetryCalls += 1;
+  assert.deepEqual(JSON.parse(options.body), {
+    repository_ids: [1183552904],
+    permissions: { actions: 'read', contents: 'read', metadata: 'read' },
+  });
+  if (tokenBodyRetryCalls < 3) {
+    return new Response(new ReadableStream({
+      pull() {
+        throw new DOMException(bodySensitiveMarker, 'AbortError');
+      },
+    }), { status: 201 });
+  }
+  return new Response(JSON.stringify({
+    token: 'synthetic-token-after-body-retry',
+    expires_at: '2026-08-27T21:00:00Z',
+    repository_selection: 'selected',
+    repositories: [{ id: 1183552904, full_name: 'ScaleSmall/SSAI_Shared' }],
+    permissions: { actions: 'read', contents: 'read', metadata: 'read' },
+  }), { status: 201 });
+}, '12345', 'synthetic-app-jwt', 'read', {
+  sleep: async () => {},
+  random: () => 0,
+  timeoutSignal: () => {
+    tokenBodySignalCalls += 1;
+    return new AbortController().signal;
+  },
+});
+assert.equal(tokenBodyRetryCalls, 3);
+assert.equal(tokenBodySignalCalls, 3);
+assert.equal(tokenAfterBodyRetry.permissionMode, 'read');
+assert.equal(tokenAfterBodyRetry.token, 'synthetic-token-after-body-retry');
+let invalidScopeCalls = 0;
+await assert.rejects(
+  () => createInstallationAccessToken(async () => {
+    invalidScopeCalls += 1;
+    return new Response(JSON.stringify({
+      token: 'synthetic-overprivileged-token',
+      expires_at: '2026-08-27T21:00:00Z',
+      repository_selection: 'selected',
+      repositories: [{ id: 1183552904, full_name: 'ScaleSmall/SSAI_Shared' }],
+      permissions: { actions: 'write', contents: 'read', metadata: 'read' },
+    }), { status: 201 });
+  }, '12345', 'synthetic-app-jwt', 'read', {
+    sleep: async () => {},
+    timeoutSignal: () => new AbortController().signal,
+  }),
+  /scope is invalid/,
+);
+assert.equal(invalidScopeCalls, 1);
 let writeTokenCalls = 0;
 const writeTokenValue = await createInstallationAccessToken(async (_url, options) => {
   writeTokenCalls += 1;
@@ -881,6 +1005,285 @@ for (const failureClass of [
   assert.equal(status.healthy, false, failureClass);
   assert.equal(status.terminal_failure, true, failureClass);
 }
+
+// An exhausted, pre-dispatch transient failure keeps one lease retryable until the final minute.
+const transientLeaseHarness = sqliteHarness();
+const transientLeaseApi = apiHarness();
+const transientLeaseMarker = 'synthetic-sensitive-transient-lease-detail';
+let transientAuthCalls = 0;
+let transientDispatchPosts = 0;
+const transientLeaseEnv = controllerEnv('observe', {
+  AUTH_PROVIDER: async (_fetch, _env, now, permissionMode) => {
+    transientAuthCalls += 1;
+    if (transientAuthCalls === 1) {
+      throw Object.assign(new Error(transientLeaseMarker), { failureClass: 'transport' });
+    }
+    return Object.freeze({
+      token: `synthetic-${permissionMode}-credential`,
+      expiresAt: now + 3600,
+      permissionMode,
+    });
+  },
+  FETCH_IMPL: async (url, options) => {
+    if (String(url).includes('/actions/workflows/344170407/dispatches')) transientDispatchPosts += 1;
+    return transientLeaseApi.fetch(url, options);
+  },
+});
+const transientLeaseObject = new ReleaseHealthControllerObject(transientLeaseHarness.state, transientLeaseEnv);
+const transientFirstTime = baseSlot * 60_000 + 10 * 60_000 + 16_000;
+const transientFirstResponse = await transientLeaseObject.fetch(
+  boundaryRequest(transientFirstTime, transientFirstTime),
+);
+const transientFirstResult = await transientFirstResponse.json();
+assert.deepEqual(transientFirstResult, {
+  decision: 'failed-closed',
+  failure_class: 'transport',
+  failure_stage: 'read-auth',
+});
+const transientLeaseStore = new ReleaseHealthSlotLedger(transientLeaseHarness.state, transientLeaseEnv);
+assert.equal((await transientLeaseStore.getSlot(
+  baseSlot,
+  controllerSourceDigest,
+  controllerProfileDigest,
+)).phase, 'leased');
+assert.equal(transientLeaseHarness.database.prepare(
+  "SELECT COUNT(*) AS count FROM audit WHERE slot=? AND result='leased'",
+).get(baseSlot).count, 1);
+assert.equal(transientDispatchPosts, 0);
+assert.doesNotMatch(JSON.stringify(transientFirstResult), new RegExp(transientLeaseMarker));
+
+const transientSecondTime = baseSlot * 60_000 + 11 * 60_000 + 16_000;
+const transientSecondResponse = await transientLeaseObject.fetch(
+  boundaryRequest(transientSecondTime, transientSecondTime),
+);
+const transientSecondResult = await transientSecondResponse.json();
+assert.equal(transientSecondResult.decision, 'would_dispatch');
+assert.equal((await transientLeaseStore.getSlot(
+  baseSlot,
+  controllerSourceDigest,
+  controllerProfileDigest,
+)).phase, 'terminal');
+assert.equal(transientLeaseHarness.database.prepare(
+  "SELECT COUNT(*) AS count FROM audit WHERE slot=? AND result='leased'",
+).get(baseSlot).count, 1);
+assert.equal(transientDispatchPosts, 0);
+
+const authorizedTransientStages = [
+  { stage: 'read-auth', failureClass: 'transport', target: 'auth' },
+  { stage: 'main-read', failureClass: 'rate-limit', target: '/commits/main' },
+  { stage: 'native-inventory', failureClass: 'transport', target: '/315630665/runs' },
+  { stage: 'canary-inventory', failureClass: 'rate-limit', target: '/344135917/runs' },
+];
+for (const { stage, failureClass, target } of authorizedTransientStages) {
+  const stageHarness = sqliteHarness();
+  const stageApi = apiHarness();
+  const stageMarker = `synthetic-sensitive-${stage}-transient-detail`;
+  let stageDispatchPosts = 0;
+  const stageEnv = controllerEnv('observe', {
+    AUTH_PROVIDER: target === 'auth'
+      ? async () => { throw Object.assign(new Error(stageMarker), { failureClass }); }
+      : authHarness(),
+    FETCH_IMPL: async (url, options = {}) => {
+      const value = String(url);
+      if (value.includes('/actions/workflows/344170407/dispatches')) stageDispatchPosts += 1;
+      if (target !== 'auth' && value.includes(target)) {
+        if (failureClass === 'rate-limit') {
+          return new Response('{}', { status: 429, headers: { 'Retry-After': '0' } });
+        }
+        throw new Error(stageMarker);
+      }
+      return stageApi.fetch(url, options);
+    },
+    GITHUB_REQUEST_OPTIONS: {
+      sleep: async () => {},
+      random: () => 0,
+      timeoutSignal: () => new AbortController().signal,
+    },
+  });
+  const stageObject = new ReleaseHealthControllerObject(stageHarness.state, stageEnv);
+  const stageTime = baseSlot * 60_000 + 10 * 60_000 + 16_000;
+  const stageResponse = await stageObject.fetch(boundaryRequest(stageTime, stageTime));
+  const stageResult = await stageResponse.json();
+  assert.deepEqual(stageResult, {
+    decision: 'failed-closed',
+    failure_class: failureClass,
+    failure_stage: stage,
+  }, stage);
+  const stageStore = new ReleaseHealthSlotLedger(stageHarness.state, stageEnv);
+  assert.equal((await stageStore.getSlot(
+    baseSlot,
+    controllerSourceDigest,
+    controllerProfileDigest,
+  )).phase, 'leased', stage);
+  assert.equal(stageHarness.database.prepare(
+    "SELECT COUNT(*) AS count FROM audit WHERE slot=? AND result='leased'",
+  ).get(baseSlot).count, 1, stage);
+  assert.equal(stageDispatchPosts, 0, stage);
+  assert.doesNotMatch(JSON.stringify(stageResult), new RegExp(stageMarker), stage);
+}
+
+const disallowedTransientHarness = sqliteHarness();
+const disallowedTransientApi = apiHarness();
+const disallowedTransientMarker = 'synthetic-sensitive-fallback-inventory-transient-detail';
+let disallowedTransientDispatchPosts = 0;
+const disallowedTransientEnv = controllerEnv('observe', {
+  AUTH_PROVIDER: authHarness(),
+  FETCH_IMPL: async (url, options = {}) => {
+    const value = String(url);
+    if (value.includes('/actions/workflows/344170407/dispatches')) disallowedTransientDispatchPosts += 1;
+    if (value.includes('/actions/workflows/344170407/runs')) throw new Error(disallowedTransientMarker);
+    return disallowedTransientApi.fetch(url, options);
+  },
+  GITHUB_REQUEST_OPTIONS: {
+    sleep: async () => {},
+    random: () => 0,
+    timeoutSignal: () => new AbortController().signal,
+  },
+});
+const disallowedTransientObject = new ReleaseHealthControllerObject(
+  disallowedTransientHarness.state,
+  disallowedTransientEnv,
+);
+const disallowedTransientTime = baseSlot * 60_000 + 10 * 60_000 + 16_000;
+const disallowedTransientResponse = await disallowedTransientObject.fetch(
+  boundaryRequest(disallowedTransientTime, disallowedTransientTime),
+);
+const disallowedTransientResult = await disallowedTransientResponse.json();
+assert.deepEqual(disallowedTransientResult, {
+  decision: 'failed-closed',
+  failure_class: 'transport',
+  failure_stage: 'fallback-inventory',
+});
+const disallowedTransientStore = new ReleaseHealthSlotLedger(
+  disallowedTransientHarness.state,
+  disallowedTransientEnv,
+);
+assert.equal((await disallowedTransientStore.getSlot(
+  baseSlot,
+  controllerSourceDigest,
+  controllerProfileDigest,
+)).phase, 'terminal');
+assert.equal(disallowedTransientDispatchPosts, 0);
+assert.doesNotMatch(
+  JSON.stringify({
+    result: disallowedTransientResult,
+    durable: await disallowedTransientStore.getSlot(
+      baseSlot,
+      controllerSourceDigest,
+      controllerProfileDigest,
+    ),
+  }),
+  new RegExp(disallowedTransientMarker),
+);
+
+const repeatedTransientHarness = sqliteHarness();
+const repeatedTransientMarker = 'synthetic-sensitive-repeated-transient-detail';
+const repeatedTransientEnv = controllerEnv('observe', {
+  AUTH_PROVIDER: async () => {
+    throw Object.assign(new Error(repeatedTransientMarker), { failureClass: 'transport' });
+  },
+  FETCH_IMPL: apiHarness().fetch,
+});
+const repeatedTransientObject = new ReleaseHealthControllerObject(
+  repeatedTransientHarness.state,
+  repeatedTransientEnv,
+);
+const repeatedAge13 = baseSlot * 60_000 + 13 * 60_000 + 16_000;
+assert.deepEqual(await (await repeatedTransientObject.fetch(
+  boundaryRequest(repeatedAge13, repeatedAge13),
+)).json(), {
+  decision: 'failed-closed',
+  failure_class: 'transport',
+  failure_stage: 'read-auth',
+});
+const repeatedTransientStore = new ReleaseHealthSlotLedger(repeatedTransientHarness.state, repeatedTransientEnv);
+assert.equal((await repeatedTransientStore.getSlot(
+  baseSlot,
+  controllerSourceDigest,
+  controllerProfileDigest,
+)).phase, 'leased');
+const repeatedAge14 = baseSlot * 60_000 + 14 * 60_000 + 16_000;
+const repeatedAge14Result = await (await repeatedTransientObject.fetch(
+  boundaryRequest(repeatedAge14, repeatedAge14),
+)).json();
+assert.deepEqual(repeatedAge14Result, {
+  decision: 'failed-closed',
+  failure_class: 'transport',
+  failure_stage: 'read-auth',
+});
+assert.equal((await repeatedTransientStore.getSlot(
+  baseSlot,
+  controllerSourceDigest,
+  controllerProfileDigest,
+)).phase, 'terminal');
+assert.equal(repeatedTransientHarness.database.prepare(
+  "SELECT COUNT(*) AS count FROM audit WHERE slot=? AND result='leased'",
+).get(baseSlot).count, 1);
+assert.doesNotMatch(JSON.stringify({
+  repeatedAge14Result,
+  durable: await repeatedTransientStore.getSlot(baseSlot, controllerSourceDigest, controllerProfileDigest),
+}), new RegExp(repeatedTransientMarker));
+
+const finalMinuteHarness = sqliteHarness();
+const finalMinuteMarker = 'synthetic-sensitive-final-minute-detail';
+const finalMinuteEnv = controllerEnv('observe', {
+  AUTH_PROVIDER: async () => {
+    throw Object.assign(new Error(finalMinuteMarker), { failureClass: 'rate-limit' });
+  },
+  FETCH_IMPL: apiHarness().fetch,
+});
+const finalMinuteObject = new ReleaseHealthControllerObject(finalMinuteHarness.state, finalMinuteEnv);
+const finalMinuteTime = baseSlot * 60_000 + 14 * 60_000 + 16_000;
+const finalMinuteResponse = await finalMinuteObject.fetch(boundaryRequest(finalMinuteTime, finalMinuteTime));
+const finalMinuteResult = await finalMinuteResponse.json();
+assert.deepEqual(finalMinuteResult, {
+  decision: 'failed-closed',
+  failure_class: 'rate-limit',
+  failure_stage: 'read-auth',
+});
+const finalMinuteStore = new ReleaseHealthSlotLedger(finalMinuteHarness.state, finalMinuteEnv);
+assert.equal((await finalMinuteStore.getSlot(
+  baseSlot,
+  controllerSourceDigest,
+  controllerProfileDigest,
+)).phase, 'terminal');
+assert.doesNotMatch(JSON.stringify({
+  finalMinuteResult,
+  durable: await finalMinuteStore.getSlot(baseSlot, controllerSourceDigest, controllerProfileDigest),
+}), new RegExp(finalMinuteMarker));
+
+const forbiddenScopeHarness = sqliteHarness();
+let forbiddenScopeCalls = 0;
+const forbiddenScopeEnv = controllerEnv('observe', {
+  AUTH_PROVIDER: async (fetchImpl, _env, _now, permissionMode) => createInstallationAccessToken(
+    fetchImpl,
+    '12345',
+    'synthetic-app-jwt',
+    permissionMode,
+    { sleep: async () => {}, timeoutSignal: () => new AbortController().signal },
+  ),
+  FETCH_IMPL: async () => {
+    forbiddenScopeCalls += 1;
+    return new Response('{}', { status: 403 });
+  },
+});
+const forbiddenScopeObject = new ReleaseHealthControllerObject(forbiddenScopeHarness.state, forbiddenScopeEnv);
+const forbiddenScopeTime = baseSlot * 60_000 + 10 * 60_000 + 16_000;
+const forbiddenScopeResponse = await forbiddenScopeObject.fetch(
+  boundaryRequest(forbiddenScopeTime, forbiddenScopeTime),
+);
+assert.deepEqual(await forbiddenScopeResponse.json(), {
+  decision: 'failed-closed',
+  failure_class: 'provider-evidence',
+  failure_stage: 'read-auth',
+});
+assert.equal(forbiddenScopeCalls, 1);
+const forbiddenScopeStore = new ReleaseHealthSlotLedger(forbiddenScopeHarness.state, forbiddenScopeEnv);
+assert.equal((await forbiddenScopeStore.getSlot(
+  baseSlot,
+  controllerSourceDigest,
+  controllerProfileDigest,
+)).phase, 'terminal');
 
 // Closed, redacted failure stages identify the exact eligible boundary without provider details.
 assert.ok(failureStages.length >= 12);

@@ -31,6 +31,13 @@ const canaryPath = '.github/workflows/release-health-monitor-v3.yml';
 const fallbackPath = '.github/workflows/release-health-monitor-fallback.yml';
 const providerStatuses = new Set(['queued', 'requested', 'waiting', 'pending', 'in_progress', 'completed']);
 const failureStageSet = new Set(failureStages);
+const retryableLeaseFailureStages = new Set([
+  'read-auth',
+  'main-read',
+  'native-inventory',
+  'canary-inventory',
+]);
+const retryableLeaseFailureClasses = new Set(['transport', 'rate-limit']);
 const boundaryFailureBrand = Symbol('controller-boundary-failure');
 
 export function currentLogicalSlot(nowMs) {
@@ -726,6 +733,23 @@ export async function evaluateSlot({
       }
     }
     if (durable && durable.phase !== 'terminal') {
+      const failureClass = classifyFailure(error, env.MODE === 'active' ? 'internal' : 'configuration');
+      const failureStage = sanitizedFailureStage(error?.failureStage, 'eligible-state');
+      const window = evaluationWindow(nowMs, slot, scheduledTime);
+      if (
+        durable.phase === 'leased'
+        && retryableLeaseFailureClasses.has(failureClass)
+        && retryableLeaseFailureStages.has(failureStage)
+        && window.eligible
+        && window.age < 14
+        && Math.floor(scheduledTime / 60_000) - slot < 14
+      ) {
+        return Object.freeze({
+          decision: 'failed-closed',
+          failure_class: failureClass,
+          failure_stage: failureStage,
+        });
+      }
       return persistFailure({ env, ledger, slot, sourceDigest, profileDigest, error, nowMs });
     }
     throw Object.assign(new Error('Controller failed closed.'), {

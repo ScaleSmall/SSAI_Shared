@@ -4,6 +4,7 @@ const MAX_BYTES = 1_000_000;
 export const GITHUB_USER_AGENT = 'ScaleSmall-SSAI-Release-Health-Controller/1.0';
 export const WORKFLOW_RUN_PAGE_SIZE = 25;
 const workflowIds = new Set(['315630665', '344135917', '344170407']);
+const bodyTransportFailureBrand = Symbol('github-body-transport-failure');
 const queries = new Set([
   `event=schedule&branch=main&per_page=${WORKFLOW_RUN_PAGE_SIZE}`,
   `event=workflow_dispatch&branch=main&per_page=${WORKFLOW_RUN_PAGE_SIZE}`,
@@ -42,7 +43,18 @@ async function readBytes(response, maximum = MAX_BYTES) {
   let length = 0;
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      let chunk;
+      try {
+        chunk = await reader.read();
+      } catch (cause) {
+        const failure = Object.assign(
+          new Error('GitHub response body transport failed closed.', { cause }),
+          { failureClass: 'transport' },
+        );
+        Object.defineProperty(failure, bodyTransportFailureBrand, { value: true });
+        throw failure;
+      }
+      const { done, value } = chunk;
       if (done) break;
       length += value.byteLength;
       if (length > maximum) {
@@ -77,11 +89,15 @@ async function readJson(response, maximum = MAX_BYTES) {
   return value;
 }
 
-function retryable(response) {
-  return response.status === 429 || response.status >= 500 || (
+function rateLimited(response) {
+  return response.status === 429 || (
     response.status === 403
     && (response.headers.get('x-ratelimit-remaining') === '0' || response.headers.has('retry-after'))
   );
+}
+
+function retryable(response) {
+  return rateLimited(response) || response.status >= 500;
 }
 
 function retryDelay(response, attempt, now, random) {
@@ -100,6 +116,7 @@ function retryDelay(response, attempt, now, random) {
 
 async function boundedRequest(fetchImpl, url, init, {
   attempts,
+  consume = async (response) => response,
   clock = Date.now,
   sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   random = Math.random,
@@ -114,10 +131,10 @@ async function boundedRequest(fetchImpl, url, init, {
         await sleep(retryDelay(null, attempt, clock(), random));
         continue;
       }
-      throw Object.assign(new Error('GitHub transport failed closed.'), {
-        cause,
-        failureClass: 'transport',
-      });
+      throw Object.assign(
+        new Error('GitHub transport failed closed.', { cause }),
+        { failureClass: 'transport' },
+      );
     }
     if (response.redirected) {
       throw Object.assign(new Error('GitHub redirect was rejected.'), { failureClass: 'provider-evidence' });
@@ -132,12 +149,22 @@ async function boundedRequest(fetchImpl, url, init, {
       throw Object.assign(new Error('GitHub API failed closed.'), {
         status: response.status,
         requestId: response.headers.get('x-github-request-id') || null,
-        failureClass: response.status === 429 || response.status === 403
-          ? 'rate-limit'
-          : 'provider-evidence',
+        failureClass: rateLimited(response) ? 'rate-limit' : 'provider-evidence',
       });
     }
-    return response;
+    try {
+      return await consume(response);
+    } catch (cause) {
+      if (!cause?.[bodyTransportFailureBrand]) throw cause;
+      if (attempt < attempts) {
+        await sleep(retryDelay(null, attempt, clock(), random));
+        continue;
+      }
+      throw Object.assign(
+        new Error('GitHub transport failed closed.', { cause }),
+        { failureClass: 'transport' },
+      );
+    }
   }
   throw new Error('GitHub API exhausted bounded retries.');
 }
@@ -162,11 +189,11 @@ export async function githubApi(fetchImpl, path, token, options = {}) {
   }
   if (options.headers || options.body) throw new Error('GitHub read request is immutable.');
   const kind = exactReadPath(path);
-  const response = await boundedRequest(fetchImpl, API + path, {
+  const value = await boundedRequest(fetchImpl, API + path, {
     method: 'GET',
     headers: immutableHeaders(token),
-  }, { ...options, attempts: 3 });
-  return validateReadPayload(kind, await readJson(response));
+  }, { ...options, attempts: 3, consume: (response) => readJson(response) });
+  return validateReadPayload(kind, value);
 }
 
 export async function createInstallationAccessToken(
@@ -185,12 +212,11 @@ export async function createInstallationAccessToken(
     contents: 'read',
     metadata: 'read',
   };
-  const response = await boundedRequest(fetchImpl, `${API}/app/installations/${id}/access_tokens`, {
+  const value = await boundedRequest(fetchImpl, `${API}/app/installations/${id}/access_tokens`, {
     method: 'POST',
     headers: immutableHeaders(jwt, true),
     body: JSON.stringify({ repository_ids: [1183552904], permissions }),
-  }, { ...options, attempts: 3 });
-  const value = await readJson(response, 262_144);
+  }, { ...options, attempts: 3, consume: (response) => readJson(response, 262_144) });
   const expiresAt = Math.floor(Date.parse(value.expires_at) / 1000);
   if (
     typeof value.token !== 'string' || value.token.length < 8 || value.token.length > 4096
