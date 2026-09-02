@@ -324,8 +324,50 @@ assert.match(verifyStep, /\(keys \| sort\) == \["alerts","checks","component","c
 assert.match(verifyStep, /scheduled < threshold/);
 assert.match(verifyStep, /fallback_after_id.*FALLBACK_BEFORE_ID/s);
 assert.match(verifyStep, /createdMs < startMs/);
-assert.match(verifyStep, /timeout-minutes: 15/);
-assert.match(verifyStep, /verification_deadline=\$\(\(SECONDS \+ 720\)\)/);
+assert.match(verifyStep, /timeout-minutes: 24/);
+assert.match(verifyStep, /verification_deadline=\$\(\(SECONDS \+ 1080\)\)/);
+assert.match(verifyStep, /timeout --signal=TERM --kill-after=5s 30s gh api --method GET/);
+const expectedFailureStages = [
+  'bootstrap-health-freshness',
+  'bootstrap-health-shape',
+  'deployment-created-at-contract',
+  'deployment-created-window',
+  'deployment-detail-contract',
+  'deployment-id-format',
+  'deployment-list-contract',
+  'domain-detail-contract',
+  'domain-hostname-contract',
+  'domain-id-format',
+  'domain-service-contract',
+  'fallback-inventory-changed',
+  'fallback-inventory-contract',
+  'fallback-inventory-fetch',
+  'health-contract',
+  'health-fetch',
+  'provider-fetch-deployment-detail',
+  'provider-fetch-deployments',
+  'provider-fetch-domain-detail',
+  'provider-fetch-hostname-domains',
+  'provider-fetch-schedules',
+  'provider-fetch-service-domains',
+  'provider-fetch-settings',
+  'provider-fetch-subdomain',
+  'provider-fetch-version-detail',
+  'schedule-contract',
+  'settings-contract',
+  'subdomain-contract',
+  'version-contract',
+  'version-id-contract',
+  'version-id-format',
+].sort();
+const assignedFailureStages = [...new Set(
+  [...verifyStep.matchAll(/failure_stage=([a-z0-9-]+)/g)].map((match) => match[1]),
+)].sort();
+assert.deepEqual(assignedFailureStages, [...expectedFailureStages, 'passed', 'unclassified'].sort());
+const failureStageCase = verifyStep.split('case "$failure_stage" in')[1].split(') ;;')[0].trim();
+assert.deepEqual(failureStageCase.split('|').sort(), expectedFailureStages);
+assert.match(verifyStep, /Controller verification failed::stage=%s/);
+assert.doesNotMatch(verifyStep, /printf '::error[^\n]*(?:API_TOKEN|PRIVATE_KEY|HMAC_KEY|SIGNING_KEY)/);
 for (const decision of ['outside-window', 'claimed', 'standby', 'native-blocked', 'native-blocked-final', 'outstanding', 'would_dispatch']) {
   assert.ok(verifyStep.includes(`.last_decision == "${decision}"`));
 }
@@ -372,8 +414,13 @@ assert.match(bootstrapContainmentStep, /DOMAIN_CREATED_BY_RUN/);
 assert.match(bootstrapContainmentStep, /SCHEDULE_CREATED_BY_RUN/);
 assert.match(bootstrapContainmentStep, /if test "\$SCHEDULE_MUTATION_ATTEMPTED" = true && test "\$SCHEDULE_CREATED_BY_RUN" != true; then\n\s+containment_rc=1/);
 assert.match(bootstrapContainmentStep, /if test "\$DOMAIN_MUTATION_ATTEMPTED" = true && test "\$DOMAIN_CREATED_BY_RUN" != true; then\n\s+containment_rc=1/);
+assert.match(bootstrapContainmentStep, /if test "\$DOMAIN_CREATED_BY_RUN" = true && ! valid_domain_id "\$EXPECTED_DOMAIN_ID"; then\n\s+containment_rc=1/);
+assert.match(bootstrapContainmentStep, /if test "\$DOMAIN_CREATED_BY_RUN" = true && valid_domain_id "\$EXPECTED_DOMAIN_ID"; then/);
+assert.match(bootstrapContainmentStep, /test "\$contained" = true \|\| containment_rc=1/);
 assert.match(bootstrapContainmentStep, /timeout-minutes: 10/);
 assert.match(bootstrapContainmentStep, /containment_deadline=\$\(\(SECONDS \+ 480\)\)/);
+assert.match(bootstrapContainmentStep, /Final exact absence will determine containment/);
+assert.equal((bootstrapContainmentStep.match(/containment_rc=1/g) || []).length, 4);
 assert.ok(
   bootstrapContainmentStep.indexOf('bootstrap-schedule-empty-body.json')
     < bootstrapContainmentStep.indexOf('--request DELETE'),
@@ -381,10 +428,10 @@ assert.ok(
 );
 const scheduleContainment = bootstrapContainmentStep.split(
   'if test "$SCHEDULE_CREATED_BY_RUN" = true; then',
-)[1].split('if test "$DOMAIN_CREATED_BY_RUN" = true; then')[0];
+)[1].split('if test "$DOMAIN_CREATED_BY_RUN" = true && valid_domain_id "$EXPECTED_DOMAIN_ID"; then')[0];
 assert.match(scheduleContainment, /--request PUT/);
 const domainContainment = bootstrapContainmentStep.split(
-  'if test "$DOMAIN_CREATED_BY_RUN" = true; then',
+  'if test "$DOMAIN_CREATED_BY_RUN" = true && valid_domain_id "$EXPECTED_DOMAIN_ID"; then',
 )[1];
 assert.match(domainContainment, /--request DELETE/);
 assert.doesNotMatch(bootstrapContainmentStep, /workers\/scripts\/\$CONTROLLER_NAME(?:['"\s]|$).*--request DELETE/);

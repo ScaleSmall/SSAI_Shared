@@ -248,6 +248,11 @@ mode-bound config and secret file, and never invokes the fallback workflow. Acce
 the exact custom domain, exact one-minute cron, a deployment newer than the operation start, and a
 healthy current-generation tick. Retain the protected workflow run, deployment ID, version ID,
 health body, domain record, cron record, source/profile/config digests, and approval as evidence.
+The final gate admits verification attempts for 18 minutes because Cloudflare documents that new
+or changed Cron Triggers can take up to 15 minutes to propagate globally. The protected step keeps
+a separate six-minute hard-timeout margin for one fully bounded final attempt and its failure
+handler. A timeout reports one closed, allowlisted verification stage without printing provider
+responses, credentials, or URLs.
 
 For the first deployment only, set `bootstrap=true` with `deploy-observe` and leave every rollback
 input empty. The workflow accepts this path only when official Cloudflare responses prove the
@@ -257,6 +262,8 @@ health schema and exact source/profile/config/Durable Object bindings before tra
 that exact version, and then applies the exact domain and cron. If final verification fails, it
 withdraws only the domain and cron proven absent before this run, preserves the Worker/version as
 diagnostic evidence, and fails visibly. Never use bootstrap when any Worker history exists.
+Containment treats only exact final readback as authoritative: receipt ambiguity does not excuse a
+remaining trigger, and exact absence can prove convergence after a noncanonical delete receipt.
 
 Active promotion is a separate `deploy-active` operation against the same protected source/profile
 generation after two consecutive observe slots produced the exact activation proof. Before the
