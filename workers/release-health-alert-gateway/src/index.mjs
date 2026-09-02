@@ -215,7 +215,7 @@ async function forwardAlert(request, { fetchImpl, timeoutMs, bodyTimeoutMs, rate
   try {
     const upstream = await fetchImpl(UPSTREAM_URL, {
       method: 'POST',
-      redirect: 'error',
+      redirect: 'manual',
       signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',

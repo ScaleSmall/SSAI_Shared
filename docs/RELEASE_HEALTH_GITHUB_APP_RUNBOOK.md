@@ -184,9 +184,9 @@ recorded producer independently, so either authorized producer can restore the o
 Legacy v4, v3, v2, and v1 issue markers remain native historical formats.
 
 The zero-dependency Cloudflare controller is under `workers/release-health-controller`. Its
-canonical sorted-source digest is `564a087877ee7264219fa3b3c151549754794fcf1de13cf00e13ac6de7fce096`.
+canonical sorted-source digest is `769c4ce017ac405b3fce09ed71555e0be782f858f3697da80ff6ce8b122c0140`.
 Its activation-profile digest is
-`53e4e61b69ce8519b717b0e1154d971437e8da7544f5e6d16cea4b9c5681334c`. The checked-in
+`6913aeb6904180933db66a0442157535ceebef83cbcdac89dd700a77df363ab5`. The checked-in
 configuration is `MODE=observe`, exposes only exact public GET
 `https://release-health-controller.scalesmall.ai/healthz`, disables `workers.dev`, and
 schedules evaluation every minute. The health response has no secret or per-request state and
@@ -202,12 +202,14 @@ to provide five bounded same-slot recovery opportunities, and never backfills a 
 transient read-authentication or read-inventory failure while the slot is only `leased` leaves that
 single lease retryable through age 13; an age-14 failure is terminal. Each bounded GitHub attempt
 includes response-body consumption, so a stalled stream cannot bypass the three-attempt policy. A
-GitHub request pins identity transfer encoding. Attempts one and two use the capped stream reader;
-attempt three may use the native buffer consumer only for a canonical `Content-Length` within the
-same operation cap and rechecks the actual bytes before parsing. One fixed-schema diagnostic per
-attempt exposes only operation kind, attempt, closed phase, sanitized response shape, chosen
-consumer, capped elapsed milliseconds, and closed outcome. It contains no provider locator,
-credential or request identity, response data, raw header, or exception detail. A
+GitHub request pins identity transfer encoding and uses Worker-compatible manual redirect handling;
+every 3xx response fails closed without following the location or forwarding credentials. Attempts
+one and two use the capped stream reader; attempt three may use the native buffer consumer only for
+a canonical `Content-Length` within the same operation cap and rechecks the actual bytes before
+parsing. One fixed-schema diagnostic per attempt exposes only operation kind, attempt, closed phase,
+sanitized response shape, chosen consumer, capped elapsed milliseconds, and closed outcome. It
+contains no provider locator, credential or request identity, response data, raw header, or
+exception detail. A
 final exact native/canary lookup, stable main SHA, and one
 unfiltered fallback inventory must pass before the durable prepare transition. Any exact native or
 canary schedule run in the slot blocks fallback. Only two consecutive canary slots establish

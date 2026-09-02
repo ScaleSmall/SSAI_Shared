@@ -108,7 +108,7 @@ function upstream(status = 202, body = '') {
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, 'https://oyyfpkpzalhxztpcdjgq.supabase.co/functions/v1/system-failure-ingest');
   assert.equal(calls[0].options.method, 'POST');
-  assert.equal(calls[0].options.redirect, 'error');
+  assert.equal(calls[0].options.redirect, 'manual');
   assert.ok(calls[0].options.signal instanceof AbortSignal);
   assert.equal(new TextDecoder().decode(calls[0].options.body), raw);
   const headers = new Headers(calls[0].options.headers);
@@ -381,8 +381,25 @@ for (const status of [200, 202, 204, 208, 226]) {
   assert.deepEqual(await result.json(), { error: 'upstream_timeout' });
 }
 
+{
+  let redirectCalls = 0;
+  const gateway = createGateway({
+    fetchImpl: async (_url, options) => {
+      redirectCalls += 1;
+      assert.equal(options.redirect, 'manual');
+      return new Response('redirect', {
+        status: 302,
+        headers: { Location: 'https://redirect-target.invalid/credential-capture' },
+      });
+    },
+  });
+  const result = await gateway.fetch(await deliveryRequest());
+  assert.equal(result.status, 502);
+  assert.deepEqual(await result.json(), { error: 'upstream_unavailable' });
+  assert.equal(redirectCalls, 1);
+}
+
 for (const resultFactory of [
-  async () => upstream(302, 'redirect'),
   async () => upstream(500, 'private upstream detail'),
   async () => { throw new Error('private network detail'); },
   async () => upstream(200, 'x'.repeat(65_537)),
