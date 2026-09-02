@@ -404,7 +404,7 @@ const retryDelays = [];
 const retryResult = await githubApi(async (_url, options) => {
   retryCalls += 1;
   assert.equal(options.method, 'GET');
-  assert.equal(options.redirect, 'error');
+  assert.equal(options.redirect, 'manual');
   assert.deepEqual(
     Object.keys(options.headers).sort(),
     ['Accept', 'Accept-Encoding', 'Authorization', 'User-Agent', 'X-GitHub-Api-Version'].sort(),
@@ -426,6 +426,19 @@ const retryResult = await githubApi(async (_url, options) => {
 assert.deepEqual(retryResult, { sha: mainSha });
 assert.equal(retryCalls, 3);
 assert.deepEqual(retryDelays, [100, 1000]);
+let readRedirectCalls = 0;
+await assert.rejects(
+  () => githubApi(async (_url, options) => {
+    readRedirectCalls += 1;
+    assert.equal(options.redirect, 'manual');
+    return new Response('', {
+      status: 302,
+      headers: { Location: 'https://redirect-target.invalid/credential-capture' },
+    });
+  }, '/repos/ScaleSmall/SSAI_Shared/commits/main', 'synthetic-read-token'),
+  (error) => error.failureClass === 'provider-evidence' && error.status === 302,
+);
+assert.equal(readRedirectCalls, 1);
 const bodySensitiveMarker = 'synthetic-sensitive-body-stream-detail';
 let bodyRetryCalls = 0;
 const bodyAttemptControllers = [];
@@ -812,6 +825,7 @@ const tokenValue = await createInstallationAccessToken(async (_url, options) => 
   tokenCalls += 1;
   assert.equal(options.headers['User-Agent'], GITHUB_USER_AGENT);
   assert.equal(options.headers['Accept-Encoding'], 'identity');
+  assert.equal(options.redirect, 'manual');
   const body = JSON.parse(options.body);
   assert.deepEqual(body, {
     repository_ids: [1183552904],
@@ -841,6 +855,19 @@ assert.deepEqual(tokenDiagnostics.map(({ attempt, operation_kind, outcome }) => 
 assert.ok(tokenDiagnostics.every((event) => (
   JSON.stringify(Object.keys(event).sort()) === JSON.stringify(diagnosticKeys)
 )));
+let tokenRedirectCalls = 0;
+await assert.rejects(
+  () => createInstallationAccessToken(async (_url, options) => {
+    tokenRedirectCalls += 1;
+    assert.equal(options.redirect, 'manual');
+    return new Response('', {
+      status: 307,
+      headers: { Location: 'https://redirect-target.invalid/credential-capture' },
+    });
+  }, '12345', 'synthetic-app-jwt', 'read'),
+  (error) => error.failureClass === 'provider-evidence' && error.status === 307,
+);
+assert.equal(tokenRedirectCalls, 1);
 let tokenBodyRetryCalls = 0;
 let tokenBodySignalCalls = 0;
 const tokenAfterBodyRetry = await createInstallationAccessToken(async (_url, options) => {
@@ -928,7 +955,7 @@ let dispatchCalls = 0;
 const ambiguous = await dispatchWorkflowOnce(async (_url, options) => {
   dispatchCalls += 1;
   assert.equal(options.method, 'POST');
-  assert.equal(options.redirect, 'error');
+  assert.equal(options.redirect, 'manual');
   assert.equal(options.headers['User-Agent'], GITHUB_USER_AGENT);
   assert.equal(options.headers['Accept-Encoding'], 'identity');
   throw new DOMException('synthetic timeout', 'TimeoutError');
@@ -936,6 +963,19 @@ const ambiguous = await dispatchWorkflowOnce(async (_url, options) => {
 assert.equal(dispatchCalls, 1);
 assert.equal(ambiguous.outcome, 'ambiguous');
 assert.equal(ambiguous.failure_class, 'transport');
+let dispatchRedirectCalls = 0;
+const redirectDispatch = await dispatchWorkflowOnce(async (_url, options) => {
+  dispatchRedirectCalls += 1;
+  assert.equal(options.redirect, 'manual');
+  return new Response('', {
+    status: 303,
+    headers: { Location: 'https://redirect-target.invalid/credential-capture' },
+  });
+}, 'synthetic-write-token', dispatchInputs);
+assert.deepEqual(redirectDispatch, {
+  outcome: 'ambiguous', failure_class: 'provider-evidence', status: 303,
+});
+assert.equal(dispatchRedirectCalls, 1);
 let malformedCalls = 0;
 const malformed = await dispatchWorkflowOnce(async () => {
   malformedCalls += 1;
@@ -1222,6 +1262,21 @@ await assert.rejects(() => deliverSignedAlert(claimed[0], {
   },
   timeoutSignal: () => new AbortController().signal,
 }), /timeout/);
+let alertRedirectCalls = 0;
+await assert.rejects(() => deliverSignedAlert(claimed[0], {
+  sink: 'https://alerts.scalesmall.ai/release-health-alert',
+  keyBase64: alertKey,
+  fetchImpl: async (_url, options) => {
+    alertRedirectCalls += 1;
+    assert.equal(options.redirect, 'manual');
+    return new Response('', {
+      status: 308,
+      headers: { Location: 'https://redirect-target.invalid/credential-capture' },
+    });
+  },
+  timeoutSignal: () => new AbortController().signal,
+}), (error) => error.message === 'Alert delivery failed.' && error.status === 308);
+assert.equal(alertRedirectCalls, 1);
 await circuitStore.rejectAlert(claimed[0].alert_id, null, 'transport', recoveryProbeSlot * 60_000 + 600_000);
 const reclaimed = await circuitStore.claimAlerts(recoveryProbeSlot * 60_000 + 661_000, 1);
 assert.equal(reclaimed[0].alert_id, claimed[0].alert_id);
@@ -1636,6 +1691,42 @@ assert.equal((await forbiddenScopeStore.getSlot(
   controllerSourceDigest,
   controllerProfileDigest,
 )).phase, 'terminal');
+
+const redirectAuthHarness = sqliteHarness();
+let redirectAuthCalls = 0;
+let redirectAuthDispatchPosts = 0;
+const redirectAuthEnv = controllerEnv('observe', {
+  AUTH_PROVIDER: async (fetchImpl, _env, _now, permissionMode) => createInstallationAccessToken(
+    fetchImpl,
+    '12345',
+    'synthetic-app-jwt',
+    permissionMode,
+    { sleep: async () => {}, timeoutSignal: () => new AbortController().signal },
+  ),
+  FETCH_IMPL: async (url, options) => {
+    if (String(url).includes('/actions/workflows/344170407/dispatches')) {
+      redirectAuthDispatchPosts += 1;
+    }
+    redirectAuthCalls += 1;
+    assert.equal(options.redirect, 'manual');
+    return new Response('', {
+      status: 302,
+      headers: { Location: 'https://redirect-target.invalid/credential-capture' },
+    });
+  },
+});
+const redirectAuthObject = new ReleaseHealthControllerObject(redirectAuthHarness.state, redirectAuthEnv);
+const redirectAuthTime = baseSlot * 60_000 + 10 * 60_000 + 16_000;
+const redirectAuthResponse = await redirectAuthObject.fetch(
+  boundaryRequest(redirectAuthTime, redirectAuthTime),
+);
+assert.deepEqual(await redirectAuthResponse.json(), {
+  decision: 'failed-closed',
+  failure_class: 'provider-evidence',
+  failure_stage: 'read-auth',
+});
+assert.equal(redirectAuthCalls, 1);
+assert.equal(redirectAuthDispatchPosts, 0);
 
 // Closed, redacted failure stages identify the exact eligible boundary without provider details.
 assert.ok(failureStages.length >= 12);

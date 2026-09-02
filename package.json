@@ -30,9 +30,9 @@
   "scripts": {
     "check": "npm run check:production-readiness",
     "check:production-readiness": "npm run check:contracts && npm run check:secrets && npm run check:audit && npm run check:signatures && git diff --check && npm run check:hygiene",
-    "check:contracts": "node scripts/verify-connect-panel-contract.mjs && node scripts/verify-shared-api-contract.mjs && node scripts/verify-workflow-contracts.mjs && node scripts/verify-release-health-monitor-selection.mjs && node scripts/verify-release-health-incident-delivery.mjs && node scripts/verify-release-health-fallback-admission.test.mjs && node scripts/verify-release-health-controller.mjs && node scripts/verify-release-health-controller-deploy.mjs && node scripts/verify-release-health-alert-gateway.mjs && node scripts/verify-release-health-alert-gateway-deploy.mjs",
-    "check:release-health-fallback": "node scripts/verify-release-health-fallback-admission.test.mjs && node scripts/verify-release-health-controller.mjs && node scripts/verify-release-health-controller-deploy.mjs",
-    "check:release-health-alert-gateway": "node scripts/verify-release-health-alert-gateway.mjs && node scripts/verify-release-health-alert-gateway-deploy.mjs",
+    "check:contracts": "node scripts/verify-connect-panel-contract.mjs && node scripts/verify-shared-api-contract.mjs && node scripts/verify-workflow-contracts.mjs && node scripts/verify-release-health-monitor-selection.mjs && node scripts/verify-release-health-incident-delivery.mjs && node scripts/verify-release-health-fallback-admission.test.mjs && node scripts/verify-release-health-controller.mjs && node scripts/verify-release-health-controller-deploy.mjs && node scripts/verify-release-health-alert-gateway.mjs && node scripts/verify-release-health-alert-gateway-deploy.mjs && node scripts/verify-worker-redirect-contract.mjs",
+    "check:release-health-fallback": "node scripts/verify-release-health-fallback-admission.test.mjs && node scripts/verify-release-health-controller.mjs && node scripts/verify-release-health-controller-deploy.mjs && node scripts/verify-worker-redirect-contract.mjs",
+    "check:release-health-alert-gateway": "node scripts/verify-release-health-alert-gateway.mjs && node scripts/verify-release-health-alert-gateway-deploy.mjs && node scripts/verify-worker-redirect-contract.mjs",
     "check:audit": "npm audit",
     "check:signatures": "node scripts/check-npm-signatures.mjs",
     "check:connect-panel": "node scripts/verify-connect-panel-contract.mjs",

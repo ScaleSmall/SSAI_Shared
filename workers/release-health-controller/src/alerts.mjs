@@ -75,7 +75,7 @@ export async function deliverSignedAlert(record, {
   );
   const response = await fetchImpl(sink, {
     method: 'POST',
-    redirect: 'error',
+    redirect: 'manual',
     signal: timeoutSignal(),
     headers: {
       'Content-Type': 'application/json',

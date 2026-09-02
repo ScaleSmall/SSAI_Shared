@@ -217,7 +217,7 @@ async function boundedRequest(fetchImpl, url, init, {
     }
     let response;
     try {
-      response = await fetchImpl(url, { ...init, redirect: 'error', signal: timeoutSignal() });
+      response = await fetchImpl(url, { ...init, redirect: 'manual', signal: timeoutSignal() });
     } catch {
       emitAttemptDiagnostic(diagnosticObserver, diagnosticClock, startedAt, {
         operationKind, attempt, phase: 'headers', outcome: 'transport',
@@ -401,7 +401,7 @@ export async function dispatchWorkflowOnce(fetchImpl, token, inputs, options = {
   try {
     response = await fetchImpl(url, {
       method: 'POST',
-      redirect: 'error',
+      redirect: 'manual',
       signal: (options.timeoutSignal || (() => AbortSignal.timeout(10_000)))(),
       headers: immutableHeaders(token, true),
       body: JSON.stringify({ ref: 'main', inputs }),
