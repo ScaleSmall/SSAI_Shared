@@ -1,10 +1,12 @@
 const API = 'https://api.github.com';
 const VERSION = '2026-03-10';
 const MAX_BYTES = 1_000_000;
+export const GITHUB_USER_AGENT = 'ScaleSmall-SSAI-Release-Health-Controller/1.0';
+export const WORKFLOW_RUN_PAGE_SIZE = 25;
 const workflowIds = new Set(['315630665', '344135917', '344170407']);
 const queries = new Set([
-  'event=schedule&branch=main&per_page=100',
-  'event=workflow_dispatch&branch=main&per_page=100',
+  `event=schedule&branch=main&per_page=${WORKFLOW_RUN_PAGE_SIZE}`,
+  `event=workflow_dispatch&branch=main&per_page=${WORKFLOW_RUN_PAGE_SIZE}`,
 ]);
 
 function exactReadPath(path) {
@@ -23,6 +25,7 @@ function immutableHeaders(token, contentType = false) {
   return Object.freeze({
     Accept: 'application/vnd.github+json',
     Authorization: `Bearer ${token}`,
+    'User-Agent': GITHUB_USER_AGENT,
     'X-GitHub-Api-Version': VERSION,
     ...(contentType ? { 'Content-Type': 'application/json' } : {}),
   });

@@ -450,6 +450,7 @@ jobs:
           OPERATION="$OPERATION" node --input-type=module <<'NODE'
           import { readFile } from 'node:fs/promises';
           import { githubApi, installationToken } from './workers/release-health-controller/src/github-app.mjs';
+          import { workflowRuns } from './workers/release-health-controller/src/controller.mjs';
           const permissionMode = process.env.OPERATION === 'deploy-active' ? 'write' : 'read';
           const env = {
             GITHUB_APP_CLIENT_ID: process.env.APP_CLIENT_ID,
@@ -459,11 +460,9 @@ jobs:
           };
           const access = await installationToken(fetch, env, Math.floor(Date.now() / 1000), permissionMode);
           await githubApi(fetch, '/repos/ScaleSmall/SSAI_Shared/commits/main', access.token);
-          await githubApi(
-            fetch,
-            '/repos/ScaleSmall/SSAI_Shared/actions/workflows/344170407/runs?event=workflow_dispatch&branch=main&per_page=100',
-            access.token,
-          );
+          await workflowRuns(fetch, access.token, 315630665, 'schedule');
+          await workflowRuns(fetch, access.token, 344135917, 'schedule');
+          await workflowRuns(fetch, access.token, 344170407, 'workflow_dispatch');
           await readFile(process.env.RUNNER_TEMP + '/github-app-pkcs8.pem', 'utf8');
           NODE
           APP_PRIVATE_KEY_PKCS8="$(cat "$RUNNER_TEMP/github-app-pkcs8.pem")" \

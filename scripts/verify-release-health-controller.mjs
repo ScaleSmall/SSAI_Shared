@@ -20,8 +20,10 @@ import {
 import {
   createInstallationAccessToken,
   dispatchWorkflowOnce,
+  GITHUB_USER_AGENT,
   githubApi,
   validateDispatchReceipt,
+  WORKFLOW_RUN_PAGE_SIZE,
 } from '../workers/release-health-controller/src/github-api.mjs';
 import {
   activationProof,
@@ -187,6 +189,10 @@ function apiHarness({ fallbackInventories = [], dispatch = [], alerts = [] } = {
         return action;
       }
       const parsed = new URL(url);
+      if (method === 'GET' && parsed.pathname.endsWith('/runs')) {
+        assert.equal(parsed.searchParams.get('per_page'), String(WORKFLOW_RUN_PAGE_SIZE));
+        assert.equal(parsed.searchParams.get('branch'), 'main');
+      }
       if (method === 'POST' && parsed.pathname.endsWith('/actions/workflows/344170407/dispatches')) {
         const action = dispatch[dispatchIndex++] ?? new Response(JSON.stringify(receipt(9001)), { status: 200 });
         if (action instanceof Error) throw action;
@@ -317,13 +323,51 @@ await assert.rejects(() => signEnvelope(envelope, Buffer.alloc(31).toString('bas
 await assert.rejects(() => signEnvelope(envelope, `${admissionKey}\n`), /HMAC key/);
 
 // Strict GET/token clients, retry classes, streaming limits, and one-attempt dispatch.
+assert.equal(GITHUB_USER_AGENT, 'ScaleSmall-SSAI-Release-Health-Controller/1.0');
+assert.equal(WORKFLOW_RUN_PAGE_SIZE, 25);
+const boundedInventoryPath = '/repos/ScaleSmall/SSAI_Shared/actions/workflows/315630665/runs?event=schedule&branch=main&per_page=25';
+assert.deepEqual(await githubApi(
+  async (_url, options) => {
+    assert.equal(options.headers['User-Agent'], GITHUB_USER_AGENT);
+    return new Response(JSON.stringify(payload()), { status: 200 });
+  },
+  boundedInventoryPath,
+  'synthetic-read-token',
+), payload());
+await assert.rejects(
+  () => githubApi(
+    async () => new Response(JSON.stringify(payload()), { status: 200 }),
+    boundedInventoryPath.replace('per_page=25', 'per_page=100'),
+    'synthetic-read-token',
+  ),
+  /not allowed/,
+);
+const oversizedInventoryStream = new ReadableStream({
+  start(controller) {
+    controller.enqueue(new Uint8Array(600_000));
+    controller.enqueue(new Uint8Array(600_000));
+    controller.close();
+  },
+});
+await assert.rejects(
+  () => githubApi(
+    async () => new Response(oversizedInventoryStream, { status: 200 }),
+    boundedInventoryPath,
+    'synthetic-read-token',
+  ),
+  /response is too large/,
+);
 let retryCalls = 0;
 const retryDelays = [];
 const retryResult = await githubApi(async (_url, options) => {
   retryCalls += 1;
   assert.equal(options.method, 'GET');
   assert.equal(options.redirect, 'error');
-  assert.deepEqual(Object.keys(options.headers).sort(), ['Accept', 'Authorization', 'X-GitHub-Api-Version'].sort());
+  assert.deepEqual(
+    Object.keys(options.headers).sort(),
+    ['Accept', 'Authorization', 'User-Agent', 'X-GitHub-Api-Version'].sort(),
+  );
+  assert.equal(options.headers['User-Agent'], GITHUB_USER_AGENT);
   if (retryCalls === 1) throw new DOMException('synthetic timeout', 'TimeoutError');
   if (retryCalls === 2) return new Response('{}', {
     status: 403,
@@ -354,6 +398,7 @@ await assert.rejects(
 let tokenCalls = 0;
 const tokenValue = await createInstallationAccessToken(async (_url, options) => {
   tokenCalls += 1;
+  assert.equal(options.headers['User-Agent'], GITHUB_USER_AGENT);
   const body = JSON.parse(options.body);
   assert.deepEqual(body, {
     repository_ids: [1183552904],
@@ -376,6 +421,7 @@ assert.equal(tokenValue.permissionMode, 'read');
 let writeTokenCalls = 0;
 const writeTokenValue = await createInstallationAccessToken(async (_url, options) => {
   writeTokenCalls += 1;
+  assert.equal(options.headers['User-Agent'], GITHUB_USER_AGENT);
   assert.deepEqual(JSON.parse(options.body), {
     repository_ids: [1183552904],
     permissions: { actions: 'write', contents: 'read', metadata: 'read' },
@@ -405,6 +451,7 @@ const ambiguous = await dispatchWorkflowOnce(async (_url, options) => {
   dispatchCalls += 1;
   assert.equal(options.method, 'POST');
   assert.equal(options.redirect, 'error');
+  assert.equal(options.headers['User-Agent'], GITHUB_USER_AGENT);
   throw new DOMException('synthetic timeout', 'TimeoutError');
 }, 'synthetic-write-token', dispatchInputs, { timeoutSignal: () => new AbortController().signal });
 assert.equal(dispatchCalls, 1);

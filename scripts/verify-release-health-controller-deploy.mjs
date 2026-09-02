@@ -113,7 +113,10 @@ for (const required of [
   'protected-observe:',
   "permissionMode = process.env.OPERATION === 'deploy-active' ? 'write' : 'read'",
   "'/repos/ScaleSmall/SSAI_Shared/commits/main'",
-  "'/repos/ScaleSmall/SSAI_Shared/actions/workflows/344170407/runs?event=workflow_dispatch&branch=main&per_page=100'",
+  "import { workflowRuns } from './workers/release-health-controller/src/controller.mjs';",
+  "await workflowRuns(fetch, access.token, 315630665, 'schedule');",
+  "await workflowRuns(fetch, access.token, 344135917, 'schedule');",
+  "await workflowRuns(fetch, access.token, 344170407, 'workflow_dispatch');",
   'https://alerts.scalesmall.ai/healthz',
   'ssai-release-health-alert-gateway-health-v2',
   '.version_id|test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")',
@@ -314,6 +317,8 @@ const baseSecretStep = workflow.split(
   '      - name: Prepare and validate runtime credentials without disclosure',
 )[1].split('      - name: Validate and bind active-only dispatch credentials')[0];
 assert.doesNotMatch(baseSecretStep, /ADMISSION_HMAC_KEY|ALERT_SIGNING_KEY|ACTIVATION_PROOF/);
+assert.equal((baseSecretStep.match(/await workflowRuns\(/g) || []).length, 3);
+assert.doesNotMatch(baseSecretStep, /actions\/workflows\/\d+\/runs\?|per_page=/);
 const activeSecretStep = workflow.split(
   '      - name: Validate and bind active-only dispatch credentials',
 )[1].split('      - name: Require healthy signed alert sink before active mode')[0];
