@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -303,16 +304,73 @@ assert.match(finalizeObserveStep, /protected-observe:\$\{GITHUB_SHA\}:\$\{EXPECT
 const verifyStep = workflow.split(
   '      - name: Verify exact deployment, domain, cron, mode, and liveness',
 )[1].split('      - name: Automatically restore attested observe version after failed deployment verification')[0];
+const deploymentListProgramMatch = verifyStep.match(
+  /live_deployment_id="\$\(jq -er --arg expected "\$expected_deployment" '\n(?<program>[\s\S]*?)\n\s+' "\$RUNNER_TEMP\/controller-deployments-after\.json"\)"/,
+);
+assert.ok(deploymentListProgramMatch?.groups?.program, 'Missing executable deployment-list jq contract.');
+const normalizeEmbeddedProgram = (program) => program
+  .split('\n')
+  .map((line) => line.trim())
+  .join('\n');
+const deploymentListProgram = normalizeEmbeddedProgram(deploymentListProgramMatch.groups.program);
+const versionIdProgramMatch = verifyStep.match(
+  /live_version_id="\$\(jq -er --arg deployment "\$live_deployment_id" --arg expected "\$expected_version" '\n(?<program>[\s\S]*?)\n\s+' "\$RUNNER_TEMP\/controller-deployments-after\.json"\)"/,
+);
+assert.ok(versionIdProgramMatch?.groups?.program, 'Missing expected version-ID jq contract.');
+const versionIdProgram = normalizeEmbeddedProgram(versionIdProgramMatch.groups.program);
+const domainIdProgramMatch = verifyStep.match(
+  /domain_id="\$\(jq -er --arg expected "\$expected_domain" '\n(?<program>[\s\S]*?)\n\s+' "\$RUNNER_TEMP\/controller-service-domains\.json"\)"/,
+);
+assert.ok(domainIdProgramMatch?.groups?.program, 'Missing expected domain-ID jq contract.');
+const domainIdProgram = normalizeEmbeddedProgram(domainIdProgramMatch.groups.program);
 assert.match(verifyStep, /id: verify_deploy/);
 assert.match(verifyStep, /continue-on-error: true/);
 assert.match(verifyStep, /no_terminal_failure:true/);
 assert.match(verifyStep, /config_digest == \$config/);
-assert.match(verifyStep, /select\(\(\$live\.versions \/\/ \[\]\) \| length == 1\)/);
+assert.match(deploymentListProgram, /select\(\(\$deployments \| type\) == "array" and \(\$deployments \| length\) > 0\)/);
+assert.match(deploymentListProgram, /select\(\(\$live\.id \| type\) == "string" and \(\$live\.id \| length\) > 0\)/);
+assert.match(deploymentListProgram, /select\(\(\$live\.versions \| type\) == "array" and \(\$live\.versions \| length\) == 1\)/);
 assert.match(verifyStep, /select\(\(\$live\.versions\[0\]\.percentage \| tonumber\) == 100\)/);
+assert.match(deploymentListProgram, /select\(\$expected == "" or \$live\.id == \$expected\)\n\| \$live\.id$/);
+assert.match(versionIdProgram, /\.versions\[0\]\.version_id\n\| select\(\$expected == "" or \. == \$expected\)$/);
+assert.match(domainIdProgram, /\| \.id \| select\(\$expected == "" or \. == \$expected\)$/);
 assert.match(verifyStep, /workers\/scripts\/\$CONTROLLER_NAME\/versions\/\$live_version_id/);
 assert.match(verifyStep, /\["workers\/tag"\] == \$tag/);
 assert.match(verifyStep, /\["workers\/message"\] == \$message/);
-assert.match(verifyStep, /select\(\$expected == "" or \. == \$expected\)/);
+if (process.platform !== 'win32') {
+  const liveDeploymentId = '11111111-2222-4333-8444-555555555555';
+  const liveVersionId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const wrappedDeploymentResponse = {
+    success: true,
+    result: {
+      deployments: [{
+        id: liveDeploymentId,
+        created_on: '2026-09-02T00:00:00Z',
+        versions: [{ version_id: liveVersionId, percentage: 100 }],
+      }],
+    },
+  };
+  const evaluateDeploymentList = (response, expected = '') => spawnSync(
+    'jq',
+    ['-er', '--arg', 'expected', expected, deploymentListProgram],
+    { encoding: 'utf8', input: JSON.stringify(response) },
+  );
+
+  const exactMatch = evaluateDeploymentList(wrappedDeploymentResponse, liveDeploymentId);
+  assert.equal(exactMatch.status, 0, exactMatch.stderr);
+  assert.equal(exactMatch.stdout.trim(), liveDeploymentId);
+
+  const emptyExpected = evaluateDeploymentList(wrappedDeploymentResponse);
+  assert.equal(emptyExpected.status, 0, emptyExpected.stderr);
+  assert.equal(emptyExpected.stdout.trim(), liveDeploymentId);
+
+  assert.notEqual(
+    evaluateDeploymentList(wrappedDeploymentResponse, '99999999-8888-4777-8666-555555555555').status,
+    0,
+  );
+  assert.notEqual(evaluateDeploymentList({ success: true, result: { deployments: [] } }).status, 0);
+  assert.notEqual(evaluateDeploymentList({ success: true, result: { deployments: {} } }).status, 0);
+}
 assert.match(verifyStep, /expected_config="\$ROLLBACK_CONFIG"/);
 for (const output of ['candidate_version_id', 'candidate_deployment_id', 'attestation_sha']) {
   assert.match(verifyStep, new RegExp(`steps\\.bootstrap_candidate\\.outputs\\.${output}`));

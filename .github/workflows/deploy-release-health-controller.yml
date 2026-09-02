@@ -1230,12 +1230,15 @@ jobs:
               -o "$RUNNER_TEMP/controller-subdomain-after.json" \
               && failure_stage=deployment-list-contract \
               && live_deployment_id="$(jq -er --arg expected "$expected_deployment" '
-                (.result.deployments // .result // []) as $deployments
+                (.result.deployments // .result // empty) as $deployments
+                | select(($deployments | type) == "array" and ($deployments | length) > 0)
                 | $deployments[0] as $live
-                | select(($live.versions // []) | length == 1)
+                | select(($live | type) == "object")
+                | select(($live.id | type) == "string" and ($live.id | length) > 0)
+                | select(($live.versions | type) == "array" and ($live.versions | length) == 1)
                 | select(($live.versions[0].percentage | tonumber) == 100)
-                | select($expected == "" or .id == $expected)
-                | .id
+                | select($expected == "" or $live.id == $expected)
+                | $live.id
               ' "$RUNNER_TEMP/controller-deployments-after.json")" \
               && failure_stage=deployment-created-at-contract \
               && live_deployment_created_on="$(jq -er --arg id "$live_deployment_id" '
