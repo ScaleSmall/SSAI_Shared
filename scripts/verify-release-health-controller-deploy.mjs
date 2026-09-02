@@ -203,9 +203,12 @@ assert.match(bootstrapDomainStep, /\$api\/workers\/domains/);
 assert.match(bootstrapDomainStep, /hostname:"release-health-controller\.scalesmall\.ai"/);
 assert.match(bootstrapDomainStep, /service:"ssai-release-health-controller"/);
 assert.match(bootstrapDomainStep, /zone_name:"scalesmall\.ai"/);
-assert.match(bootstrapDomainStep, /test "\$code" = 503/);
-assert.match(bootstrapDomainStep, /last_completed_tick == null and \.last_scheduled_time == null and \.last_decision == null/);
-assert.match(bootstrapDomainStep, /\.checks == \{fresh:false,no_dead_alerts:true,no_terminal_failure:true,no_internal_failure:true\}/);
+assert.match(bootstrapDomainStep, /if test "\$CURRENT_STATE" = contained \|\| test "\$CURRENT_STATE" = domain; then/);
+assert.equal((bootstrapDomainStep.match(/bootstrap-domain-health\.json/g) || []).length, 2);
+assert.match(bootstrapDomainStep, /test "\$code" = 200 \|\| test "\$code" = 503/);
+assert.match(bootstrapDomainStep, /health\.last_completed_tick === null/);
+assert.match(bootstrapDomainStep, /health\.last_scheduled_time === null/);
+assert.match(bootstrapDomainStep, /health\.last_decision === null/);
 assert.doesNotMatch(bootstrapDomainStep, /no_terminal_failure:false|no_internal_failure:false/);
 const bootstrapVirginHealth = bootstrapDomainStep.split(
   "          const virgin = code === '503'",
