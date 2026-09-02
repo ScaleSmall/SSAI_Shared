@@ -184,14 +184,19 @@ recorded producer independently, so either authorized producer can restore the o
 Legacy v4, v3, v2, and v1 issue markers remain native historical formats.
 
 The zero-dependency Cloudflare controller is under `workers/release-health-controller`. Its
-canonical sorted-source digest is `3680d43cb1d62d2b5d25ea5ba873646078e2c1d51d3f3a9bd87c0897ebf8035c`.
+canonical sorted-source digest is `cef1079d9e2e19e00e9379f257ea2e79a0629cb2b39fb53ab196d134be99aa38`.
 Its activation-profile digest is
-`90d069ec4d221b79bc47ddb58a52a8b8eb57f58ad2b5f9a886febbf93f41707e`. The checked-in
+`fcb9b7bc3b9a4816e3f5dd9d004e3816885462a258ffbb9ff48c21b0b37525d1`. The checked-in
 configuration is `MODE=observe`, exposes only exact public GET
 `https://release-health-controller.scalesmall.ai/healthz`, disables `workers.dev`, and
 schedules evaluation every minute. The health response has no secret or per-request state and
 returns 503 when the current generation has no completed tick within 300 seconds, the last tick
 has any terminal failure classification, or any alert is dead.
+Eligible failures persist and log only a closed, allowlisted `failure_stage` beside the existing
+`failure_class`. The stage names a controller boundary without retaining an exception, stack,
+provider URL or body, request identifier, credential, or other secret-bearing detail. Successful
+evaluations emit both diagnostic fields as null, and the public health and signed-alert schemas do
+not expose the stage.
 Logical slots are minutes 1, 16, 31, and 46. Evaluation occurs only at ages 10 through 14 minutes
 to provide five bounded same-slot recovery opportunities, and never backfills a new dispatch. A
 final exact native/canary lookup, stable main SHA, and one
