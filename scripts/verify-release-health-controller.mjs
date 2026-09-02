@@ -734,7 +734,19 @@ healthEnv.SLOT_LEDGER = {
 const publicHealthRequest = () => new Request(
   'https://release-health-controller.scalesmall.ai/healthz',
 );
-assert.equal((await worker.fetch(publicHealthRequest(), healthEnv)).status, 503);
+const virginHealth = await worker.fetch(publicHealthRequest(), healthEnv);
+assert.equal(virginHealth.status, 503);
+const virginHealthBody = await virginHealth.json();
+assert.equal(virginHealthBody.status, 'unhealthy');
+assert.equal(virginHealthBody.last_completed_tick, null);
+assert.equal(virginHealthBody.last_scheduled_time, null);
+assert.equal(virginHealthBody.last_decision, null);
+assert.deepEqual(virginHealthBody.checks, {
+  fresh: false,
+  no_dead_alerts: true,
+  no_terminal_failure: true,
+  no_internal_failure: true,
+});
 assert.equal((await worker.fetch(new Request(
   'https://release-health-controller.scalesmall.ai/healthz?verbose=true',
 ), healthEnv)).status, 404);
