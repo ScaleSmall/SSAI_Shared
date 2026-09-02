@@ -1145,7 +1145,7 @@ jobs:
         id: verify_deploy
         if: ${{ always() }}
         continue-on-error: true
-        timeout-minutes: 15
+        timeout-minutes: 24
         shell: bash
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
@@ -1208,34 +1208,45 @@ jobs:
               ;;
             *) exit 1 ;;
           esac
-          verification_deadline=$((SECONDS + 720))
+          # Cloudflare documents that a new or changed Cron Trigger can require up to
+          # 15 minutes to propagate globally. Keep three minutes of verification
+          # margin without weakening the requirement for a natural scheduled tick.
+          verification_deadline=$((SECONDS + 1080))
           success=false
+          failure_stage=provider-fetch-schedules
           while test "$SECONDS" -lt "$verification_deadline"; do
             checks_ready=false
+            failure_stage=provider-fetch-schedules
             if curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
               "$api/workers/scripts/$CONTROLLER_NAME/schedules" \
               -o "$RUNNER_TEMP/controller-schedules.json" \
+              && failure_stage=provider-fetch-service-domains \
               && curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
               "$api/workers/domains?service=$CONTROLLER_NAME" \
               -o "$RUNNER_TEMP/controller-service-domains.json" \
+              && failure_stage=provider-fetch-hostname-domains \
               && curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
               "$api/workers/domains?hostname=release-health-controller.scalesmall.ai" \
               -o "$RUNNER_TEMP/controller-hostname-domains.json" \
+              && failure_stage=provider-fetch-deployments \
               && curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
               "$api/workers/scripts/$CONTROLLER_NAME/deployments" \
               -o "$RUNNER_TEMP/controller-deployments-after.json" \
+              && failure_stage=provider-fetch-settings \
               && curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
               "$api/workers/scripts/$CONTROLLER_NAME/settings" \
               -o "$RUNNER_TEMP/controller-settings-after.json" \
+              && failure_stage=provider-fetch-subdomain \
               && curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
               "$api/workers/scripts/$CONTROLLER_NAME/subdomain" \
               -o "$RUNNER_TEMP/controller-subdomain-after.json" \
+              && failure_stage=deployment-list-contract \
               && live_deployment_id="$(jq -er --arg expected "$expected_deployment" '
                 (.result.deployments // .result // []) as $deployments
                 | $deployments[0] as $live
@@ -1244,10 +1255,12 @@ jobs:
                 | select($expected == "" or .id == $expected)
                 | .id
               ' "$RUNNER_TEMP/controller-deployments-after.json")" \
+              && failure_stage=deployment-created-at-contract \
               && live_deployment_created_on="$(jq -er --arg id "$live_deployment_id" '
                 (.result.deployments // .result // [])[0]
                 | select(.id == $id) | .created_on | select(type == "string" and length > 0)
               ' "$RUNNER_TEMP/controller-deployments-after.json")" \
+              && failure_stage=deployment-created-window \
               && node -e '
                 const [expected, started, created] = process.argv.slice(1);
                 if (!expected) {
@@ -1256,22 +1269,28 @@ jobs:
                   if (!Number.isFinite(startMs) || !Number.isFinite(createdMs) || createdMs < startMs) process.exit(1);
                 }
               ' "$expected_deployment" "$DEPLOY_STARTED_AT" "$live_deployment_created_on" \
+              && failure_stage=version-id-contract \
               && live_version_id="$(jq -er --arg deployment "$live_deployment_id" --arg expected "$expected_version" '
                 (.result.deployments // .result // [])[0]
                 | select(.id == $deployment)
                 | .versions[0].version_id
                 | select($expected == "" or . == $expected)
               ' "$RUNNER_TEMP/controller-deployments-after.json")" \
+              && failure_stage=deployment-id-format \
               && [[ "$live_deployment_id" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
+              && failure_stage=version-id-format \
               && [[ "$live_version_id" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
+              && failure_stage=provider-fetch-deployment-detail \
               && curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
               "$api/workers/scripts/$CONTROLLER_NAME/deployments/$live_deployment_id" \
               -o "$RUNNER_TEMP/controller-live-deployment.json" \
+              && failure_stage=provider-fetch-version-detail \
               && curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
               "$api/workers/scripts/$CONTROLLER_NAME/versions/$live_version_id" \
               -o "$RUNNER_TEMP/controller-live-version.json" \
+              && failure_stage=domain-service-contract \
               && domain_id="$(jq -er --arg expected "$expected_domain" '
                 select(.success == true and (.result | type) == "array" and (.result | length) == 1)
                 | .result[0]
@@ -1282,24 +1301,30 @@ jobs:
                 | select((.environment // "production") == "production")
                 | .id | select($expected == "" or . == $expected)
               ' "$RUNNER_TEMP/controller-service-domains.json")" \
+              && failure_stage=domain-id-format \
               && [[ "$domain_id" =~ ^[a-f0-9]{32}$ || "$domain_id" =~ ^[a-f0-9]{40}$ || "$domain_id" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]] \
+              && failure_stage=provider-fetch-domain-detail \
               && curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
               "$api/workers/domains/$domain_id" \
               -o "$RUNNER_TEMP/controller-domain-detail.json" \
+              && failure_stage=health-fetch \
               && curl --silent --show-error --max-time 15 --proto '=https' \
               --fail \
               "$CONTROLLER_HEALTH_URL" -o "$RUNNER_TEMP/controller-health.json" \
+              && failure_stage=schedule-contract \
               && jq -e '.success == true
                 and ((.result.schedules // .result // []) | length) == 1
                 and (.result.schedules // .result // [])[0].cron == "* * * * *"' \
                 "$RUNNER_TEMP/controller-schedules.json" >/dev/null \
+              && failure_stage=domain-hostname-contract \
               && jq -e --arg id "$domain_id" '
                 .success == true and (.result | length) == 1
                 and .result[0].id == $id
                 and .result[0].hostname == "release-health-controller.scalesmall.ai"
                 and .result[0].service == "ssai-release-health-controller"
               ' "$RUNNER_TEMP/controller-hostname-domains.json" >/dev/null \
+              && failure_stage=domain-detail-contract \
               && jq -e --arg id "$domain_id" '
                 .success == true and .result.id == $id
                 and .result.hostname == "release-health-controller.scalesmall.ai"
@@ -1307,14 +1332,17 @@ jobs:
                 and .result.zone_name == "scalesmall.ai"
                 and (.result.environment // "production") == "production"
               ' "$RUNNER_TEMP/controller-domain-detail.json" >/dev/null \
+              && failure_stage=subdomain-contract \
               && jq -e '.success == true and .result.enabled == false and .result.previews_enabled == false' \
                 "$RUNNER_TEMP/controller-subdomain-after.json" >/dev/null \
+              && failure_stage=deployment-detail-contract \
               && jq -e --arg deployment "$live_deployment_id" --arg version "$live_version_id" '
                 .success == true and .result.id == $deployment
                 and (.result.versions | length) == 1
                 and .result.versions[0].version_id == $version
                 and (.result.versions[0].percentage | tonumber) == 100
               ' "$RUNNER_TEMP/controller-live-deployment.json" >/dev/null \
+              && failure_stage=version-contract \
               && jq -e --arg id "$live_version_id" --arg tag "$expected_tag" --arg message "$expected_message" --arg mode "$expected_mode" --arg source "$EXPECTED_SOURCE" --arg profile "$EXPECTED_PROFILE" --arg config "$expected_config" '
                 (.result.resources.bindings // .result.bindings // []) as $bindings
                 | .success == true and .result.id == $id
@@ -1332,6 +1360,7 @@ jobs:
                     == ["GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"]
                   end)
               ' "$RUNNER_TEMP/controller-live-version.json" >/dev/null \
+              && failure_stage=health-contract \
               && jq -e --arg mode "$expected_mode" --arg source "$EXPECTED_SOURCE" --arg profile "$EXPECTED_PROFILE" --arg config "$expected_config" \
                 '.schema == "ssai-release-health-controller-health-v1"
                  and .component == "release-health-controller" and .status == "healthy"
@@ -1339,6 +1368,7 @@ jobs:
                  and .config_digest == $config
                  and .checks == {fresh:true,no_dead_alerts:true,no_terminal_failure:true,no_internal_failure:true}' \
                 "$RUNNER_TEMP/controller-health.json" >/dev/null \
+              && failure_stage=settings-contract \
               && jq -e --arg mode "$expected_mode" --arg config "$expected_config" \
                 '.result.bindings as $bindings
                  | .success == true
@@ -1353,6 +1383,7 @@ jobs:
               checks_ready=true
             fi
             if test "$checks_ready" = true && test "$BOOTSTRAP" = true; then
+              failure_stage=bootstrap-health-shape
               if ! jq -e '
                 (keys | sort) == ["alerts","checks","component","config_digest","last_completed_tick","last_decision","last_scheduled_time","mode","profile_digest","schema","source_digest","status"]
                 and .alerts == {pending:0,dead:0}
@@ -1368,7 +1399,10 @@ jobs:
                   or .last_decision == "would_dispatch")
               ' "$RUNNER_TEMP/controller-health.json" >/dev/null; then
                 checks_ready=false
-              elif ! node --input-type=module - "$RUNNER_TEMP/controller-health.json" "$CRON_VERIFIED_AT" <<'NODE'
+              else
+                failure_stage=bootstrap-health-freshness
+              fi
+              if test "$checks_ready" = true && ! node --input-type=module - "$RUNNER_TEMP/controller-health.json" "$CRON_VERIFIED_AT" <<'NODE'
           import { readFile } from 'node:fs/promises';
           const health = JSON.parse(await readFile(process.argv[2], 'utf8'));
           const canonical = (value) => {
@@ -1386,23 +1420,35 @@ jobs:
           NODE
               then
                 checks_ready=false
-              else
-                gh api --method GET \
+              fi
+              if test "$checks_ready" = true; then
+                failure_stage=fallback-inventory-fetch
+                if ! timeout --signal=TERM --kill-after=5s 30s gh api --method GET \
                   'repos/ScaleSmall/SSAI_Shared/actions/workflows/344170407/runs?event=workflow_dispatch&branch=main&per_page=1' \
-                  > "$RUNNER_TEMP/bootstrap-fallback-after.json"
-                fallback_after_id="$(jq -er '
+                  > "$RUNNER_TEMP/bootstrap-fallback-after.json"; then
+                  checks_ready=false
+                else
+                  failure_stage=fallback-inventory-contract
+                  fallback_after_id="$(jq -er '
                   select((.workflow_runs | type) == "array" and (.workflow_runs | length) <= 1)
                   | if (.workflow_runs | length) == 0 then "absent"
                     else (.workflow_runs[0]
                       | select(.workflow_id == 344170407 and .event == "workflow_dispatch" and .head_branch == "main")
                       | (.id | tostring))
                     end
-                ' "$RUNNER_TEMP/bootstrap-fallback-after.json")"
-                if test "$fallback_after_id" != "$FALLBACK_BEFORE_ID"; then checks_ready=false; fi
+                  ' "$RUNNER_TEMP/bootstrap-fallback-after.json" 2>/dev/null || true)"
+                  if test -z "$fallback_after_id"; then
+                    checks_ready=false
+                  else
+                    failure_stage=fallback-inventory-changed
+                    if test "$fallback_after_id" != "$FALLBACK_BEFORE_ID"; then checks_ready=false; fi
+                  fi
+                fi
               fi
             fi
             if test "$checks_ready" = true; then
               success=true
+              failure_stage=passed
               printf 'verified_version_id=%s\n' "$live_version_id" >> "$GITHUB_OUTPUT"
               printf 'verified_deployment_id=%s\n' "$live_deployment_id" >> "$GITHUB_OUTPUT"
               printf 'verified_domain_id=%s\n' "$domain_id" >> "$GITHUB_OUTPUT"
@@ -1410,7 +1456,15 @@ jobs:
             fi
             sleep 10
           done
-          test "$success" = true
+          if test "$success" != true; then
+            case "$failure_stage" in
+              provider-fetch-schedules|provider-fetch-service-domains|provider-fetch-hostname-domains|provider-fetch-deployments|provider-fetch-settings|provider-fetch-subdomain|deployment-list-contract|deployment-created-at-contract|deployment-created-window|version-id-contract|deployment-id-format|version-id-format|provider-fetch-deployment-detail|provider-fetch-version-detail|domain-service-contract|domain-id-format|provider-fetch-domain-detail|health-fetch|schedule-contract|domain-hostname-contract|domain-detail-contract|subdomain-contract|deployment-detail-contract|version-contract|health-contract|settings-contract|bootstrap-health-shape|bootstrap-health-freshness|fallback-inventory-fetch|fallback-inventory-contract|fallback-inventory-changed) ;;
+              *) failure_stage=unclassified ;;
+            esac
+            printf 'failure_stage=%s\n' "$failure_stage" >> "$GITHUB_OUTPUT"
+            printf '::error title=Controller verification failed::stage=%s\n' "$failure_stage"
+            exit 1
+          fi
 
       - name: Record exact verified deployment attestation
         id: record_attestation
@@ -1554,6 +1608,9 @@ jobs:
           if test "$DOMAIN_MUTATION_ATTEMPTED" = true && test "$DOMAIN_CREATED_BY_RUN" != true; then
             containment_rc=1
           fi
+          if test "$DOMAIN_CREATED_BY_RUN" = true && ! valid_domain_id "$EXPECTED_DOMAIN_ID"; then
+            containment_rc=1
+          fi
           if test "$SCHEDULE_CREATED_BY_RUN" = true; then
             schedule_code="$(curl --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
@@ -1575,15 +1632,15 @@ jobs:
               if test "$delete_code" != 200 \
                 || ! jq -e '.success == true and (.result.schedules // .result // []) == []' \
                   "$RUNNER_TEMP/bootstrap-schedule-delete.json" >/dev/null; then
-                containment_rc=1
+                echo '::warning title=Schedule withdrawal receipt was noncanonical::Final exact absence will determine containment.'
               fi
             elif test "$schedule_code" != 200 \
               || ! jq -e '.success == true and ((.result.schedules // .result // []) | length) == 0' \
                 "$RUNNER_TEMP/bootstrap-schedules-containment.json" >/dev/null; then
-              containment_rc=1
+              echo '::warning title=Schedule inventory was temporarily inconclusive::Final exact absence will determine containment.'
             fi
           fi
-          if test "$DOMAIN_CREATED_BY_RUN" = true; then
+          if test "$DOMAIN_CREATED_BY_RUN" = true && valid_domain_id "$EXPECTED_DOMAIN_ID"; then
             domain_id=
             if curl --fail --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
@@ -1603,7 +1660,7 @@ jobs:
                 domain_id="$(jq -er '.result[0].id' "$RUNNER_TEMP/bootstrap-service-domains-containment.json" 2>/dev/null || true)"
                 hostname_domain_id="$(jq -er '.result[0].id' "$RUNNER_TEMP/bootstrap-hostname-domains-containment.json" 2>/dev/null || true)"
                 if ! valid_domain_id "$domain_id" || test "$domain_id" != "$hostname_domain_id" \
-                  || { test -n "$EXPECTED_DOMAIN_ID" && test "$domain_id" != "$EXPECTED_DOMAIN_ID"; } \
+                  || test "$domain_id" != "$EXPECTED_DOMAIN_ID" \
                   || ! curl --fail --silent --show-error --max-time 15 --proto '=https' \
                     -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
                     "$api/workers/domains/$domain_id" -o "$RUNNER_TEMP/bootstrap-domain-containment-detail.json" \
@@ -1614,15 +1671,12 @@ jobs:
                     and .result.zone_name == "scalesmall.ai"
                     and (.result.environment // "production") == "production"
                   ' "$RUNNER_TEMP/bootstrap-domain-containment-detail.json" >/dev/null; then
-                  containment_rc=1
                   domain_id=ambiguous
                 fi
               else
-                containment_rc=1
                 domain_id=ambiguous
               fi
             else
-              containment_rc=1
               domain_id=ambiguous
             fi
             if valid_domain_id "$domain_id"; then
@@ -1632,7 +1686,7 @@ jobs:
                 "$api/workers/domains/$domain_id" || true)"
               if test "$delete_code" != 200 \
                 || ! jq -e '.success == true' "$RUNNER_TEMP/bootstrap-domain-delete.json" >/dev/null; then
-                containment_rc=1
+                echo '::warning title=Domain withdrawal receipt was noncanonical::Final exact absence will determine containment.'
               fi
             fi
           fi
