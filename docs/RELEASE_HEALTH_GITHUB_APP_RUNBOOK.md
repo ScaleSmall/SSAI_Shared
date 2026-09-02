@@ -236,7 +236,10 @@ proves no fallback run is queued or active, and only then disables the fallback 
 Deploy only with `.github/workflows/deploy-release-health-controller.yml` at an exact protected
 `main` SHA. The `release-health-controller-production` environment must require production
 review and contain the Cloudflare account/token plus the controller GitHub App client ID, private
-key, and installation ID. Observe deployment binds only those three App credentials and requests
+key, and installation ID. The Cloudflare token must grant `Workers Scripts Write` for the owning
+account and `Workers Routes Write` only for the `scalesmall.ai` zone; the protected workflow proves
+both account access and read-only route inventory before any deployment mutation. Observe
+deployment binds only those three App credentials and requests
 only Actions read, Contents read, and Metadata read. Do not provision the dispatch HMAC, alert key,
 or activation proof to an observe deployment.
 

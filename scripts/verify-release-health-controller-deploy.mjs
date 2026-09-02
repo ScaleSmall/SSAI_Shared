@@ -13,6 +13,7 @@ const sourceDirectory = new URL('workers/release-health-controller/src/', root);
 const configUrl = new URL('workers/release-health-controller/wrangler.jsonc', root);
 const workflowUrl = new URL('.github/workflows/deploy-release-health-controller.yml', root);
 const pinnedCloudflareAccountId = '7b68f149b6054718ad2c6ff0634ae145';
+const pinnedCloudflareZoneId = '6f28c0a1fc71847f6647bd526a38ff1d';
 
 const sourceHash = createHash('sha256');
 for (const name of (await readdir(sourceDirectory)).sort()) {
@@ -84,6 +85,7 @@ for (const required of [
   'cancel-in-progress: false',
   'timeout-minutes: 75',
   `CLOUDFLARE_ACCOUNT_ID: ${pinnedCloudflareAccountId}`,
+  `CLOUDFLARE_ZONE_ID: ${pinnedCloudflareZoneId}`,
   'github.ref_protected == true',
   'github.workflow_sha == inputs.expected_sha',
   'node_modules/wrangler/package.json',
@@ -134,7 +136,7 @@ assert.doesNotMatch(workflow, /wrangler\s+triggers\s+deploy/i);
 assert.doesNotMatch(workflow, /preview_prefix|bootstrap-preview-health/i);
 assert.match(workflow, /options: \[deploy-observe, deploy-active, rollback-observe\]/);
 assert.ok(workflow.includes('.schema == "ssai-release-health-controller-health-v1"'));
-assert.ok(workflow.includes('.checks.no_terminal_failure == true'));
+assert.ok(workflow.includes('.checks == {fresh:true,no_dead_alerts:true,no_terminal_failure:true,no_internal_failure:true}'));
 assert.match(workflow, /if test "\$BOOTSTRAP" = true; then\n\s+test "\$OPERATION" = deploy-observe/);
 assert.match(workflow, /test -z "\$ROLLBACK_VERSION_ID\$ROLLBACK_SOURCE\$ROLLBACK_PROFILE\$ROLLBACK_CONFIG\$ROLLBACK_ATTESTATION_SHA"/);
 assert.match(workflow, /\[\[ "\$ROLLBACK_CONFIG" =~ \^\[a-f0-9\]\{64\}\$ \]\]/);
@@ -148,6 +150,50 @@ assert.doesNotMatch(identityRun, /\$\{\{\s*inputs\./);
 for (const field of ['EXPECTED_SOURCE', 'EXPECTED_PROFILE', 'EXPECTED_CONFIG']) {
   assert.match(identityStep, new RegExp(`${field}: \\$\\{\\{ inputs\\.`));
   assert.match(identityRun, new RegExp(`\\[\\[ "\\$${field}" =~ \\^\\[a-f0-9\\]\\{64\\}\\$ \\]\\]`));
+}
+
+const capabilityStepName = '      - name: Verify Cloudflare account capability';
+const capabilityStep = workflow.split(capabilityStepName)[1].split(
+  '      - name: Capture fallback inventory before bootstrap',
+)[0];
+assert.match(capabilityStep, new RegExp(`\\[\\[ "\\$CLOUDFLARE_ZONE_ID" =~ \\^\\[a-f0-9\\]\\{32\\}\\$ \\]\\]`));
+assert.match(capabilityStep, /zones\/\$CLOUDFLARE_ZONE_ID\/workers\/routes/);
+assert.match(capabilityStep, /cloudflare-worker-routes\.json/);
+assert.match(capabilityStep, /\.success == true and \.errors == \[\] and \.messages == \[\] and \(\.result \| type\) == "array"/);
+assert.doesNotMatch(capabilityStep, /--request|\s-X\s|wrangler/);
+const capabilityFailureStages = [...new Set(
+  [...capabilityStep.matchAll(/failure_stage=([a-z0-9-]+)/g)].map((match) => match[1]),
+)].sort();
+assert.deepEqual(capabilityFailureStages, [
+  'account-contract',
+  'account-fetch',
+  'identity-contract',
+  'passed',
+  'route-contract',
+  'route-fetch',
+  'unclassified',
+]);
+const capabilityFailureCase = capabilityStep.split('case "$failure_stage" in')[1].split(') ;;')[0].trim();
+assert.deepEqual(
+  capabilityFailureCase.split('|').sort(),
+  ['account-contract', 'account-fetch', 'identity-contract', 'route-contract', 'route-fetch'].sort(),
+);
+assert.match(capabilityStep, /Cloudflare capability preflight failed::stage=%s/);
+assert.doesNotMatch(capabilityStep, /printf '::error[^\n]*(?:API_TOKEN|Authorization|Bearer)/);
+const capabilityOffset = workflow.indexOf(capabilityStepName);
+for (const mutationStep of [
+  '      - name: Create contained bootstrap observe candidate',
+  '      - name: Attach and preverify bootstrap health domain',
+  '      - name: Activate or re-attest exact bootstrap schedule',
+  '      - name: Apply exact observe or active deployment',
+  '      - name: Remove every active-only binding from observe mode',
+  '      - name: Finalize attested observe version after active-secret removal',
+  '      - name: Apply exact known-good observe rollback',
+]) {
+  assert.ok(
+    capabilityOffset >= 0 && capabilityOffset < workflow.indexOf(mutationStep),
+    `Cloudflare route capability preflight must precede mutation step: ${mutationStep.trim()}`,
+  );
 }
 
 const bootstrapAbsenceStep = workflow.split(
@@ -256,7 +302,9 @@ assert.ok(
 
 const jobEnvironment = workflow.split('    env:\n')[1].split('    steps:\n')[0];
 assert.match(jobEnvironment, new RegExp(`CLOUDFLARE_ACCOUNT_ID: ${pinnedCloudflareAccountId}`));
+assert.match(jobEnvironment, new RegExp(`CLOUDFLARE_ZONE_ID: ${pinnedCloudflareZoneId}`));
 assert.equal((workflow.match(new RegExp(pinnedCloudflareAccountId, 'g')) || []).length, 1);
+assert.equal((workflow.match(new RegExp(pinnedCloudflareZoneId, 'g')) || []).length, 1);
 assert.doesNotMatch(jobEnvironment, /CLOUDFLARE_API_TOKEN/);
 for (const name of ['Install exact locked toolchain', 'Verify exact source and deployment contracts']) {
   const step = workflow.split(`      - name: ${name}\n`)[1].split('\n      - name: ')[0];
@@ -450,12 +498,59 @@ assert.doesNotMatch(attestationRecordStep, /ACTIVATION_PROOF|PRIVATE_KEY|API_TOK
 
 const autoRollbackStep = workflow.split(
   '      - name: Automatically restore attested observe version after failed deployment verification',
-)[1].split('      - name: Conclude exact operation and safe rollback outcome')[0];
+)[1].split('      - name: Contain failed first deployment without deleting Worker history')[0];
 assert.match(autoRollbackStep, /steps\.attest_rollback\.outcome == 'success'/);
 assert.match(autoRollbackStep, /steps\.apply_deploy\.outputs\.started_at != ''/);
 assert.match(autoRollbackStep, /steps\.verify_deploy\.outcome != 'success'/);
 assert.match(autoRollbackStep, /wrangler rollback "\$ROLLBACK_VERSION_ID"/);
-assert.match(autoRollbackStep, /no_terminal_failure == true/);
+assert.match(autoRollbackStep, /workers\/scripts\/\$CONTROLLER_NAME\/deployments/);
+assert.match(autoRollbackStep, /workers\/scripts\/\$CONTROLLER_NAME\/versions\/\$ROLLBACK_VERSION_ID/);
+assert.doesNotMatch(autoRollbackStep, /workers\/scripts\/\$CONTROLLER_NAME\/settings|controller-rollback-settings/);
+const rollbackDeploymentProgramMatch = autoRollbackStep.match(
+  /rollback_deployment_id="\$\(jq -er --arg version "\$ROLLBACK_VERSION_ID" '\n(?<program>[\s\S]*?)\n\s+' "\$RUNNER_TEMP\/controller-rollback-deployments\.json"\)"/,
+);
+assert.ok(rollbackDeploymentProgramMatch?.groups?.program, 'Missing automatic rollback deployment-list contract.');
+const rollbackDeploymentProgram = normalizeEmbeddedProgram(rollbackDeploymentProgramMatch.groups.program);
+assert.match(rollbackDeploymentProgram, /\$deployments\[0\]/);
+assert.match(rollbackDeploymentProgram, /select\(\(\.versions \| type\) == "array" and \(\.versions \| length\) == 1\)/);
+assert.match(rollbackDeploymentProgram, /\.versions\[0\]\.version_id == \$version/);
+assert.match(rollbackDeploymentProgram, /\(\.versions\[0\]\.percentage \| tonumber\) == 100/);
+assert.match(autoRollbackStep, /\.result\.id == \$id/);
+assert.match(autoRollbackStep, /\["workers\/tag"\] == \$attestation/);
+assert.match(autoRollbackStep, /\["workers\/message"\] == \("protected-observe:" \+ \$attestation \+ ":" \+ \$source \+ ":" \+ \$profile\)/);
+for (const binding of ['MODE', 'CONTROLLER_SOURCE_SHA256', 'CONTROLLER_ACTIVATION_PROFILE_SHA256', 'CONTROLLER_CONFIG_SHA256', 'SLOT_LEDGER']) {
+  assert.match(autoRollbackStep, new RegExp(`select\\(\\.name == "${binding}"[\\s\\S]*?\\)\\] \\| length\\) == 1`));
+}
+assert.match(autoRollbackStep, /\["GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"\]/);
+assert.match(autoRollbackStep, /\.checks == \{fresh:true,no_dead_alerts:true,no_terminal_failure:true,no_internal_failure:true\}/);
+assert.match(autoRollbackStep, /ROLLBACK_ATTESTATION_SHA: \$\{\{ inputs\.rollback_attestation_sha \}\}/);
+if (process.platform !== 'win32') {
+  const rollbackVersionId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const newestDeploymentId = '11111111-2222-4333-8444-555555555555';
+  const olderDeploymentId = '99999999-8888-4777-8666-555555555555';
+  const evaluateRollbackDeployment = (deployments) => spawnSync(
+    'jq',
+    ['-er', '--arg', 'version', rollbackVersionId, rollbackDeploymentProgram],
+    { encoding: 'utf8', input: JSON.stringify({ success: true, result: { deployments } }) },
+  );
+  const exactNewest = evaluateRollbackDeployment([{
+    id: newestDeploymentId,
+    versions: [{ version_id: rollbackVersionId, percentage: 100 }],
+  }]);
+  assert.equal(exactNewest.status, 0, exactNewest.stderr);
+  assert.equal(exactNewest.stdout.trim(), newestDeploymentId);
+  assert.notEqual(evaluateRollbackDeployment([{
+    id: newestDeploymentId,
+    versions: [{ version_id: rollbackVersionId, percentage: 99 }],
+  }]).status, 0);
+  assert.notEqual(evaluateRollbackDeployment([{
+    id: newestDeploymentId,
+    versions: [{ version_id: 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', percentage: 100 }],
+  }, {
+    id: olderDeploymentId,
+    versions: [{ version_id: rollbackVersionId, percentage: 100 }],
+  }]).status, 0);
+}
 
 const bootstrapContainmentStep = workflow.split(
   '      - name: Contain failed first deployment without deleting Worker history',

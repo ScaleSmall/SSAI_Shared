@@ -76,6 +76,7 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       CLOUDFLARE_ACCOUNT_ID: 7b68f149b6054718ad2c6ff0634ae145
+      CLOUDFLARE_ZONE_ID: 6f28c0a1fc71847f6647bd526a38ff1d
       CONTROLLER_CONFIG: workers/release-health-controller/wrangler.jsonc
       CONTROLLER_NAME: ssai-release-health-controller
       CONTROLLER_HEALTH_URL: https://release-health-controller.scalesmall.ai/healthz
@@ -154,16 +155,43 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.SSAI_RELEASE_CONTROLLER_CLOUDFLARE_API_TOKEN }}
         run: |
           set -euo pipefail
+          failure_stage=unclassified
+          report_failure() {
+            status=$?
+            trap - EXIT
+            if test "$status" -ne 0; then
+              case "$failure_stage" in
+                identity-contract|account-fetch|account-contract|route-fetch|route-contract) ;;
+                *) failure_stage=unclassified ;;
+              esac
+              printf '::error title=Cloudflare capability preflight failed::stage=%s\n' "$failure_stage"
+            fi
+            exit "$status"
+          }
+          trap report_failure EXIT
+          failure_stage=identity-contract
           [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[a-f0-9]{32}$ ]]
+          [[ "$CLOUDFLARE_ZONE_ID" =~ ^[a-f0-9]{32}$ ]]
           test "${#CLOUDFLARE_API_TOKEN}" -ge 20
           umask 077
+          failure_stage=account-fetch
           curl --fail --silent --show-error --max-time 15 --proto '=https' \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID" \
             -o "$RUNNER_TEMP/cloudflare-account.json"
+          failure_stage=account-contract
           jq -e --arg id "$CLOUDFLARE_ACCOUNT_ID" \
             '.success == true and .result.id == $id' \
             "$RUNNER_TEMP/cloudflare-account.json" >/dev/null
+          failure_stage=route-fetch
+          curl --fail --silent --show-error --max-time 15 --proto '=https' \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/workers/routes" \
+            -o "$RUNNER_TEMP/cloudflare-worker-routes.json"
+          failure_stage=route-contract
+          jq -e '.success == true and .errors == [] and .messages == [] and (.result | type) == "array"' \
+            "$RUNNER_TEMP/cloudflare-worker-routes.json" >/dev/null
+          failure_stage=passed
 
       - name: Capture fallback inventory before bootstrap
         id: fallback_before
@@ -1527,8 +1555,15 @@ jobs:
           ROLLBACK_SOURCE: ${{ inputs.rollback_source_sha256 }}
           ROLLBACK_PROFILE: ${{ inputs.rollback_profile_sha256 }}
           ROLLBACK_CONFIG: ${{ inputs.rollback_config_sha256 }}
+          ROLLBACK_ATTESTATION_SHA: ${{ inputs.rollback_attestation_sha }}
         run: |
           set -euo pipefail
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          [[ "$ROLLBACK_VERSION_ID" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]
+          [[ "$ROLLBACK_SOURCE" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$ROLLBACK_PROFILE" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$ROLLBACK_CONFIG" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$ROLLBACK_ATTESTATION_SHA" =~ ^[a-f0-9]{40}$ ]]
           ./node_modules/.bin/wrangler rollback "$ROLLBACK_VERSION_ID" \
             --config "$CONTROLLER_CONFIG" \
             --message "automatic-safe-rollback ${GITHUB_SHA}" \
@@ -1536,27 +1571,47 @@ jobs:
           rollback_deadline=$((SECONDS + 480))
           restored=false
           while test "$SECONDS" -lt "$rollback_deadline"; do
-            if curl --silent --show-error --max-time 15 --proto '=https' \
+            rollback_deployment_id=
+            if curl --fail --silent --show-error --max-time 15 --proto '=https' \
               "$CONTROLLER_HEALTH_URL" -o "$RUNNER_TEMP/controller-rollback-health.json" \
-              && curl --silent --show-error --max-time 15 --proto '=https' \
+              && curl --fail --silent --show-error --max-time 15 --proto '=https' \
               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$CONTROLLER_NAME/settings" \
-              -o "$RUNNER_TEMP/controller-rollback-settings.json" \
+              "$api/workers/scripts/$CONTROLLER_NAME/deployments" \
+              -o "$RUNNER_TEMP/controller-rollback-deployments.json" \
+              && rollback_deployment_id="$(jq -er --arg version "$ROLLBACK_VERSION_ID" '
+                select(.success == true)
+                | (.result.deployments // .result // empty) as $deployments
+                | select(($deployments | type) == "array" and ($deployments | length) > 0)
+                | $deployments[0]
+                | select((.id | type) == "string" and (.id | test("^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$")))
+                | select((.versions | type) == "array" and (.versions | length) == 1)
+                | select(.versions[0].version_id == $version and (.versions[0].percentage | tonumber) == 100)
+                | .id
+              ' "$RUNNER_TEMP/controller-rollback-deployments.json")" \
+              && curl --fail --silent --show-error --max-time 15 --proto '=https' \
+              -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "$api/workers/scripts/$CONTROLLER_NAME/versions/$ROLLBACK_VERSION_ID" \
+              -o "$RUNNER_TEMP/controller-rollback-live-version.json" \
               && jq -e --arg source "$ROLLBACK_SOURCE" --arg profile "$ROLLBACK_PROFILE" --arg config "$ROLLBACK_CONFIG" \
                 '.schema == "ssai-release-health-controller-health-v1"
-                 and .status == "healthy" and .mode == "observe"
+                 and .component == "release-health-controller" and .status == "healthy" and .mode == "observe"
                  and .source_digest == $source and .profile_digest == $profile
                  and .config_digest == $config
-                 and .checks.fresh == true and .checks.no_dead_alerts == true
-                 and .checks.no_terminal_failure == true' \
+                 and .checks == {fresh:true,no_dead_alerts:true,no_terminal_failure:true,no_internal_failure:true}' \
                 "$RUNNER_TEMP/controller-rollback-health.json" >/dev/null \
-              && jq -e --arg config "$ROLLBACK_CONFIG" '.result.bindings as $bindings
-                 | .success == true
-                 and ($bindings | any(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject"))
-                 and ($bindings | any(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config))
+              && jq -e --arg id "$ROLLBACK_VERSION_ID" --arg source "$ROLLBACK_SOURCE" --arg profile "$ROLLBACK_PROFILE" --arg config "$ROLLBACK_CONFIG" --arg attestation "$ROLLBACK_ATTESTATION_SHA" '
+                 (.result.resources.bindings // .result.bindings // []) as $bindings
+                 | .success == true and .result.id == $id
+                 and (.result.annotations // .result.metadata.annotations // {})["workers/tag"] == $attestation
+                 and (.result.annotations // .result.metadata.annotations // {})["workers/message"] == ("protected-observe:" + $attestation + ":" + $source + ":" + $profile)
+                 and ([$bindings[] | select(.name == "MODE" and .type == "plain_text" and .text == "observe")] | length) == 1
+                 and ([$bindings[] | select(.name == "CONTROLLER_SOURCE_SHA256" and .type == "plain_text" and .text == $source)] | length) == 1
+                 and ([$bindings[] | select(.name == "CONTROLLER_ACTIVATION_PROFILE_SHA256" and .type == "plain_text" and .text == $profile)] | length) == 1
+                 and ([$bindings[] | select(.name == "CONTROLLER_CONFIG_SHA256" and .type == "plain_text" and .text == $config)] | length) == 1
+                 and ([$bindings[] | select(.name == "SLOT_LEDGER" and .type == "durable_object_namespace" and .class_name == "ReleaseHealthControllerObject")] | length) == 1
                  and ([$bindings[] | select(.type == "secret_text") | .name] | sort)
-                   == ["GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"]' \
-                "$RUNNER_TEMP/controller-rollback-settings.json" >/dev/null; then
+                    == ["GITHUB_APP_CLIENT_ID","GITHUB_APP_PRIVATE_KEY","GITHUB_INSTALLATION_ID"]' \
+                 "$RUNNER_TEMP/controller-rollback-live-version.json" >/dev/null; then
               restored=true
               break
             fi
