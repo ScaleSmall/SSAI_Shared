@@ -827,29 +827,7 @@ jobs:
             sleep 5
           done
           test "$domain_ready" = true
-          if test "$CURRENT_STATE" = contained; then
-            health_ready=false
-            while test "$SECONDS" -lt "$domain_deadline"; do
-              code="$(curl --silent --show-error --max-time 20 --proto '=https' \
-                -o "$RUNNER_TEMP/bootstrap-domain-health.json" -w '%{http_code}' \
-                "$CONTROLLER_HEALTH_URL" || true)"
-              if test "$code" = 503 \
-                && jq -e --arg source "$EXPECTED_SOURCE" --arg profile "$EXPECTED_PROFILE" --arg config "$EXPECTED_CONFIG" '
-                  .schema == "ssai-release-health-controller-health-v1"
-                  and .component == "release-health-controller" and .status == "unhealthy"
-                  and .mode == "observe" and .source_digest == $source and .profile_digest == $profile
-                  and .config_digest == $config
-                  and .last_completed_tick == null and .last_scheduled_time == null and .last_decision == null
-                  and .alerts == {pending:0,dead:0}
-                  and .checks == {fresh:false,no_dead_alerts:true,no_terminal_failure:true,no_internal_failure:true}
-                ' "$RUNNER_TEMP/bootstrap-domain-health.json" >/dev/null; then
-                health_ready=true
-                break
-              fi
-              sleep 5
-            done
-            test "$health_ready" = true
-          elif test "$CURRENT_STATE" = domain; then
+          if test "$CURRENT_STATE" = contained || test "$CURRENT_STATE" = domain; then
             health_ready=false
             while test "$SECONDS" -lt "$domain_deadline"; do
               code="$(curl --silent --show-error --max-time 20 --proto '=https' \
@@ -895,6 +873,10 @@ jobs:
             && health.checks?.no_internal_failure === true;
           const scheduled = canonical(health.last_scheduled_time);
           const completed = canonical(health.last_completed_tick);
+          // A contained resume can retain an exact prior Durable Object tick after
+          // its run-owned domain and schedule were withdrawn. Accept that bounded
+          // historical state here; final verification still requires a newer
+          // natural tick after this run re-attaches the schedule.
           const historical = scheduled !== null
             && completed !== null
             && completed >= scheduled

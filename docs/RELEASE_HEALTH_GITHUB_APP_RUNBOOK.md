@@ -264,6 +264,9 @@ withdraws only the domain and cron proven absent before this run, preserves the 
 diagnostic evidence, and fails visibly. Never use bootstrap when any Worker history exists.
 Containment treats only exact final readback as authoritative: receipt ambiguity does not excuse a
 remaining trigger, and exact absence can prove convergence after a noncanonical delete receipt.
+When a contained bootstrap resumes, pre-schedule health may be either virgin state or an exact,
+internally healthy historical Durable Object tick from the contained attempt. Final verification
+still requires a newer natural tick after the schedule is reattached.
 
 Active promotion is a separate `deploy-active` operation against the same protected source/profile
 generation after two consecutive observe slots produced the exact activation proof. Before the
